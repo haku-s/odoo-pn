@@ -227,7 +227,7 @@ class FakePNCPSession:
         self.responses = iter(responses)
         self.requests = []
 
-    def get(self, url, params, timeout):
+    def get(self, url, params, timeout, allow_redirects):
         self.requests.append(
             (url, dict(params))
         )
