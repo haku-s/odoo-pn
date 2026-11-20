@@ -73,9 +73,15 @@ class PNCPClient:
                     'Remote service connection failed'
                 ) from exc
 
-            if resp.status_code == 204:
-                return
+            
+             if resp.status_code == 204:
+                if page == 1:
+                    return
+                raise RuntimeError(
+                    'Unexpected empty page; state not advanced'
+                )
 
+            
             if not resp.ok:
                 raise RuntimeError(
                     f'Remote request failed: HTTP {resp.status_code}'
