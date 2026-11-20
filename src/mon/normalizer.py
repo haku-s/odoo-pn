@@ -16,18 +16,12 @@ TZ_BRAZIL = ZoneInfo('America/Sao_Paulo')
 def odoo_datetime(value: object) -> str | None:
     if not value:
         return None
-
     try:
         iso = str(value).replace('Z', '+00:00')
         dt = datetime.fromisoformat(iso)
-
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=TZ_BRAZIL)
-
-        return dt.astimezone(timezone.utc).strftime(
-            '%Y-%m-%d %H:%M:%S'
-        )
-
+        return dt.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
     except (TypeError, ValueError) as exc:
         raise ValueError('Invalid datetime value') from exc
 
@@ -35,15 +29,11 @@ def odoo_datetime(value: object) -> str | None:
 def clean_money(value: object) -> float | None:
     if value is None or value == '':
         return None
-
     try:
-        v = Decimal(str(value))
-
-        if not v.is_finite():
+        amount = Decimal(str(value))
+        if not amount.is_finite():
             raise InvalidOperation()
-
-        return float(v)
-
+        return float(amount)
     except (InvalidOperation, ValueError) as exc:
         raise ValueError('Invalid numeric value') from exc
 
@@ -51,104 +41,60 @@ def clean_money(value: object) -> float | None:
 def clean_day(value: object) -> str | None:
     if not value:
         return None
-
     return str(value)[:10]
 
 
-def normalize(r: dict) -> dict:
-    pncp_id = r.get('numeroControlePNCP')
-
-    if (
-        not isinstance(pncp_id, str)
-        or not PNCP_ID.fullmatch(pncp_id)
-    ):
+def normalize(record: dict) -> dict:
+    identifier = record.get('numeroControlePNCP')
+    if not isinstance(identifier, str) or not PNCP_ID.fullmatch(identifier):
         raise ValueError('Invalid or missing record identifier')
 
-    org = r.get('orgaoEntidade') or {}
-    unit = r.get('unidadeOrgao') or {}
+    organization = record.get('orgaoEntidade') or {}
+    unit = record.get('unidadeOrgao') or {}
+    if not isinstance(organization, dict) or not isinstance(unit, dict):
+        raise ValueError('Unexpected organization or unit format')
 
-    base = {
-        'pncp_id': pncp_id,
-        'objeto': r.get('objetoCompra'),
-        'numero_edital': r.get('numeroCompra'),
-        'orgao': (
-            org.get('razaoSocial')
-            or org.get('razaosocial')
-        ),
-        'cnpj': org.get('cnpj'),
-        'uf': unit.get('ufSigla'),
-        'municipio': unit.get('municipioNome'),
-        'modalidade': r.get('modalidadeNome'),
-        'situacao': r.get('situacaoCompraNome'),
-        'valor_estimado': clean_money(
-            r.get('valorTotalEstimado')
-        ),
-        'data_publicacao': clean_day(
-            r.get('dataPublicacaoPncp')
-        ),
-        'data_atualizacao': clean_day(
-            r.get('dataAtualizacaoGlobal')
-            or r.get('dataAtualizacao')
-        ),
-        'data_encerramento': odoo_datetime(
-            r.get('dataEncerramentoProposta')
-        ),
-        'url_origem': r.get('linkSistemaOrigem'),
+    base = {'pncp_id': identifier}
+    direct = {
+        'objeto': ('objetoCompra', lambda value: value),
+        'numero_edital': ('numeroCompra', lambda value: value),
+        'modalidade': ('modalidadeNome', lambda value: value),
+        'situacao': ('situacaoCompraNome', lambda value: value),
+        'valor_estimado': ('valorTotalEstimado', clean_money),
+        'data_publicacao': ('dataPublicacaoPncp', clean_day),
+        'data_encerramento': ('dataEncerramentoProposta', odoo_datetime),
+        'url_origem': ('linkSistemaOrigem', lambda value: value),
     }
+    for target, (source, convert) in direct.items():
+        if source in record:
+            base[target] = convert(record[source])
 
-    
-    # Preserve the distinction between absent and empty values.
-    provenance = {
-        'objeto': ('objetoCompra',),
-        'numero_edital': ('numeroCompra',),
-        'orgao': ('orgaoEntidade',),
-        'cnpj': ('orgaoEntidade',),
-        'uf': ('unidadeOrgao',),
-        'municipio': ('unidadeOrgao',),
-        'modalidade': ('modalidadeNome',),
-        'situacao': ('situacaoCompraNome',),
-        'valor_estimado': ('valorTotalEstimado',),
-        'data_publicacao': ('dataPublicacaoPncp',),
-        'data_atualizacao': (
-            'dataAtualizacaoGlobal',
-            'dataAtualizacao',
-        ),
-        'data_encerramento': ('dataEncerramentoProposta',),
-        'url_origem': ('linkSistemaOrigem',),
-    }
-
-    for field, keys in provenance.items():
-        if not any(key in r for key in keys):
-            base.pop(field)
+    # The first response key is authoritative when it is present,
+    # including when its value is explicitly null.
+    for source in ('dataAtualizacaoGlobal', 'dataAtualizacao'):
+        if source in record:
+            base['data_atualizacao'] = clean_day(record[source])
+            break
 
     nested = {
-        'orgao': (
-            'orgaoEntidade',
-            ('razaoSocial', 'razaosocial'),
-        ),
-        'cnpj': ('orgaoEntidade', ('cnpj',)),
-        'uf': ('unidadeOrgao', ('ufSigla',)),
-        'municipio': (
-            'unidadeOrgao',
-            ('municipioNome',),
-        ),
+        'orgao': (organization, ('razaoSocial', 'razaosocial')),
+        'cnpj': (organization, ('cnpj',)),
+        'uf': (unit, ('ufSigla',)),
+        'municipio': (unit, ('municipioNome',)),
     }
+    for target, (data, sources) in nested.items():
+        for source in sources:
+            if source in data:
+                base[target] = data[source]
+                break
+        else:
+            # Explicitly null parent objects represent explicit clearing.
+            parent = ('orgaoEntidade' if target in ('orgao', 'cnpj')
+                      else 'unidadeOrgao')
+            if parent in record and record[parent] is None:
+                base[target] = None
 
-    for field, (parent, keys) in nested.items():
-        obj = r.get(parent)
-        if (
-            isinstance(obj, dict)
-            and not any(key in obj for key in keys)
-        ):
-            base.pop(field, None)
-
-
-    content = {
-        k: v
-        for k, v in base.items()
-        if v is not None
-    }
-
+    content = {key: value for key, value in base.items() if value is not None}
     base['assinatura'] = hashlib.sha256(
         json.dumps(
             content,
@@ -157,5 +103,4 @@ def normalize(r: dict) -> dict:
             separators=(',', ':'),
         ).encode()
     ).hexdigest()
-
     return base
