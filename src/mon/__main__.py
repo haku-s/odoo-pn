@@ -21,7 +21,7 @@ def main(argv=None) -> int:
             fields = client.check_fields(write=False)
             client.project([])
             for model, names in fields.items():
-              # inventary
+              
                 report = {'model': model, 'field_count': len(names)}
                 if __import__('os').getenv('ODOO_INSPECT_FIELDS') == '1':
                     report['fields'] = {name: meta.get('type') for name, meta in names.items()
@@ -36,7 +36,7 @@ def main(argv=None) -> int:
         print(json.dumps({'mode': args.command, 'counts': stats}, ensure_ascii=False, sort_keys=True))
         return 0
     except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as exc:
-        print(f'FALHA: {exc}', file=sys.stderr)
+        print(f'Error: {exc}', file=sys.stderr)
         return 1
 
 
