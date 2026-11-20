@@ -26,7 +26,7 @@ from mon.relevance import is_relevant
 from mon.sync import Synchronizer
 
 
-FIXTURE = Path(__file__).parent / 'fixtures' / 'contratacao.json'
+FIXTURE = Path(__file__).parent / 'fixtures' / 'hiring.json'
 RECORD = json.loads(FIXTURE.read_text(encoding='utf-8'))
 FILT = Filters((6,), ('software',), (), ())
 TODAY = date(2026, 11, 20)
