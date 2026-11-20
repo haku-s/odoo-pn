@@ -1,4 +1,3 @@
-
 """Data normalization utilities."""
 
 from __future__ import annotations
