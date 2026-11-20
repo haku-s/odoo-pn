@@ -484,9 +484,12 @@ class CompletionTests(unittest.TestCase):
             FakeResponse(data={'data': [RECORD], 'totalPaginas': 2, 'totalRegistros': 3}),
             FakeResponse(data={'data': [RECORD], 'totalPaginas': 2, 'totalRegistros': 3}),
         ]))
+        self.source.documents = Mock(return_value=[])
+        self.source.budget_is_public = Mock(return_value=True)
         with self.assertRaisesRegex(RuntimeError, 'Incomplete PNCP record count'):
             self.run_sync()
-        self.assertFalse(self.odoo.created or self.odoo.checkpoints)
+        self.assertEqual(len(self.odoo.created), 1)
+        self.assertFalse(self.odoo.checkpoints)
 
     def test_small_day_limit_can_advance_beyond_overlap(self):
         previous = TODAY - timedelta(days=3)
