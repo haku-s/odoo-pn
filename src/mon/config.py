@@ -13,10 +13,20 @@ from zoneinfo import ZoneInfo
 
 BRASILIA = ZoneInfo('America/Sao_Paulo')
 CONFIG_PATH = Path(__file__).resolve().parents[1] / 'config' / 'filters.json'
-ALLOWED_FIELDS = frozenset({
-    'objeto', 'numero_edital', 'orgao', 'cnpj', 'uf', 'municipio',
-    'modalidade', 'situacao', 'valor_estimado', 'data_publicacao',
-    'data_atualizacao', 'data_encerramento', 'url_origem', 'assinatura',
+FIELD_ALIASES = {
+    'numero_processo': 'process_number',
+    'numero_edital': 'purchase_number',
+    'modalidade': 'modality',
+    'valor_estimado': 'estimated_value',
+    'data_encerramento': 'deadline',
+    'orgao': 'organization',
+    'municipio': 'municipality_state',
+}
+OFFICIAL_FIELDS = frozenset(FIELD_ALIASES.values())
+ALLOWED_FIELDS = OFFICIAL_FIELDS | frozenset(FIELD_ALIASES) | frozenset({
+    'objeto', 'cnpj', 'uf',
+    'situacao', 'data_publicacao',
+    'data_atualizacao', 'url_origem', 'assinatura',
 })
 TECHNICAL_FIELD = re.compile(r'^[a-z][a-z0-9_]*$')
 
@@ -112,7 +122,11 @@ class Settings:
             raise ValueError('Invalid target field name')
         if len(mapping) != len(set(mapping.values())):
             raise ValueError('Duplicate target field mapping')
-        if any(not value.startswith('x_') for value in mapping.values()):
+        if any(
+            not target.startswith('x_')
+            and (FIELD_ALIASES.get(source, source), target) != ('deadline', 'date_deadline')
+            for source, target in mapping.items()
+        ):
             raise ValueError('Only custom target fields are supported')
 
         project = os.getenv('ODOO_PROJECT_ID', '')
@@ -149,17 +163,24 @@ class Settings:
         )
 
     def require_odoo(self, write: bool = False) -> None:
+        if not self.odoo_url:
+            raise ValueError('Missing ODOO_URL')
         parsed = urlsplit(self.odoo_url)
         if (
             parsed.scheme != 'https'
-            or not parsed.netloc
+            or not parsed.hostname
             or parsed.username
             or parsed.password
             or parsed.query
+            or parsed.fragment
         ):
             raise ValueError('Invalid service URL configuration')
-        if not self.odoo_api_key or not self.project_id or self.project_id <= 0:
-            raise ValueError('Missing service credentials or identifier')
+        if not self.odoo_api_key:
+            raise ValueError('Missing ODOO_API_KEY')
+        if not self.project_id or self.project_id <= 0:
+            raise ValueError('Missing or invalid ODOO_PROJECT_ID')
+        if write and (not self.stage_id or self.stage_id <= 0):
+            raise ValueError('Missing or invalid ODOO_STAGE_ID')
         if write and (not self.pncp_field or not self.checkpoint_field):
             raise ValueError('Required write fields are not configured')
         if write and (
