@@ -105,8 +105,12 @@ class OdooClient:
 
         return result
 
-    def check_fields(self, write: bool = False) -> dict:
-        task = self.fields('project.task')
+    
+        def check_fields(self, write: bool = False) -> dict:
+            if write:
+                self.cfg.require_odoo(write=True)
+            task = self.fields('project.task')
+
         project = self.fields('project.project')
 
         def valid(
