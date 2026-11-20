@@ -31,7 +31,7 @@ def serialize_checkpoint(day: date) -> str:
 
 
 def days_to_process(
-    initial: date,
+    initial: date | None,
     last_done: date | None,
     today: date,
     overlap_days: int,
@@ -42,7 +42,9 @@ def days_to_process(
         initial if last_done is None
         else last_done - timedelta(days=min(overlap_days, max_days - 1) - 1)
     )
-    if start > today:
+    if start is None:
+        raise ValueError('Set PNCP_INITIAL_DATE to the earliest unprocessed day when no checkpoint exists')
+    if (last_done or start) > today:
         raise ValueError('Checkpoint future')
     day = start
     count = 0
