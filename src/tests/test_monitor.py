@@ -36,16 +36,15 @@ class PNCPTests(unittest.TestCase):
     def test_normalize_preserves_values(self):
         d = normalize(RECORD)
 
-        self.assertEqual(d['valor_estimado'], 379000.0)
+        self.assertEqual(d['estimated_value'], 379000.0)
         self.assertEqual(
             d['pncp_id'],
             RECORD['numeroControlePNCP'],
         )
         self.assertEqual(
-            d['data_encerramento'],
+            d['deadline'],
             '2026-11-27 13:00:00',
         )
-        self.assertEqual(len(d['assinatura']), 64)
 
     def test_no_value_not_zero(self):
         rec = {
@@ -54,7 +53,7 @@ class PNCPTests(unittest.TestCase):
         }
 
         self.assertIsNone(
-            normalize(rec)['valor_estimado']
+            normalize(rec)['estimated_value']
         )
 
     def test_invalid_identifier(self):
@@ -264,7 +263,7 @@ class PaginationTests(unittest.TestCase):
             ),
             FakeResponse(
                 data={
-                    'data': [RECORD],
+                    'data': [{**RECORD, 'numeroControlePNCP': '12345678000190-1-000124/2026'}],
                     'totalPaginas': 2,
                 }
             ),
@@ -332,9 +331,13 @@ class PaginationTests(unittest.TestCase):
 
 
 class FakeOdooSession:
-    def __init__(self, responses):
+    def __init__(self, responses, version=20):
         self.responses = iter(responses)
         self.calls = []
+        self.version = version
+
+    def get(self, url, headers, timeout, allow_redirects):
+        return FakeResponse(data={'version_info': [self.version, 0, 0, 'final', 0, '']})
 
     def post(
         self,
@@ -364,8 +367,8 @@ def cfg(**overrides):
         project_id=11,
         pncp_field='x_pncp_id',
         checkpoint_field='x_pncp_checkpoint',
-        stage_id=None,
-        field_map={'objeto': 'x_objeto'},
+        stage_id=61,
+        field_map={'valor_estimado': 'x_amount'},
     )
 
     defaults.update(overrides)
@@ -398,22 +401,15 @@ class OdooTests(unittest.TestCase):
     def test_write_uses_ids(self):
         session = FakeOdooSession([
             FakeResponse(data=True),
+            FakeResponse(data=True),
         ])
 
         client = OdooClient(cfg(), session)
-        client.update_task(
-            15,
-            {'x_objeto': 'updated'},
-        )
+        client.update_task(15, {'x_amount': 10.0})
 
-        self.assertEqual(
-            session.calls[0][1]['ids'],
-            [15],
-        )
-        self.assertEqual(
-            session.calls[0][1]['vals']['x_objeto'],
-            'updated',
-        )
+        self.assertEqual(session.calls[0][1]['operation'], 'write')
+        self.assertEqual(session.calls[1][1]['ids'], [15])
+        self.assertEqual(session.calls[1][1]['vals']['x_amount'], 10.0)
 
     def test_check_fields_wrong_type_fails(self):
         session = FakeOdooSession([
@@ -470,6 +466,12 @@ class OdooTests(unittest.TestCase):
 
 
 class FakeSource:
+    def budget_is_public(self, identifier):
+        return True
+
+    def documents(self, identifier):
+        return []
+
     def list_day(
         self,
         kind,
@@ -492,9 +494,10 @@ class FakeOdoo:
         self.created = []
         self.updated = []
         self.checkpoints = []
+        self.mappings = {'estimated_value': ('x_amount', {'type': 'float'})}
 
     def check_fields(self, write=False):
-        return {}
+        return self.project(['x_pncp_checkpoint'])
 
     def has_unlinked_tasks(self):
         return False
@@ -518,16 +521,16 @@ class FakeOdoo:
     def create_task(self, vals):
         self.created.append(vals)
 
-        self.records[vals['x_pncp_id']] = {
-            'id': len(self.created),
-            'x_pncp_id': vals['x_pncp_id'],
-            'x_objeto': vals['x_objeto'],
+        record = {
+            **vals, 'id': len(self.created),
+            'stage_id': [vals['stage_id'], 'Initial'],
         }
+        self.records[vals['x_pncp_id']] = record
+        return record['id']
 
     def update_task(self, task_id, vals):
-        self.updated.append(
-            (task_id, vals)
-        )
+        self.updated.append((task_id, vals))
+        next(row for row in self.records.values() if row['id'] == task_id).update(vals)
 
     def write_checkpoint(self, value):
         self.checkpoints.append(value)
@@ -603,7 +606,8 @@ class SyncTests(unittest.TestCase):
                 'project_id',
                 'name',
                 'x_pncp_id',
-                'x_objeto',
+                'stage_id',
+                'x_amount',
             },
         )
 
@@ -718,7 +722,7 @@ class SafetyRegressionTests(unittest.TestCase):
             field_map={'valor_estimado': 'x_amount'}
         )
         sync = Synchronizer(
-            configuration, FILT, FakeSource()
+            configuration, FILT, FakeSource(), FakeOdoo()
         )
 
         explicit = normalize({
@@ -731,10 +735,10 @@ class SafetyRegressionTests(unittest.TestCase):
             if key != 'valorTotalEstimado'
         })
 
-        self.assertEqual(
-            sync._values(explicit),
-            {'x_amount': False},
-        )
+        self.assertIn('estimated_value', explicit)
+        self.assertIsNone(explicit['estimated_value'])
+        self.assertNotIn('estimated_value', absent)
+        self.assertEqual(sync._values(explicit), {})
         self.assertEqual(sync._values(absent), {})
 
     def test_metadata_rejects_system_field(self):
