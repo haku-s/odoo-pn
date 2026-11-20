@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from time import monotonic, sleep
 from urllib.parse import urlsplit
 
@@ -44,7 +45,10 @@ class PNCPRetry(Retry):
                 delay = RATE_LIMIT_STEP * sum(attempt.status == 429 for attempt in self.history)
         else:
             delay = delay or self.get_backoff_time()
-        sleep(max(REQUEST_INTERVAL, delay))
+        wait = max(REQUEST_INTERVAL, delay)
+        if response is not None and response.status == 429:
+            logging.getLogger(__name__).warning('PNCP HTTP 429 retry_wait_seconds=%.1f', wait)
+        sleep(wait)
 
 
 class PNCPAdapter(HTTPAdapter):
@@ -147,6 +151,19 @@ class PNCPClient:
         max_pages: int,
         uf: str | None = None,
     ):
+        for records in self.list_day_pages(kind, day, modality, page_size, max_pages, uf):
+            yield from records
+
+    def list_day_pages(
+        self,
+        kind: str,
+        day,
+        modality: int,
+        page_size: int,
+        max_pages: int,
+        uf: str | None = None,
+    ):
+        """Yield each complete, validated consultation page."""
         if kind not in ('publicacao', 'atualizacao'):
             raise ValueError('Unsupported operation')
         params = {
@@ -230,7 +247,7 @@ class PNCPClient:
                 if identifier in identifiers:
                     raise RuntimeError('Repeated record in PNCP pagination')
                 identifiers.add(identifier)
-                yield record
+            yield records
             if page >= total_pages:
                 return
             page += 1
