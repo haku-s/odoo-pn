@@ -14,7 +14,7 @@ from urllib.parse import urljoin
 import requests
 
 from .odoo import ATTACHMENT, TASK, direct_attachment
-from .pn import Document, validate_document_url
+from .pn import MAX_RATE_LIMIT_RETRY_WAIT, Document, PNCPSession, validate_document_url
 
 MAX_BYTES = 40 * 1024 * 1024
 DOWNLOAD_SECONDS = 120
@@ -105,7 +105,7 @@ def name_and_mime(document: Document, data: bytes) -> tuple[str, str]:
 
 def download(session: requests.Session, document: Document) -> bytes:
     url = document.url
-    deadline = monotonic() + DOWNLOAD_SECONDS
+    deadline = monotonic() + DOWNLOAD_SECONDS + MAX_RATE_LIMIT_RETRY_WAIT
     try:
         for _ in range(4):
             if monotonic() >= deadline:
@@ -126,6 +126,8 @@ def download(session: requests.Session, document: Document) -> bytes:
                     continue
                 if response.status_code != 200:
                     raise RuntimeError(f'Official document download: HTTP {response.status_code}')
+                # Retry waits can precede the body, which still has its own time limit.
+                deadline = min(deadline, monotonic() + DOWNLOAD_SECONDS)
                 headers = response.headers
                 kind = headers.get('Content-Type', '').split(';')[0].strip().lower()
                 if (
@@ -152,6 +154,9 @@ def download(session: requests.Session, document: Document) -> bytes:
                 return bytes(content)
     except requests.RequestException as exc:
         raise RuntimeError('Official document download interrupted') from exc
+    finally:
+        if isinstance(session, PNCPSession):
+            session.finish_attempt()
     raise RuntimeError('Official document redirect limit exceeded')
 
 
