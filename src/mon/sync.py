@@ -32,12 +32,16 @@ class Synchronizer:
         self.apply = apply
         self.stats = Counter()
 
+    
     def _values(self, record: dict) -> dict:
         return {
-            dest: record[source]
+            dest: (
+                False if record[source] is None else record[source]
+            )
             for source, dest in self.cfg.field_map.items()
-            if record.get(source) is not None
+            if source in record
         }
+
 
     def _sync_batch(self, records: dict[str, dict]) -> None:
         if not records:
