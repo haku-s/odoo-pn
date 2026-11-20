@@ -6,7 +6,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
@@ -95,7 +95,7 @@ class Filters:
 @dataclass(frozen=True)
 class Settings:
     today: date
-    initial_date: date
+    initial_date: date | None
     overlap_days: int
     max_days: int
     page_size: int
@@ -113,14 +113,12 @@ class Settings:
     def from_env(cls) -> 'Settings':
         from datetime import datetime
         today = datetime.now(BRASILIA).date()
+        initial = os.getenv('PNCP_INITIAL_DATE')
         try:
-            first = date.fromisoformat(os.getenv(
-                'PNCP_INITIAL_DATE',
-                (today - timedelta(days=2)).isoformat(),
-            ))
+            first = date.fromisoformat(initial) if initial else None
         except ValueError as exc:
             raise ValueError('Invalid PNCP_INITIAL_DATE') from exc
-        if first > today:
+        if first is not None and first > today:
             raise ValueError('Initial date cannot be in the future')
         try:
             mapping = json.loads(os.getenv('ODOO_FIELD_MAP', '').strip() or '{}')
