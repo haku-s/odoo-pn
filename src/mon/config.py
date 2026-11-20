@@ -159,9 +159,23 @@ class Settings:
         pncp_field = os.getenv('ODOO_PNCP_FIELD', '')
         checkpoint_field = os.getenv('ODOO_CHECKPOINT_FIELD', '')
 
+        
         for name in (pncp_field, checkpoint_field):
-            if name and not TECHNICAL_FIELD.fullmatch(name):
-                raise ValueError('Invalid technical field name')
+            if name and (
+                not TECHNICAL_FIELD.fullmatch(name)
+                or not name.startswith('x_')
+            ):
+                raise ValueError(
+                    'Only custom technical fields are supported'
+                )
+
+        if (
+            pncp_field
+            and checkpoint_field
+            and pncp_field == checkpoint_field
+        ):
+            raise ValueError('Reserved fields must be distinct')
+
 
         if pncp_field and pncp_field in mapping.values():
             raise ValueError('Reserved field mapping conflict')
