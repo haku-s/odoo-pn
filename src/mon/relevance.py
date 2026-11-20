@@ -19,8 +19,10 @@ def fold(s: object) -> str:
 
 
 def is_relevant(record: dict, filt: Filters) -> bool:
-    unit = record.get('unidadeOrgao') or {}
-    uf = str(unit.get('ufSigla') or '').upper()
+    unit = record.get('unidadeOrgao')
+    if unit is not None and not isinstance(unit, dict):
+        raise ValueError('Unexpected organization unit format')
+    uf = str((unit or {}).get('ufSigla') or '').upper()
 
     if filt.ufs and uf not in filt.ufs:
         return False
