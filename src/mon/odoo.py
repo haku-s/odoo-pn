@@ -1,41 +1,203 @@
-"""Remote service client."""
+"""Odoo JSON-2 client and destination preflight."""
 
 from __future__ import annotations
 
+import re
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
 import requests
 
-from .config import ALLOWED_FIELDS, Settings
+from .config import FIELD_ALIASES, OFFICIAL_FIELDS, TECHNICAL_FIELD, Settings
+from .relevance import fold
 
-FIELD_TYPES = {
-    'pncp': {'char', 'text'},
-    'checkpoint': {'text'},
-    'objeto': {'char', 'text'},
-    'numero_edital': {'char', 'text'},
-    'orgao': {'char', 'text'},
-    'cnpj': {'char', 'text'},
-    'uf': {'char', 'text'},
-    'municipio': {'char', 'text'},
-    'modalidade': {'char', 'text'},
-    'situacao': {'char', 'text'},
-    'valor_estimado': {'float', 'monetary'},
-    'data_publicacao': {'date'},
-    'data_atualizacao': {'date'},
-    'data_encerramento': {'datetime'},
-    'url_origem': {'char', 'text'},
-    'assinatura': {'char', 'text'},
+TASK = 'project.task'
+PROJECT = 'project.project'
+STAGE = 'project.task.type'
+ATTACHMENT = 'ir.attachment'
+MESSAGE = 'mail.message'
+CURRENCY = 'res.currency'
+CONTEXT = {'lang': 'pt_BR', 'active_test': False}
+TEXT = {'char', 'text'}
+
+FORM = (
+    ('Projeto', 'project', 'configuration', {'many2one'}, 'project_id'),
+    ('Responsáveis', None, None, None, None),
+    ('Número do processo', 'process_number', 'processo', TEXT, None),
+    ('Número da licitação', 'purchase_number', 'numeroCompra', TEXT, None),
+    ('Edital / aviso', None, None, None, None),
+    ('Modalidade', 'modality', 'modalidadeNome', TEXT | {'selection'}, None),
+    ('Tipo de contratação', None, None, None, None),
+    ('Critério de julgamento', None, None, None, None),
+    ('Forma de adjudicação', None, None, None, None),
+    ('Valor estimado', 'estimated_value', 'valorTotalEstimado', {'float', 'monetary'}, None),
+    ('Tags', None, None, None, None),
+    ('Prazo final', 'deadline', 'dataEncerramentoProposta', {'datetime'}, 'date_deadline'),
+    ('Data e hora da sessão', None, None, None, None),
+    ('Prazo para esclarecimentos', None, None, None, None),
+    ('Órgão contratante', 'organization', 'orgaoEntidade.razaoSocial', TEXT, None),
+    ('Município / UF', 'municipality_state',
+     'unidadeOrgao.municipioNome / unidadeOrgao.ufSigla', TEXT, None),
+    ('Identificador PNCP', 'identifier', 'numeroControlePNCP', TEXT, None),
+    ('Plataforma de disputa', None, None, None, None),
+    ('Link oficial do processo', None, None, None, None),
+    ('Resultado da Homologação', None, None, None, None),
+)
+
+OPERATIONS = {
+    TASK: {'fields_get', 'search_read', 'search_count', 'has_access', 'create', 'write'},
+    PROJECT: {'fields_get', 'search_read', 'has_access', 'write'},
+    STAGE: {'fields_get', 'search_read'},
+    ATTACHMENT: {'fields_get', 'search_read', 'has_access', 'create'},
+    MESSAGE: {'fields_get', 'search_read', 'has_access'},
+    CURRENCY: {'fields_get', 'search_read'},
 }
+ATTACHMENT_FIELDS = {
+    'name': {'char'}, 'description': {'text'}, 'checksum': {'char'},
+    'res_model': {'char'}, 'res_id': {'many2one_reference', 'integer'},
+    'res_field': {'char'}, 'type': {'selection'}, 'raw': {'binary'}, 'mimetype': {'char'},
+}
+ATTACHMENT_READ = ['name', 'description', 'checksum', 'res_model', 'res_id', 'res_field', 'type']
+MAX_ODOO_ROWS = 1000
+CHECKSUM = re.compile(r'[0-9a-f]{40}')
+
+
+def selection_keys(meta: dict) -> dict:
+    choices = meta.get('selection')
+    if not isinstance(choices, list) or not choices:
+        raise ValueError('Missing selection options')
+    keys = {}
+    for pair in choices:
+        if (
+            not isinstance(pair, (list, tuple)) or len(pair) != 2
+            or not isinstance(pair[0], str) or not pair[0] or pair[0] in keys
+            or not isinstance(pair[1], str) or not pair[1].strip()
+        ):
+            raise ValueError('Invalid selection options')
+        keys[pair[0]] = pair[1]
+    return keys
+
+
+def selection_value(meta: dict, value: str) -> str:
+    keys = [
+        key for key, label in selection_keys(meta).items()
+        if fold(label.strip()) == fold(value)
+    ]
+    if len(keys) != 1:
+        raise ValueError('Official modality has no unique Odoo selection')
+    return keys[0]
+
+
+def amount_value(value: float, step: Decimal | None) -> float:
+    if step is None:
+        return value
+    try:
+        return float((Decimal(str(value)) / step).quantize(Decimal(1), rounding=ROUND_HALF_UP) * step)
+    except InvalidOperation as exc:
+        raise ValueError('Estimated value exceeds the supported Odoo precision') from exc
+
+
+def float_step(meta: dict) -> Decimal | None:
+    digits = meta.get('digits')
+    if digits is None or digits is False or digits == 0:
+        return None
+    if (
+        not isinstance(digits, (list, tuple)) or len(digits) != 2
+        or any(type(value) is not int for value in digits)
+        or not 0 <= digits[1] <= 16
+    ):
+        raise ValueError('Invalid Odoo estimated value precision')
+    return Decimal(1).scaleb(-digits[1])
+
+
+def positive_id(value) -> bool:
+    return type(value) is int and value > 0
+
+
+def relation_id(value):
+    if isinstance(value, (list, tuple)) and len(value) == 2 and positive_id(value[0]):
+        return value[0]
+    return None
+
+
+def _valid(metadata, name, types, *, writable=False, relation=None):
+    meta = metadata.get(name, {})
+    if (
+        meta.get('type') not in types
+        or (writable and meta.get('readonly') is not False)
+        or (relation and meta.get('relation') != relation)
+    ):
+        raise ValueError(f'Incompatible or inaccessible Odoo field: {name}')
+
+
+def field_inventory(task: dict, settings: Settings) -> tuple[list[dict], dict, list[str]]:
+    inventory, mappings, errors = [], {}, []
+    configured = {}
+    for key, name in settings.field_map.items():
+        source = FIELD_ALIASES.get(key, key)
+        if source not in OFFICIAL_FIELDS:
+            errors.append(f'Unsupported Odoo field mapping: {key}')
+        if source in configured:
+            errors.append(f'Duplicate Odoo source mapping: {source}')
+        configured[source] = name
+
+    for label, source, path, types, standard in FORM:
+        matches = [
+            (name, meta) for name, meta in task.items()
+            if fold(str(meta.get('string') or '').strip()) == fold(label)
+        ]
+        name, meta = matches[0] if len(matches) == 1 else (None, {})
+        entry = {
+            'label': label, 'technical_name': name, 'type': meta.get('type'),
+            'selections': meta.get('selection') or [], 'source_path': path,
+            'writable': None if type(meta.get('readonly')) is not bool else not meta['readonly'],
+            'write_enabled': False,
+            'status': 'unresolved' if not matches else 'ambiguous' if len(matches) > 1 else 'excluded',
+        }
+        inventory.append(entry)
+        if source is None:
+            continue
+        if name is None:
+            errors.append(f'Missing or ambiguous Odoo field: {label}')
+            continue
+        expected = settings.pncp_field if source == 'identifier' else configured.get(source)
+        if (
+            (expected and name != expected)
+            or (standard and name != standard)
+            or (not standard and (not name.startswith('x_') or not TECHNICAL_FIELD.fullmatch(name)))
+        ):
+            entry['status'] = 'incompatible'
+            errors.append(f'Odoo field mapping does not match label: {label}')
+            continue
+        try:
+            _valid(task, name, types, writable=True, relation=PROJECT if source == 'project' else None)
+            if meta['type'] == 'selection':
+                selection_keys(meta)
+            if source == 'estimated_value':
+                if meta['type'] == 'monetary':
+                    currency = meta.get('currency_field')
+                    if not isinstance(currency, str):
+                        raise ValueError('Missing Odoo currency field')
+                    _valid(task, currency, {'many2one'}, relation=CURRENCY)
+                else:
+                    float_step(meta)
+        except ValueError:
+            entry['status'] = 'incompatible'
+            errors.append(f'Incompatible Odoo field metadata: {label}')
+            continue
+        entry['status'] = 'validated'
+        if source not in ('project', 'identifier'):
+            mappings[source] = (name, meta)
+    return inventory, mappings, errors
 
 
 class OdooClient:
-    def __init__(
-        self,
-        settings: Settings,
-        session: requests.Session | None = None,
-    ):
+    def __init__(self, settings: Settings, session: requests.Session | None = None):
         settings.require_odoo()
         self.cfg = settings
         self.session = session or requests.Session()
         self.base = settings.odoo_url
+        self.mappings = {}
+        self.currency_steps: dict[int, Decimal] = {}
         self.headers = {
             'Authorization': f'bearer {settings.odoo_api_key}',
             'Content-Type': 'application/json',
@@ -45,165 +207,262 @@ class OdooClient:
             self.headers['X-Odoo-Database'] = settings.odoo_database
 
     def call(self, model: str, method: str, **params):
-        if (
-            model not in {'project.task', 'project.project'}
-            or method not in {'fields_get', 'search_read', 'create', 'write'}
-        ):
+        if method not in OPERATIONS.get(model, ()):
             raise ValueError('Operation not permitted')
-
         try:
-            res = self.session.post(
-                f'{self.base}/json/2/{model}/{method}',
-                headers=self.headers,
-                json=params,
-                timeout=(10, 40),
-                allow_redirects=False,
+            response = self.session.post(
+                f'{self.base}/json/2/{model}/{method}', headers=self.headers,
+                json=params, timeout=(10, 40), allow_redirects=False,
             )
         except requests.RequestException as exc:
-            raise RuntimeError('Remote service connection failed') from exc
-
-        if not res.ok:
-            raise RuntimeError(
-                f'Remote request failed: {model}/{method} HTTP {res.status_code}'
-            )
+            raise RuntimeError('Odoo connection failed') from exc
+        if response.status_code != 200:
+            raise RuntimeError(f'Odoo {model}/{method}: HTTP {response.status_code}')
         try:
-            return res.json()
+            return response.json()
         except ValueError as exc:
-            raise RuntimeError('Invalid response format') from exc
+            raise RuntimeError('Invalid Odoo response format') from exc
+
+    def _require_attachment_contract(self) -> None:
+        try:
+            response = self.session.get(
+                f'{self.base}/web/version', headers={'Accept': 'application/json'},
+                timeout=(10, 20), allow_redirects=False,
+            )
+            if response.status_code != 200:
+                raise RuntimeError(f'Odoo version check: HTTP {response.status_code}')
+            body = response.json()
+        except requests.RequestException as exc:
+            raise RuntimeError('Odoo version check could not connect') from exc
+        except ValueError as exc:
+            raise RuntimeError('Invalid Odoo version response') from exc
+        info = body.get('version_info') if isinstance(body, dict) else None
+        if not isinstance(info, list) or not info or type(info[0]) is not int or info[0] != 20:
+            raise ValueError('The attachment write contract requires Odoo 20')
 
     def fields(self, model: str) -> dict:
         result = self.call(
-            model,
-            'fields_get',
-            attributes=['type', 'string', 'readonly', 'required'],
+            model, 'fields_get', context=CONTEXT,
+            attributes=['type', 'string', 'readonly', 'selection', 'relation', 'digits', 'currency_field'],
         )
-        if not isinstance(result, dict):
-            raise ValueError('Unexpected field metadata')
+        if not isinstance(result, dict) or any(
+            not isinstance(name, str) or not isinstance(meta, dict)
+            for name, meta in result.items()
+        ):
+            raise ValueError('Unexpected Odoo field metadata')
         return result
 
-    def check_fields(self, write: bool = False) -> dict:
+    def rows(self, model, domain, fields, limit):
+        rows = self.call(
+            model, 'search_read', domain=domain, fields=['id', *fields],
+            limit=limit, context=CONTEXT,
+        )
+        if (
+            not isinstance(rows, list) or len(rows) >= limit
+            or any(not isinstance(row, dict) or not positive_id(row.get('id')) for row in rows)
+            or len({row['id'] for row in rows}) != len(rows)
+        ):
+            raise RuntimeError(f'Incomplete or invalid lookup: {model}')
+        return rows
+
+    def require_access(self, model, operation, ids=()):
+        if self.call(model, 'has_access', ids=list(ids), operation=operation, context=CONTEXT) is not True:
+            raise ValueError(f'Odoo access denied: {model}/{operation}')
+
+    def check_fields(self, write=False, *, report=None) -> dict:
+        task = self.fields(TASK)
+        project = self.fields(PROJECT)
+        inventory, mappings, errors = field_inventory(task, self.cfg)
+        if report is not None:
+            report.extend(inventory)
+        if errors:
+            raise ValueError('; '.join(errors))
+        self.cfg.require_odoo(write=write)
+        if not self.cfg.pncp_field:
+            raise ValueError('Missing ODOO_PNCP_FIELD')
+        if not self.cfg.stage_id or self.cfg.stage_id <= 0:
+            raise ValueError('Missing or invalid ODOO_STAGE_ID')
         if write:
-            self.cfg.require_odoo(write=True)
-            reserved = (self.cfg.pncp_field, self.cfg.checkpoint_field)
-            if (
-                any(not isinstance(field, str) or not field.startswith('x_')
-                    for field in reserved)
-                or len(set(reserved)) != 2
-                or any(field in self.cfg.field_map.values() for field in reserved)
-            ):
-                raise ValueError('Unsafe reserved field configuration')
+            self._require_attachment_contract()
+            _valid(task, 'name', {'char'}, writable=True)
+            _valid(task, 'stage_id', {'many2one'}, writable=True, relation=STAGE)
+            _valid(project, self.cfg.checkpoint_field, {'text'}, writable=True)
+        elif self.cfg.checkpoint_field:
+            _valid(project, self.cfg.checkpoint_field, {'text'})
 
-        task = self.fields('project.task')
-        project = self.fields('project.project')
+        stage = self.fields(STAGE)
+        _valid(stage, 'name', {'char'})
+        _valid(stage, 'active', {'boolean'})
+        _valid(stage, 'project_ids', {'many2many'}, relation=PROJECT)
+        _valid(project, 'name', {'char'})
+        _valid(project, 'active', {'boolean'})
 
-        def valid(spec: dict, name: str, types: set, label: str):
-            if not name or name not in spec:
-                raise ValueError(f'{label}: required field is missing')
-            meta = spec[name]
-            if (
-                not isinstance(meta, dict)
-                or meta.get('type') not in types
-                or (write and meta.get('readonly'))
-            ):
-                raise ValueError(f'{label}: incompatible field configuration')
+        project_row = self.project(['name', 'active', *(
+            [self.cfg.checkpoint_field] if self.cfg.checkpoint_field else []
+        )])
+        if self.cfg.checkpoint_field and self.cfg.checkpoint_field not in project_row:
+            raise ValueError('Odoo checkpoint could not be read')
+        if fold(project_row.get('name')) != fold('Licitações') or project_row.get('active') is not True:
+            raise ValueError('Configured Odoo project does not match the active destination')
+        stages = self.rows(STAGE, [['id', '=', self.cfg.stage_id]],
+                           ['name', 'active', 'project_ids'], 2)
+        if (
+            len(stages) != 1 or stages[0]['id'] != self.cfg.stage_id
+            or fold(stages[0].get('name')) != fold('Capturados')
+            or stages[0].get('active') is not True
+            or not isinstance(stages[0].get('project_ids'), list)
+            or self.cfg.project_id not in stages[0]['project_ids']
+        ):
+            raise ValueError('Configured Odoo initial stage does not belong to the destination')
 
+        attachment = self.fields(ATTACHMENT)
+        for name, types in ATTACHMENT_FIELDS.items():
+            _valid(attachment, name, types, writable=write and name in {
+                'name', 'description', 'type', 'raw',
+            })
+        if 'binary' not in selection_keys(attachment['type']):
+            raise ValueError('Odoo binary attachment type is unavailable')
+        # Attachment linkage and MIME can be API inputs even when readonly in the UI.
+        messages = self.fields(MESSAGE)
+        _valid(messages, 'model', {'char'})
+        _valid(messages, 'res_id', {'many2one_reference', 'integer'})
+        _valid(messages, 'attachment_ids', {'many2many'}, relation=ATTACHMENT)
+        if mappings['estimated_value'][1]['type'] == 'monetary':
+            currency = self.fields(CURRENCY)
+            _valid(currency, 'name', {'char'})
+            _valid(currency, 'rounding', {'float'})
+        for model in (TASK, ATTACHMENT, MESSAGE):
+            self.require_access(model, 'read')
         if write:
-            valid(task, self.cfg.pncp_field, FIELD_TYPES['pncp'], 'identifier')
-            valid(
-                project,
-                self.cfg.checkpoint_field,
-                FIELD_TYPES['checkpoint'],
-                'checkpoint',
-            )
-            if 'project_id' not in task or 'name' not in task:
-                raise ValueError('Required base fields are missing')
-            if self.cfg.stage_id and 'stage_id' not in task:
-                raise ValueError('Required stage field is missing')
-            for source, dest in self.cfg.field_map.items():
-                if source not in ALLOWED_FIELDS:
-                    raise ValueError('Unsupported source field')
-                valid(task, dest, FIELD_TYPES[source], source)
-
-        return {'project.task': task, 'project.project': project}
+            self.require_access(TASK, 'create')
+            self.require_access(TASK, 'write')
+            self.require_access(PROJECT, 'write', [self.cfg.project_id])
+            self.require_access(ATTACHMENT, 'create')
+            for entry in inventory:
+                entry['write_enabled'] = entry['status'] == 'validated'
+        self.mappings = mappings
+        return project_row
 
     def project(self, fields: list[str]) -> dict:
-        rows = self.call(
-            'project.project',
-            'search_read',
-            domain=[['id', '=', self.cfg.project_id]],
-            fields=['id', *fields],
-            limit=2,
-        )
-        if not isinstance(rows, list) or len(rows) != 1:
-            raise ValueError('Requested resource is unavailable')
+        rows = self.rows(PROJECT, [['id', '=', self.cfg.project_id]], fields, 2)
+        if len(rows) != 1 or rows[0]['id'] != self.cfg.project_id:
+            raise ValueError('Configured Odoo project is unavailable')
         return rows[0]
 
     def has_unlinked_tasks(self) -> bool:
-        rows = self.call(
-            'project.task',
-            'search_read',
-            domain=[
-                ['project_id', '=', self.cfg.project_id],
-                [self.cfg.pncp_field, '=', False],
-            ],
-            fields=['id'],
-            limit=1,
-        )
-        if not isinstance(rows, list):
-            raise RuntimeError('Unexpected lookup response')
-        return bool(rows)
+        count = self.call(TASK, 'search_count', domain=[
+            ['project_id', '=', self.cfg.project_id],
+            [self.cfg.pncp_field, '=', False],
+        ], limit=1, context=CONTEXT)
+        if type(count) is not int or count not in (0, 1):
+            raise RuntimeError('Invalid unlinked task count')
+        return bool(count)
 
     def tasks(self, ids: list[str]) -> dict[str, dict]:
         if not ids:
             return {}
-        fields = ['id', self.cfg.pncp_field, *self.cfg.field_map.values()]
-        rows = self.call(
-            'project.task',
-            'search_read',
-            domain=[
-                ['project_id', '=', self.cfg.project_id],
-                [self.cfg.pncp_field, 'in', ids],
-            ],
-            fields=list(dict.fromkeys(fields)),
-            limit=len(ids) + 1,
-        )
-        if not isinstance(rows, list):
-            raise RuntimeError('Unexpected lookup response')
-
+        identifier = self.cfg.pncp_field
+        fields = ['project_id', 'stage_id', identifier, *(name for name, _ in self.mappings.values())]
+        amount = self.mappings.get('estimated_value')
+        if amount and amount[1]['type'] == 'monetary':
+            fields.append(amount[1]['currency_field'])
+        rows = self.rows(TASK, [[identifier, 'in', ids]], fields, len(ids) + 1)
         by_id = {}
-        for item in rows:
-            pncp_id = item.get(self.cfg.pncp_field)
-            if pncp_id in by_id:
-                raise RuntimeError('Duplicate record identifier')
-            by_id[pncp_id] = item
+        for row in rows:
+            key = row.get(identifier)
+            if (
+                not isinstance(key, str) or key not in ids or key in by_id
+                or relation_id(row.get('project_id')) != self.cfg.project_id
+                or any(field not in row for field in fields)
+            ):
+                raise RuntimeError('Duplicate identifier or invalid task association')
+            by_id[key] = row
         return by_id
 
-    def create_task(self, values: dict) -> None:
-        result = self.call('project.task', 'create', vals_list=[values])
-        if (
-            not isinstance(result, (int, list))
-            or isinstance(result, bool)
-            or (
-                isinstance(result, list)
-                and (
-                    len(result) != 1
-                    or type(result[0]) is not int
-                )
-            )
-        ):
-            raise RuntimeError('Unexpected create response')
+    def currency_step(self, currency_relation) -> Decimal:
+        currency_id = relation_id(currency_relation)
+        if currency_id is None:
+            raise ValueError('Task currency is unavailable for the estimated value')
+        if currency_id not in self.currency_steps:
+            rows = self.rows(CURRENCY, [['id', '=', currency_id]], ['name', 'rounding'], 2)
+            if len(rows) != 1 or rows[0]['id'] != currency_id or rows[0].get('name') != 'BRL':
+                raise ValueError('Task currency does not match the PNCP estimate')
+            rounding = rows[0].get('rounding')
+            if type(rounding) not in (int, float):
+                raise ValueError('Invalid Odoo currency rounding')
+            step = Decimal(str(rounding))
+            if not step.is_finite() or step <= 0:
+                raise ValueError('Invalid Odoo currency rounding')
+            self.currency_steps[currency_id] = step
+        return self.currency_steps[currency_id]
+
+    def create(self, model: str, values: dict) -> int:
+        result = self.call(model, 'create', vals_list=[values])
+        if isinstance(result, list) and len(result) == 1:
+            result = result[0]
+        if not positive_id(result):
+            raise RuntimeError('Unexpected Odoo create response')
+        return result
+
+    def create_task(self, values: dict) -> int:
+        return self.create(TASK, values)
 
     def update_task(self, task_id: int, values: dict) -> None:
-        result = self.call('project.task', 'write', ids=[task_id], vals=values)
-        if result is not True:
-            raise RuntimeError('Update was not confirmed')
+        self.require_access(TASK, 'write', [task_id])
+        if self.call(TASK, 'write', ids=[task_id], vals=values, context=CONTEXT) is not True:
+            raise RuntimeError('Odoo task update was not confirmed')
+
+    def attachments(self, task_id: int) -> list[dict]:
+        direct = self.rows(ATTACHMENT, [
+            ['res_model', '=', TASK], ['res_id', '=', task_id],
+            ['type', '=', 'binary'], ['res_field', '=', False],
+        ], ATTACHMENT_READ, MAX_ODOO_ROWS)
+        messages = self.rows(MESSAGE, [
+            ['model', '=', TASK], ['res_id', '=', task_id], ['attachment_ids', '!=', False],
+        ], ['attachment_ids'], MAX_ODOO_ROWS)
+        linked = {row['id']: row for row in direct}
+        for row in direct:
+            if not direct_attachment(row, task_id):
+                raise RuntimeError('Invalid direct attachment association')
+        ids = set()
+        for message in messages:
+            items = message.get('attachment_ids')
+            if not isinstance(items, list) or not all(map(positive_id, items)):
+                raise RuntimeError('Invalid Chatter attachment metadata')
+            ids.update(items)
+        if len(ids) >= MAX_ODOO_ROWS:
+            raise RuntimeError('Chatter attachment limit exceeded')
+        missing = sorted(ids - linked.keys())
+        for offset in range(0, len(missing), 100):
+            chunk = missing[offset:offset + 100]
+            rows = self.rows(ATTACHMENT, [['id', 'in', chunk]], ATTACHMENT_READ, len(chunk) + 1)
+            if (
+                {row['id'] for row in rows} != set(chunk)
+                or any(row.get('type') not in {'binary', 'url'} for row in rows)
+            ):
+                raise RuntimeError('Incomplete Chatter attachment lookup')
+            linked.update((row['id'], row) for row in rows if row.get('type') == 'binary')
+        if any(
+            not isinstance(row.get('name'), str)
+            or not isinstance(row.get('checksum'), str)
+            or not CHECKSUM.fullmatch(row['checksum'])
+            or 'description' not in row
+            for row in linked.values()
+        ):
+            raise RuntimeError('Incomplete Odoo attachment metadata')
+        return list(linked.values())
 
     def write_checkpoint(self, serialized: str) -> None:
         result = self.call(
-            'project.project',
-            'write',
-            ids=[self.cfg.project_id],
-            vals={self.cfg.checkpoint_field: serialized},
+            PROJECT, 'write', ids=[self.cfg.project_id],
+            vals={self.cfg.checkpoint_field: serialized}, context=CONTEXT,
         )
         if result is not True:
-            raise RuntimeError('State update was not confirmed')
+            raise RuntimeError('Odoo checkpoint update was not confirmed')
+
+
+def direct_attachment(row: dict, task_id: int) -> bool:
+    return (
+        row.get('res_model') == TASK and row.get('res_id') == task_id
+        and row.get('type') == 'binary' and row.get('res_field') is False
+    )
