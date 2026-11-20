@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import monotonic, sleep
 from urllib.parse import urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
+from urllib3.exceptions import InvalidHeader, MaxRetryError
 from urllib3.util.retry import Retry
 
 from .normalizer import purchase_identity
@@ -17,6 +19,61 @@ BASE = f'{CONSULTATION_BASE}/v1/contratacoes'
 FILES_BASE = 'https://pncp.gov.br/api/pncp'
 MAX_DOCUMENTS = 100
 LOOKUP_PAGE_SIZE = 50
+# Local pacing for the sequential collector.
+REQUEST_INTERVAL = 1.0
+MAX_RETRY_AFTER = 30
+
+
+class PNCPRetry(Retry):
+    def __init__(self, pace, **kwargs):
+        super().__init__(**kwargs)
+        self._pace = pace
+
+    def new(self, **kwargs):
+        return super().new(pace=self._pace, **kwargs)
+
+    def increment(self, method=None, url=None, response=None, _pool=None, **kwargs):
+        if response is not None and (self.get_retry_after(response) or 0) > MAX_RETRY_AFTER:
+            # Return the HTTP response through urllib3's existing exhausted-status path.
+            raise MaxRetryError(_pool, url, 'PNCP Retry-After exceeds the local wait limit')
+        return super().increment(method, url, response, _pool=_pool, **kwargs)
+
+    def sleep(self, response=None):
+        delay = self.get_retry_after(response) if response is not None else None
+        self._pace(delay or self.get_backoff_time())
+
+
+class PNCPAdapter(HTTPAdapter):
+    def __init__(self):
+        self._next_attempt = None
+        super().__init__(max_retries=PNCPRetry(
+            self._pace, total=3, backoff_factor=1.0,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods={'GET'}, respect_retry_after_header=True, raise_on_status=False,
+        ))
+
+    def _pace(self, delay=0):
+        now = monotonic()
+        gap = self._next_attempt - now if self._next_attempt is not None else 0
+        wait = max(delay, gap)
+        if wait > 0:
+            sleep(wait)
+        self._next_attempt = monotonic() + REQUEST_INTERVAL
+
+    def send(self, request, **kwargs):
+        self._pace()
+        response = super().send(request, **kwargs)
+        if response.is_redirect and 'Retry-After' in response.headers:
+            try:
+                delay = self.max_retries.get_retry_after(response.raw)
+            except InvalidHeader as exc:
+                response.close()
+                raise requests.exceptions.InvalidHeader('Invalid PNCP redirect wait') from exc
+            if delay > MAX_RETRY_AFTER:
+                response.close()
+                raise RuntimeError('PNCP redirect Retry-After exceeds the local wait limit')
+            self._next_attempt = max(self._next_attempt, monotonic() + delay)
+        return response
 
 
 def purchase_path(identifier: str) -> str:
@@ -30,7 +87,10 @@ def validate_document_url(url: object, path: str) -> str:
         or any(ord(ch) <= 32 or ord(ch) == 127 or ch in '?#' for ch in url)
     ):
         raise ValueError('Invalid official document URL')
-    parsed = urlsplit(url)
+    try:
+        parsed = urlsplit(url)
+    except ValueError as exc:
+        raise ValueError('Invalid official document URL') from exc
     if (
         parsed.scheme != 'https' or parsed.netloc not in ('pncp.gov.br', 'pncp.gov.br:443')
         or parsed.query or parsed.fragment
@@ -52,15 +112,7 @@ class PNCPClient:
     def __init__(self, session: requests.Session | None = None):
         self.session = session if session is not None else requests.Session()
         if session is None:
-            retry = Retry(
-                total=3,
-                backoff_factor=1.0,
-                status_forcelist=[429, 500, 502, 503, 504],
-                allowed_methods={'GET'},
-                respect_retry_after_header=True,
-                raise_on_status=False,
-            )
-            self.session.mount('https://', HTTPAdapter(max_retries=retry))
+            self.session.mount('https://', PNCPAdapter())
         self.session.headers.update({
             'Accept': 'application/json',
             'User-Agent': 'pnx/1.0',
@@ -97,9 +149,10 @@ class PNCPClient:
                     f'{BASE}/{kind}',
                     params=params,
                     timeout=(10, 40),
+                    allow_redirects=False,
                 )
             except requests.RequestException as exc:
-                raise RuntimeError('Remote service connection failed') from exc
+                raise RuntimeError(f'PNCP consultation page {page}: request failed') from exc
 
             if resp.status_code == 204:
                 if page == 1:
@@ -107,7 +160,7 @@ class PNCPClient:
                 raise RuntimeError('Unexpected empty page; state not advanced')
             if resp.status_code != 200:
                 raise RuntimeError(
-                    f'Remote request failed: HTTP {resp.status_code}'
+                    f'PNCP consultation page {page}: HTTP {resp.status_code}'
                 )
             try:
                 data = resp.json()
@@ -163,28 +216,29 @@ class PNCPClient:
             page += 1
 
 
-    def _purchase_json(self, url: str, **params):
+    def _purchase_json(self, url: str, operation: str, **params):
         try:
             response = self.session.get(
                 url, params=params, timeout=(10, 40), allow_redirects=False,
             )
         except requests.RequestException as exc:
-            raise RuntimeError('PNCP purchase lookup failed') from exc
+            raise RuntimeError(f'PNCP {operation}: request failed') from exc
         if response.status_code == 204:
             return []
         if response.status_code != 200:
-            raise RuntimeError(f'PNCP purchase lookup failed: HTTP {response.status_code}')
+            raise RuntimeError(f'PNCP {operation}: HTTP {response.status_code}')
         try:
             return response.json()
         except ValueError as exc:
-            raise RuntimeError('Invalid PNCP purchase response') from exc
+            raise RuntimeError(f'PNCP {operation}: invalid response') from exc
 
     def documents(self, identifier: str) -> list[Document]:
         path = f'{purchase_path(identifier)}/arquivos'
         rows = []
         for page in range(1, MAX_DOCUMENTS // LOOKUP_PAGE_SIZE + 2):
             batch = self._purchase_json(
-                FILES_BASE + path, pagina=page, tamanhoPagina=LOOKUP_PAGE_SIZE,
+                FILES_BASE + path, f'document listing page {page}',
+                pagina=page, tamanhoPagina=LOOKUP_PAGE_SIZE,
             )
             if (
                 not isinstance(batch, list) or len(batch) > LOOKUP_PAGE_SIZE
@@ -222,7 +276,7 @@ class PNCPClient:
         return documents
 
     def budget_is_public(self, identifier: str) -> bool:
-        detail = self._purchase_json(CONSULTATION_BASE + purchase_path(identifier))
+        detail = self._purchase_json(CONSULTATION_BASE + purchase_path(identifier), 'budget lookup')
         if not isinstance(detail, dict) or detail.get('numeroControlePNCP') != identifier:
             raise ValueError('Purchase identity was not confirmed for the budget lookup')
         code = detail.get('orcamentoSigilosoCodigo')
