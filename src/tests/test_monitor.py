@@ -647,5 +647,118 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(db.checkpoints, [])
 
 
+class SafetyRegressionTests(unittest.TestCase):
+    def test_resume_does_not_skip_old_backlog(self):
+        days = list(
+            days_to_process(
+                TODAY - timedelta(days=2),
+                TODAY - timedelta(days=10),
+                TODAY,
+                2,
+                3,
+            )
+        )
+        self.assertEqual(
+            days,
+            [
+                TODAY - timedelta(days=11),
+                TODAY - timedelta(days=10),
+                TODAY - timedelta(days=9),
+            ],
+        )
+
+    def test_intermediate_204_is_error(self):
+        session = FakePNCPSession([
+            FakeResponse(
+                data={
+                    'data': [RECORD],
+                    'totalPaginas': 2,
+                }
+            ),
+            FakeResponse(204),
+        ])
+
+        with self.assertRaises(RuntimeError):
+            list(
+                PNCPClient(session).list_day(
+                    'publicacao', TODAY, 6, 50, 30
+                )
+            )
+
+    def test_reserved_fields_must_be_custom(self):
+        for field, value in [
+            ('ODOO_PNCP_FIELD', 'name'),
+            ('ODOO_CHECKPOINT_FIELD', 'name'),
+        ]:
+            with self.subTest(field=field):
+                with patch.dict(
+                    os.environ,
+                    {
+                        field: value,
+                        'ODOO_FIELD_MAP': '{}',
+                    },
+                ):
+                    with self.assertRaises(ValueError):
+                        Settings.from_env()
+
+    def test_reserved_field_collision(self):
+        with patch.dict(
+            os.environ,
+            {
+                'ODOO_PNCP_FIELD': 'x_same',
+                'ODOO_CHECKPOINT_FIELD': 'x_same',
+                'ODOO_FIELD_MAP': '{}',
+            },
+        ):
+            with self.assertRaises(ValueError):
+                Settings.from_env()
+
+    def test_null_is_distinct_from_missing(self):
+        configuration = cfg(
+            field_map={'valor_estimado': 'x_amount'}
+        )
+        sync = Synchronizer(
+            configuration, FILT, FakeSource()
+        )
+
+        explicit = normalize({
+            **RECORD,
+            'valorTotalEstimado': None,
+        })
+        absent = normalize({
+            key: value
+            for key, value in RECORD.items()
+            if key != 'valorTotalEstimado'
+        })
+
+        self.assertEqual(
+            sync._values(explicit),
+            {'x_amount': False},
+        )
+        self.assertEqual(sync._values(absent), {})
+
+    def test_metadata_rejects_system_field(self):
+        configuration = cfg(pncp_field='name')
+        session = FakeOdooSession([
+            FakeResponse(
+                data={
+                    'name': {'type': 'char'},
+                    'project_id': {'type': 'many2one'},
+                }
+            ),
+            FakeResponse(
+                data={
+                    'x_pncp_checkpoint': {
+                        'type': 'text',
+                    },
+                }
+            ),
+        ])
+
+        with self.assertRaises(ValueError):
+            OdooClient(
+                configuration, session
+            ).check_fields(write=True)
+
 if __name__ == '__main__':
     unittest.main()
