@@ -1,1 +1,66 @@
 
+name: pnx
+
+on:
+  schedule:
+    - cron: '11,41 * * * *'
+
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'sync'
+        type: choice
+        options:
+          - preview
+          - inspect
+          - apply
+        default: preview
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pncp-sync-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.ENABLE_COLLECT == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.15.2'
+
+      - name: deps
+        run: python -m pip install -r requirements.txt
+
+      - name: Tests
+        env:
+          PYTHONPATH: src
+        run: python -m unittest discover -s src/tests -v
+
+      - name: collect
+        env:
+          PYTHONPATH: src
+          MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || (vars.ENABLE_SYNC == 'true' && 'apply' || 'preview') }}
+          ODOO_URL: ${{ vars.ODOO_URL }}
+          ODOO_DATABASE: ${{ vars.ODOO_DATABASE }}
+          ODOO_PROJECT_ID: ${{ vars.ODOO_PROJECT_ID }}
+          ODOO_STAGE_ID: ${{ vars.ODOO_STAGE_ID }}
+          ODOO_PNCP_FIELD: ${{ vars.ODOO_PNCP_FIELD }}
+          ODOO_CHECKPOINT_FIELD: ${{ vars.ODOO_CHECKPOINT_FIELD }}
+          ODOO_FIELD_MAP: ${{ vars.ODOO_FIELD_MAP }}
+          ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
+          PNCP_FILTERS_JSON: ${{ secrets.PNCP_FILTERS_JSON }}
+          ODOO_ALLOW_UNLINKED_TASKS: ${{ vars.ODOO_ALLOW_UNLINKED_TASKS }}
+        run: python -m mon "$MODE"
+
