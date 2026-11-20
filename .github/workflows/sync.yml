@@ -49,7 +49,7 @@ jobs:
         env:
           PYTHONPATH: src
           MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || (vars.ENABLE_SYNC == 'true' && 'apply' || 'preview') }}
-          ODOO_URL: ${{ vars.ODOO_URL }}
+          ODOO_URL: ${{ secrets.ODOO_URL }}
           ODOO_DATABASE: ${{ vars.ODOO_DATABASE }}
           ODOO_PROJECT_ID: ${{ vars.ODOO_PROJECT_ID }}
           ODOO_STAGE_ID: ${{ vars.ODOO_STAGE_ID }}
@@ -60,4 +60,3 @@ jobs:
           PNCP_FILTERS_JSON: ${{ secrets.PNCP_FILTERS_JSON }}
           ODOO_ALLOW_UNLINKED_TASKS: ${{ vars.ODOO_ALLOW_UNLINKED_TASKS }}
         run: uv run --locked python -m mon "$MODE"
-
