@@ -232,3 +232,12 @@ class Settings:
             or not self.checkpoint_field
         ):
             raise ValueError('Required write fields are not configured')
+
+        if write and (
+            not self.pncp_field.startswith('x_')
+            or not self.checkpoint_field.startswith('x_')
+            or self.pncp_field == self.checkpoint_field
+            or self.pncp_field in self.field_map.values()
+            or self.checkpoint_field in self.field_map.values()
+        ):
+            raise ValueError('Unsafe write field configuration')
