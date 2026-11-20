@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 
 from .config import Filters, Settings
@@ -23,27 +22,19 @@ def main(argv=None) -> int:
     try:
         cfg = Settings.from_env()
         if args.command == 'inspect':
-            cfg.require_odoo()
             client = OdooClient(cfg)
-            fields = client.check_fields(write=False)
-            client.project([])
-            for model, names in fields.items():
-                report = {'model': model, 'field_count': len(names)}
-                if os.getenv('ODOO_INSPECT_FIELDS') == '1':
-                    report['fields'] = {
-                        name: meta.get('type')
-                        for name, meta in names.items()
-                        if name.startswith('x_') or name in (
-                            'name', 'description', 'project_id', 'stage_id',
-                        )
-                    }
-                print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+            inventory = []
+            try:
+                client.check_fields(write=True, report=inventory)
+            finally:
+                if inventory:
+                    print(json.dumps({'fields': inventory}, ensure_ascii=False, sort_keys=True))
             return 0
 
         filters = Filters.load()
         if args.command == 'apply':
             cfg.require_odoo(write=True)
-        odoo = OdooClient(cfg) if args.command == 'apply' else None
+        odoo = OdooClient(cfg) if args.command == 'apply' or cfg.odoo_api_key else None
         stats = Synchronizer(
             cfg, filters, PNCPClient(), odoo,
             apply=(args.command == 'apply'),
