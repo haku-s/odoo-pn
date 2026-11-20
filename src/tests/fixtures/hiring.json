@@ -1,0 +1,22 @@
+{
+  "numeroControlePNCP": "12345678000190-1-000123/2026",
+  "numeroCompra": "045/2026",
+  "objetoCompra": "Software licensing for operational management",
+  "informacaoComplementar": "Support and deployment services",
+  "modalidadeId": 6,
+  "modalidadeNome": "Electronic Procedure",
+  "situacaoCompraNome": "Published",
+  "valorTotalEstimado": 379000.0,
+  "dataPublicacaoPncp": "2026-11-19T08:00:00",
+  "dataAtualizacao": "2026-11-19T12:15:00",
+  "dataEncerramentoProposta": "2026-11-27T10:00:00-03:00",
+  "orgaoEntidade": {
+    "cnpj": "12345678000190",
+    "razaoSocial": "Sample Organization"
+  },
+  "unidadeOrgao": {
+    "ufSigla": "SP",
+    "municipioNome": "Sample City"
+  },
+  "linkSistemaOrigem": "https://example.com/reference/45"
+}
