@@ -10,12 +10,8 @@ BASE = 'https://pncp.gov.br/api/consulta/v1/contratacoes'
 
 
 class PNCPClient:
-    def __init__(
-        self,
-        session: requests.Session | None = None,
-    ):
+    def __init__(self, session: requests.Session | None = None):
         self.session = session or requests.Session()
-
         if session is None:
             retry = Retry(
                 total=3,
@@ -24,12 +20,7 @@ class PNCPClient:
                 allowed_methods={'GET'},
                 respect_retry_after_header=True,
             )
-
-            self.session.mount(
-                'https://',
-                HTTPAdapter(max_retries=retry),
-            )
-
+            self.session.mount('https://', HTTPAdapter(max_retries=retry))
         self.session.headers.update({
             'Accept': 'application/json',
             'User-Agent': 'pnx/1.0',
@@ -46,22 +37,19 @@ class PNCPClient:
     ):
         if kind not in ('publicacao', 'atualizacao'):
             raise ValueError('Unsupported operation')
-
         params = {
             'dataInicial': day.strftime('%Y%m%d'),
             'dataFinal': day.strftime('%Y%m%d'),
             'codigoModalidadeContratacao': modality,
             'tamanhoPagina': page_size,
         }
-
         if uf:
             params['uf'] = uf
 
         page = 1
-
+        expected_pages = None
         while True:
             params['pagina'] = page
-
             try:
                 resp = self.session.get(
                     f'{BASE}/{kind}',
@@ -69,64 +57,42 @@ class PNCPClient:
                     timeout=(10, 40),
                 )
             except requests.RequestException as exc:
-                raise RuntimeError(
-                    'Remote service connection failed'
-                ) from exc
+                raise RuntimeError('Remote service connection failed') from exc
 
-            
-             if resp.status_code == 204:
+            if resp.status_code == 204:
                 if page == 1:
                     return
-                raise RuntimeError(
-                    'Unexpected empty page; state not advanced'
-                )
-
-            
+                raise RuntimeError('Unexpected empty page; state not advanced')
             if not resp.ok:
                 raise RuntimeError(
                     f'Remote request failed: HTTP {resp.status_code}'
                 )
-
             try:
                 data = resp.json()
             except ValueError as exc:
-                raise RuntimeError(
-                    'Invalid response format'
-                ) from exc
-
-            if (
-                not isinstance(data, dict)
-                or not isinstance(data.get('data'), list)
-            ):
-                raise RuntimeError(
-                    'Unexpected response structure'
-                )
+                raise RuntimeError('Invalid response format') from exc
+            if not isinstance(data, dict) or not isinstance(data.get('data'), list):
+                raise RuntimeError('Unexpected response structure')
 
             records = data['data']
             total_pages = data.get('totalPaginas')
-
-            if (
-                type(total_pages) is not int
-                or total_pages < page
-            ):
-                raise RuntimeError(
-                    'Invalid pagination metadata'
-                )
-
+            if page == 1 and total_pages == 0 and not records:
+                return
+            if type(total_pages) is not int or total_pages < page:
+                raise RuntimeError('Invalid pagination metadata')
             if total_pages > max_pages:
-                raise RuntimeError(
-                    'Page limit exceeded; state not advanced'
-                )
+                raise RuntimeError('Page limit exceeded; state not advanced')
+            if expected_pages is None:
+                expected_pages = total_pages
+            elif total_pages != expected_pages:
+                raise RuntimeError('Pagination metadata changed; state not advanced')
+            if not records:
+                raise RuntimeError('Unexpected empty page; state not advanced')
 
             for record in records:
                 if not isinstance(record, dict):
-                    raise RuntimeError(
-                        'Unexpected record format'
-                    )
-
+                    raise RuntimeError('Unexpected record format')
                 yield record
-
             if page >= total_pages:
                 return
-
             page += 1
