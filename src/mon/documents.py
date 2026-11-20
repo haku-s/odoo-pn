@@ -108,6 +108,8 @@ def download(session: requests.Session, document: Document) -> bytes:
     deadline = monotonic() + DOWNLOAD_SECONDS
     try:
         for _ in range(4):
+            if monotonic() >= deadline:
+                raise RuntimeError('Official document download exceeded its time limit')
             validate_document_url(url, document.path)
             with session.get(
                 url, stream=True, allow_redirects=False, timeout=(10, 40),
@@ -117,7 +119,10 @@ def download(session: requests.Session, document: Document) -> bytes:
                     location = response.headers.get('Location')
                     if not location:
                         raise ValueError('Official document redirect has no destination')
-                    url = urljoin(url, location)
+                    try:
+                        url = urljoin(url, location)
+                    except ValueError as exc:
+                        raise ValueError('Invalid official document redirect URL') from exc
                     continue
                 if response.status_code != 200:
                     raise RuntimeError(f'Official document download: HTTP {response.status_code}')
