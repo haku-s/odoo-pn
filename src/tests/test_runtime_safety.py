@@ -319,14 +319,15 @@ class ResumeTests(unittest.TestCase):
                 db, source = FakeOdoo(), FakeSource()
 
                 def partial(kind, day, modality, page_size, max_pages, uf=None):
-                    if (kind, day, modality) == ('publicacao', completed_day, 6):
-                        yield RECORD
-                    if (kind, day, modality) == ('atualizacao', failed_day, 8):
+                    if (kind, day, modality) == ('atualizacao', completed_day, 6):
+                        yield [RECORD]
+                    if (kind, day, modality) == ('publicacao', failed_day, 8):
                         if failure == 'interrupt':
                             raise KeyboardInterrupt
-                        yield from page_client.list_day(kind, day, modality, page_size, max_pages, uf)
+                        yield from page_client.list_day_pages(kind, day, modality, page_size, max_pages, uf)
 
-                source.list_day = partial
+                normal_pages = source.list_day_pages
+                source.list_day_pages = partial
                 error = RuntimeError if failure == 'page' else KeyboardInterrupt
                 with self.assertRaises(error):
                     Synchronizer(config, filters, source, db, apply=True).run()
@@ -334,7 +335,7 @@ class ResumeTests(unittest.TestCase):
                     self.assertEqual([stamp for _, stamp in service.attempts], [0, 3, 33, 93, 183])
                 self.assertEqual([parse_checkpoint(item) for item in db.checkpoints], [completed_day])
                 self.assertNotIn(failed_day.isoformat(), stdout.getvalue())
-                self.assertNotIn(identifier, db.records)
+                self.assertEqual(identifier in db.records, failure == 'page')
 
                 def recovered(kind, day, modality, *args, **kwargs):
                     if (kind, day, modality) == ('atualizacao', failed_day, 8):
@@ -344,6 +345,7 @@ class ResumeTests(unittest.TestCase):
                     return []
 
                 source.list_day = Mock(side_effect=recovered)
+                source.list_day_pages = normal_pages
                 Synchronizer(config, filters, source, db, apply=True).run()
                 self.assertIn(failed_day, [call.args[1] for call in source.list_day.call_args_list])
                 self.assertEqual([parse_checkpoint(item) for item in db.checkpoints],
@@ -445,7 +447,9 @@ class ConfigurationAndOutputTests(unittest.TestCase):
         self.assertEqual(counts['documents_pending'], 1)
         for value in (identifier, title, config.odoo_url, RECORD['objetoCompra']):
             self.assertNotIn(value, output)
-        self.assertEqual(stderr.getvalue(), '')
+        self.assertIn('pages_completed=1', stderr.getvalue())
+        for value in (identifier, title, config.odoo_url, RECORD['objetoCompra']):
+            self.assertNotIn(value, stderr.getvalue())
         self.assertFalse(db.created or db.updated or db.checkpoints)
         db.create.assert_not_called()
         source.session.get.assert_not_called()
@@ -463,9 +467,14 @@ class ConfigurationAndOutputTests(unittest.TestCase):
             redirect_stdout(io.StringIO()) as stdout,
             redirect_stderr(io.StringIO()) as stderr,
         ):
+            client.documents = Mock(return_value=[])
+            client.budget_is_public = Mock(return_value=True)
             self.assertEqual(main(['preview']), 1)
         self.assertEqual(stdout.getvalue(), '')
-        self.assertEqual(stderr.getvalue(), 'Error in collection: PNCP consultation page 2: HTTP 429\n')
+        self.assertEqual(stderr.getvalue().splitlines()[-1],
+                         'Error in collection: PNCP consultation page 2: HTTP 429')
+        for wait in (30, 60, 90):
+            self.assertIn(f'retry_wait_seconds={wait}.0', stderr.getvalue())
         self.assertEqual([stamp for _, stamp in service.attempts], [0, 3, 33, 93, 183])
         self.assertFalse(db.created or db.updated or db.checkpoints)
         db.create.assert_not_called()
