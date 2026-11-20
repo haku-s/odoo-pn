@@ -20,49 +20,54 @@ FILES_BASE = 'https://pncp.gov.br/api/pncp'
 MAX_DOCUMENTS = 100
 LOOKUP_PAGE_SIZE = 50
 # Local pacing for the sequential collector.
-REQUEST_INTERVAL = 1.0
+REQUEST_INTERVAL = 3.0
+HTTP_RETRIES = 3
+RATE_LIMIT_STEP = 30
+MAX_RATE_LIMIT_RETRY_AFTER = RATE_LIMIT_STEP * HTTP_RETRIES
+MAX_RATE_LIMIT_RETRY_WAIT = MAX_RATE_LIMIT_RETRY_AFTER * HTTP_RETRIES
 MAX_RETRY_AFTER = 30
 
 
 class PNCPRetry(Retry):
-    def __init__(self, pace, **kwargs):
-        super().__init__(**kwargs)
-        self._pace = pace
-
-    def new(self, **kwargs):
-        return super().new(pace=self._pace, **kwargs)
-
     def increment(self, method=None, url=None, response=None, _pool=None, **kwargs):
-        if response is not None and (self.get_retry_after(response) or 0) > MAX_RETRY_AFTER:
-            # Return the HTTP response through urllib3's existing exhausted-status path.
-            raise MaxRetryError(_pool, url, 'PNCP Retry-After exceeds the local wait limit')
+        if response is not None:
+            limit = MAX_RATE_LIMIT_RETRY_AFTER if response.status == 429 else MAX_RETRY_AFTER
+            if (self.get_retry_after(response) or 0) > limit:
+                # Return the HTTP response through urllib3's existing exhausted-status path.
+                raise MaxRetryError(_pool, url, 'PNCP Retry-After exceeds the local wait limit')
         return super().increment(method, url, response, _pool=_pool, **kwargs)
 
     def sleep(self, response=None):
         delay = self.get_retry_after(response) if response is not None else None
-        self._pace(delay or self.get_backoff_time())
+        if response is not None and response.status == 429:
+            if delay is None:
+                delay = RATE_LIMIT_STEP * sum(attempt.status == 429 for attempt in self.history)
+        else:
+            delay = delay or self.get_backoff_time()
+        sleep(max(REQUEST_INTERVAL, delay))
 
 
 class PNCPAdapter(HTTPAdapter):
     def __init__(self):
-        self._next_attempt = None
+        self._next_attempt = monotonic()
         super().__init__(max_retries=PNCPRetry(
-            self._pace, total=3, backoff_factor=1.0,
+            total=HTTP_RETRIES, backoff_factor=1.0,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods={'GET'}, respect_retry_after_header=True, raise_on_status=False,
         ))
 
-    def _pace(self, delay=0):
-        now = monotonic()
-        gap = self._next_attempt - now if self._next_attempt is not None else 0
-        wait = max(delay, gap)
-        if wait > 0:
-            sleep(wait)
-        self._next_attempt = monotonic() + REQUEST_INTERVAL
+    def finish_attempt(self):
+        self._next_attempt = max(self._next_attempt, monotonic() + REQUEST_INTERVAL)
 
     def send(self, request, **kwargs):
-        self._pace()
-        response = super().send(request, **kwargs)
+        wait = self._next_attempt - monotonic()
+        if wait > 0:
+            sleep(wait)
+        try:
+            response = super().send(request, **kwargs)
+        finally:
+            # Connection setup can delay the actual HTTP request.
+            self.finish_attempt()
         if response.is_redirect and 'Retry-After' in response.headers:
             try:
                 delay = self.max_retries.get_retry_after(response.raw)
@@ -74,6 +79,23 @@ class PNCPAdapter(HTTPAdapter):
                 raise RuntimeError('PNCP redirect Retry-After exceeds the local wait limit')
             self._next_attempt = max(self._next_attempt, monotonic() + delay)
         return response
+
+
+class PNCPSession(requests.Session):
+    def __init__(self):
+        super().__init__()
+        self._pncp_adapter = PNCPAdapter()
+        self.mount('https://', self._pncp_adapter)
+
+    def finish_attempt(self):
+        self._pncp_adapter.finish_attempt()
+
+    def send(self, request, **kwargs):
+        try:
+            return super().send(request, **kwargs)
+        finally:
+            # Requests reads non-streamed response bodies after the adapter returns.
+            self.finish_attempt()
 
 
 def purchase_path(identifier: str) -> str:
@@ -110,9 +132,7 @@ class Document:
 
 class PNCPClient:
     def __init__(self, session: requests.Session | None = None):
-        self.session = session if session is not None else requests.Session()
-        if session is None:
-            self.session.mount('https://', PNCPAdapter())
+        self.session = session if session is not None else PNCPSession()
         self.session.headers.update({
             'Accept': 'application/json',
             'User-Agent': 'pnx/1.0',
