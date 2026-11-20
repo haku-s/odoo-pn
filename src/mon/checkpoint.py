@@ -20,10 +20,15 @@ def serialize_checkpoint(day: date) -> str:
     return json.dumps({'version': 1, 'last_complete_day': day.isoformat()}, separators=(',', ':'))
 
 
+
 def days_to_process(initial: date, last_done: date | None, today: date,
                     overlap_days: int, max_days: int):
-    # Reprocessar a janela anterior, mas não pular períodos não concluídos.
-    start = initial if last_done is None else max(initial, last_done - timedelta(days=overlap_days - 1))
+    # Replay the overlap without discarding unfinished days.
+    start = (
+        initial
+        if last_done is None
+        else last_done - timedelta(days=overlap_days - 1)
+    )
     if start > today:
         raise ValueError('Checkpoint future')
     day = start
@@ -32,3 +37,4 @@ def days_to_process(initial: date, last_done: date | None, today: date,
         yield day
         day += timedelta(days=1)
         count += 1
+
