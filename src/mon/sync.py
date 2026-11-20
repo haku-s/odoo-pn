@@ -1,4 +1,4 @@
-"""Batch synchronization utilities."""
+"""Synchronize verified official values and documents."""
 
 from __future__ import annotations
 
@@ -6,8 +6,18 @@ from collections import Counter
 import os
 
 from .checkpoint import days_to_process, parse_checkpoint, serialize_checkpoint
+from .documents import attach, pending_documents
 from .normalizer import normalize
+from .odoo import TASK, amount_value, float_step, relation_id, selection_value
 from .relevance import is_relevant
+
+
+def changed_values(old: dict, official: dict) -> dict:
+    # Odoo can return integers for numeric fields, but False is an unset value.
+    return {
+        name: value for name, value in official.items()
+        if old.get(name) != value or old.get(name) is False
+    }
 
 
 class Synchronizer:
@@ -19,113 +29,165 @@ class Synchronizer:
         self.apply = apply
         self.stats = Counter()
 
-    def _values(self, record: dict) -> dict:
-        return {
-            destination: (
-                False if record[source] is None else record[source]
+    def _values(self, record: dict, task: dict | None = None) -> dict:
+        values = {}
+        for source, (destination, meta) in self.odoo.mappings.items():
+            value = record.get(source)
+            if value is None:
+                continue
+            if source == 'estimated_value':
+                if meta['type'] == 'monetary':
+                    # The task currency may be computed from its project on creation.
+                    if task is None:
+                        continue
+                    step = self.odoo.currency_step(task[meta['currency_field']])
+                else:
+                    step = float_step(meta)
+                value = amount_value(value, step)
+            values[destination] = (
+                selection_value(meta, value) if meta['type'] == 'selection' else value
             )
-            for source, destination in self.cfg.field_map.items()
-            if source in record
+        return values
+
+    def _create_task(self, identifier, record, official):
+        title = record.get('title')
+        if not title:
+            raise ValueError('Missing official task title')
+        new = {
+            'project_id': self.cfg.project_id,
+            'stage_id': self.cfg.stage_id,
+            'name': f'PNCP {identifier} - {title[:130]}',
+            self.cfg.pncp_field: identifier,
+            **official,
         }
+        try:
+            task_id = self.odoo.create_task(new)
+        except RuntimeError as exc:
+            row = self.odoo.tasks([identifier]).get(identifier)
+            if row is None or changed_values(row, official):
+                raise RuntimeError('Unconfirmed task creation; checkpoint withheld') from exc
+        else:
+            row = self.odoo.tasks([identifier]).get(identifier)
+            if row is None or row['id'] != task_id or changed_values(row, official):
+                raise RuntimeError('Created task association or official values were not confirmed')
+        if relation_id(row.get('stage_id')) != self.cfg.stage_id:
+            raise RuntimeError('Created task initial stage was not confirmed')
+        return row
+
+    def _update_task(self, identifier, old, changes):
+        try:
+            self.odoo.update_task(old['id'], changes)
+        except RuntimeError as exc:
+            row = self.odoo.tasks([identifier]).get(identifier)
+            if row is None or row['id'] != old['id'] or changed_values(row, changes):
+                raise RuntimeError('Unconfirmed task update; checkpoint withheld') from exc
 
     def _sync_batch(self, records: dict[str, dict]) -> None:
         if not records:
             return
-        present = self.odoo.tasks(list(records))
+        present = self.odoo.tasks(list(records)) if self.odoo else {}
         for identifier, record in records.items():
-            values = self._values(record)
+            documents = self.pncp.documents(identifier)
+            if self.odoo is None:
+                self.stats['updates_unverified'] += 1
+                self.stats['documents_unverified'] += len(documents)
+                continue
             old = present.get(identifier)
+            if self.apply:
+                current = self.odoo.tasks([identifier]).get(identifier)
+                if old and (current is None or current['id'] != old['id']):
+                    raise RuntimeError('Task identity changed before synchronization')
+                old = current
+            if record.get('estimate_needs_confirmation') and not self.pncp.budget_is_public(identifier):
+                record = {**record, 'estimated_value': None}
+            official = self._values(record, old)
+            changes = changed_values(old, official) if old else {}
+            if not self.apply:
+                self.stats['requires_create'] += old is None
+                self.stats['requires_update'] += bool(changes)
+                existing = self.odoo.attachments(old['id']) if old and documents else []
+                pending, unverified = pending_documents(documents, existing)
+                self.stats['documents_pending'] += pending
+                self.stats['documents_unverified'] += unverified
+                continue
+
             if old is None:
-                title = (
-                    f"PNCP {identifier} - "
-                    f"{str(record.get('objeto') or '')[:130]}"
-                ).strip()
-                new = {
-                    'project_id': self.cfg.project_id,
-                    'name': title,
-                    self.cfg.pncp_field: identifier,
-                    **values,
-                }
-                if self.cfg.stage_id:
-                    new['stage_id'] = self.cfg.stage_id
-                self.odoo.create_task(new)
+                created = self._create_task(identifier, record, official)
+                task_id = created['id']
+                amount = self.odoo.mappings.get('estimated_value')
+                if amount and amount[1]['type'] == 'monetary' and record.get('estimated_value') is not None:
+                    changes = changed_values(created, self._values(record, created))
+                    if changes:
+                        self._update_task(identifier, created, changes)
                 self.stats['created'] += 1
             else:
-                changed = {}
-                for destination, value in values.items():
-                    old_value = old.get(destination)
-                    if old_value is False and (value is False or value == ''):
-                        continue
-                    if type(old_value) is not type(value) or old_value != value:
-                        changed[destination] = value
-                if changed:
-                    self.odoo.update_task(old['id'], changed)
+                task_id = old['id']
+                if changes:
+                    self._update_task(identifier, old, changes)
                     self.stats['updated'] += 1
                 else:
                     self.stats['unchanged'] += 1
+            if documents:
+                self.odoo.require_access(TASK, 'write', [task_id])
+                existing = self.odoo.attachments(task_id)
+                for document in documents:
+                    if attach(self.odoo, self.pncp.session, identifier, task_id, document, existing):
+                        self.stats['documents_uploaded'] += 1
+                    else:
+                        self.stats['documents_present'] += 1
 
     def run(self):
         last_done = None
-        if self.apply:
-            if self.odoo is None:
-                raise ValueError('Remote client is required for write mode')
-            self.cfg.require_odoo(write=True)
-            self.odoo.check_fields(write=True)
+        if self.apply and self.odoo is None:
+            raise ValueError('Odoo client is required for apply mode')
+        if self.odoo:
+            project = self.odoo.check_fields(write=self.apply)
             if (
-                os.getenv('ODOO_ALLOW_UNLINKED_TASKS') != 'true'
+                self.apply and os.getenv('ODOO_ALLOW_UNLINKED_TASKS') != 'true'
                 and self.odoo.has_unlinked_tasks()
             ):
                 raise ValueError(
-                    'Existing records lack required identifiers. '
-                    'Review duplicates before setting '
-                    'ODOO_ALLOW_UNLINKED_TASKS=true'
+                    'Existing tasks lack identifiers. Review duplicates before enabling '
+                    'ODOO_ALLOW_UNLINKED_TASKS.'
                 )
-            project = self.odoo.project([self.cfg.checkpoint_field])
-            last_done = parse_checkpoint(project.get(self.cfg.checkpoint_field))
+            if self.cfg.checkpoint_field:
+                last_done = parse_checkpoint(project[self.cfg.checkpoint_field])
             if last_done and last_done > self.cfg.today:
                 raise ValueError('Stored checkpoint exceeds the current date')
 
+        if not self.apply:
+            self.stats.update({
+                'matched': 0, 'documents_pending': 0, 'documents_unverified': 0,
+                **({'requires_create': 0, 'requires_update': 0} if self.odoo
+                   else {'updates_unverified': 0}),
+            })
         for day in days_to_process(
-            self.cfg.initial_date,
-            last_done,
-            self.cfg.today,
-            self.cfg.overlap_days,
-            self.cfg.max_days,
+            self.cfg.initial_date, last_done, self.cfg.today,
+            self.cfg.overlap_days, self.cfg.max_days,
         ):
             buffer: dict[str, dict] = {}
             for kind in ('publicacao', 'atualizacao'):
                 for modality in self.filters.modalities:
-                    server_uf = (
-                        self.filters.ufs[0]
-                        if len(self.filters.ufs) == 1
-                        else None
-                    )
+                    server_uf = self.filters.ufs[0] if len(self.filters.ufs) == 1 else None
                     for item in self.pncp.list_day(
-                        kind,
-                        day,
-                        modality,
-                        self.cfg.page_size,
-                        self.cfg.max_pages,
+                        kind, day, modality, self.cfg.page_size, self.cfg.max_pages,
                         uf=server_uf,
                     ):
                         self.stats['seen'] += 1
                         if not is_relevant(item, self.filters):
                             self.stats['filtered'] += 1
                             continue
-                        rec = normalize(item)
+                        record = normalize(item)
+                        identifier = record['pncp_id']
                         self.stats['matched'] += 1
-                        buffer[rec['pncp_id']] = rec
+                        buffer[identifier] = record
                         if len(buffer) >= 50:
-                            if self.apply:
-                                self._sync_batch(buffer)
+                            self._sync_batch(buffer)
                             buffer.clear()
-            if self.apply:
-                self._sync_batch(buffer)
-                if day < self.cfg.today:
-                    self.odoo.write_checkpoint(serialize_checkpoint(day))
+            self._sync_batch(buffer)
+            if self.apply and day < self.cfg.today and (last_done is None or day > last_done):
+                self.odoo.write_checkpoint(serialize_checkpoint(day))
+                last_done = day
             self.stats['days'] += 1
-            print(
-                f'Batch {day.isoformat()}: completed, '
-                f'mode={"apply" if self.apply else "preview"}'
-            )
+            print(f'Batch {day.isoformat()}: completed, mode={"apply" if self.apply else "preview"}')
         return dict(self.stats)
