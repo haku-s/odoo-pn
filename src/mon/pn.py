@@ -107,7 +107,7 @@ class PNCPClient:
 
             if (
                 type(total_pages) is not int
-                or total_pages < 0
+                or total_pages < page
             ):
                 raise RuntimeError(
                     'Invalid pagination metadata'
