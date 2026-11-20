@@ -14,7 +14,13 @@ def parse_checkpoint(value: object) -> date | None:
     data = json.loads(value)
     if not isinstance(data, dict) or data.get('version') != 1:
         raise ValueError('Unsupported checkpoint version')
-    return date.fromisoformat(data['last_complete_day'])
+    day = data.get('last_complete_day')
+    if not isinstance(day, str):
+        raise ValueError('Missing checkpoint date')
+    try:
+        return date.fromisoformat(day)
+    except ValueError as exc:
+        raise ValueError('Invalid checkpoint date') from exc
 
 
 def serialize_checkpoint(day: date) -> str:
@@ -31,9 +37,10 @@ def days_to_process(
     overlap_days: int,
     max_days: int,
 ):
+    # Leave one slot for a new day even when the configured overlap fills the run.
     start = (
         initial if last_done is None
-        else last_done - timedelta(days=overlap_days - 1)
+        else last_done - timedelta(days=min(overlap_days, max_days - 1) - 1)
     )
     if start > today:
         raise ValueError('Checkpoint future')
