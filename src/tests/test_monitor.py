@@ -466,6 +466,11 @@ class OdooTests(unittest.TestCase):
 
 
 class FakeSource:
+    def list_day_pages(self, *args, **kwargs):
+        records = list(self.list_day(*args, **kwargs))
+        if records:
+            yield records
+
     def budget_is_public(self, identifier):
         return True
 
@@ -632,7 +637,7 @@ class SyncTests(unittest.TestCase):
 
     def test_checkpoint_not_advanced_on_failure(self):
         class BrokenSource:
-            def list_day(self, *args, **kwargs):
+            def list_day_pages(self, *args, **kwargs):
                 raise RuntimeError(
                     'Remote service unavailable'
                 )
