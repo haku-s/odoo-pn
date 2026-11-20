@@ -31,10 +31,17 @@ ALLOWED_FIELDS = OFFICIAL_FIELDS | frozenset(FIELD_ALIASES) | frozenset({
 TECHNICAL_FIELD = re.compile(r'^[a-z][a-z0-9_]*$')
 
 
+def _integer(var: str, value: str) -> int:
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f'{var} must be an integer') from exc
+
+
 def _positive_int(
     var: str, default: int, minimum: int = 1, maximum: int = 10000,
 ) -> int:
-    value = int(os.getenv(var, str(default)))
+    value = _integer(var, os.getenv(var, str(default)))
     if not minimum <= value <= maximum:
         raise ValueError(f'{var} must be between {minimum} and {maximum}')
     return value
@@ -50,9 +57,10 @@ class Filters:
     @classmethod
     def load(cls, path: Path = CONFIG_PATH) -> 'Filters':
         secret = os.getenv('PNCP_FILTERS_JSON', '')
-        obj = json.loads(secret) if secret else json.loads(
-            path.read_text(encoding='utf-8')
-        )
+        try:
+            obj = json.loads(secret or path.read_text(encoding='utf-8'))
+        except json.JSONDecodeError as exc:
+            raise ValueError('Invalid PNCP filter JSON') from exc
         if not isinstance(obj, dict):
             raise ValueError('Expected a JSON object')
         modalities = obj.get('modalidades', [])
@@ -105,13 +113,19 @@ class Settings:
     def from_env(cls) -> 'Settings':
         from datetime import datetime
         today = datetime.now(BRASILIA).date()
-        first = date.fromisoformat(os.getenv(
-            'PNCP_INITIAL_DATE',
-            (today - timedelta(days=2)).isoformat(),
-        ))
+        try:
+            first = date.fromisoformat(os.getenv(
+                'PNCP_INITIAL_DATE',
+                (today - timedelta(days=2)).isoformat(),
+            ))
+        except ValueError as exc:
+            raise ValueError('Invalid PNCP_INITIAL_DATE') from exc
         if first > today:
             raise ValueError('Initial date cannot be in the future')
-        mapping = json.loads(os.getenv('ODOO_FIELD_MAP', '{}'))
+        try:
+            mapping = json.loads(os.getenv('ODOO_FIELD_MAP', '').strip() or '{}')
+        except json.JSONDecodeError as exc:
+            raise ValueError('Invalid ODOO_FIELD_MAP JSON') from exc
         if not isinstance(mapping, dict) or set(mapping) - ALLOWED_FIELDS:
             raise ValueError('Invalid source field mapping')
         if any(
@@ -155,17 +169,20 @@ class Settings:
             odoo_url=os.getenv('ODOO_URL', '').rstrip('/'),
             odoo_database=os.getenv('ODOO_DATABASE', ''),
             odoo_api_key=os.getenv('ODOO_API_KEY', ''),
-            project_id=int(project) if project else None,
+            project_id=_integer('ODOO_PROJECT_ID', project) if project else None,
             pncp_field=pncp_field,
             checkpoint_field=checkpoint_field,
-            stage_id=int(stage) if stage else None,
+            stage_id=_integer('ODOO_STAGE_ID', stage) if stage else None,
             field_map=mapping,
         )
 
     def require_odoo(self, write: bool = False) -> None:
         if not self.odoo_url:
             raise ValueError('Missing ODOO_URL')
-        parsed = urlsplit(self.odoo_url)
+        try:
+            parsed = urlsplit(self.odoo_url)
+        except ValueError as exc:
+            raise ValueError('Invalid ODOO_URL configuration') from exc
         if (
             parsed.scheme != 'https'
             or not parsed.hostname
@@ -174,7 +191,7 @@ class Settings:
             or parsed.query
             or parsed.fragment
         ):
-            raise ValueError('Invalid service URL configuration')
+            raise ValueError('Invalid ODOO_URL configuration')
         if not self.odoo_api_key:
             raise ValueError('Missing ODOO_API_KEY')
         if not self.project_id or self.project_id <= 0:
