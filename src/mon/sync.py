@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections import Counter
 import os
+import sys
+from time import monotonic
 
 from .checkpoint import days_to_process, parse_checkpoint, serialize_checkpoint
 from .documents import attach, pending_documents
@@ -75,18 +77,21 @@ class Synchronizer:
         return row
 
     def _update_task(self, identifier, old, changes):
+        failure = None
         try:
             self.odoo.update_task(old['id'], changes)
         except RuntimeError as exc:
-            row = self.odoo.tasks([identifier]).get(identifier)
-            if row is None or row['id'] != old['id'] or changed_values(row, changes):
-                raise RuntimeError('Unconfirmed task update; checkpoint withheld') from exc
+            failure = exc
+        row = self.odoo.tasks([identifier]).get(identifier)
+        if row is None or row['id'] != old['id'] or changed_values(row, changes):
+            raise RuntimeError('Unconfirmed task update; checkpoint withheld') from failure
 
-    def _sync_batch(self, records: dict[str, dict]) -> None:
+    def _sync_batch(self, records: dict[str, dict], progress) -> None:
         if not records:
             return
         present = self.odoo.tasks(list(records)) if self.odoo else {}
         for identifier, record in records.items():
+            progress()
             documents = self.pncp.documents(identifier)
             if self.odoo is None:
                 self.stats['updates_unverified'] += 1
@@ -113,13 +118,13 @@ class Synchronizer:
 
             if old is None:
                 created = self._create_task(identifier, record, official)
+                self.stats['created'] += 1
                 task_id = created['id']
                 amount = self.odoo.mappings.get('estimated_value')
                 if amount and amount[1]['type'] == 'monetary' and record.get('estimated_value') is not None:
                     changes = changed_values(created, self._values(record, created))
                     if changes:
                         self._update_task(identifier, created, changes)
-                self.stats['created'] += 1
             else:
                 task_id = old['id']
                 if changes:
@@ -131,12 +136,14 @@ class Synchronizer:
                 self.odoo.require_access(TASK, 'write', [task_id])
                 existing = self.odoo.attachments(task_id)
                 for document in documents:
+                    progress()
                     if attach(self.odoo, self.pncp.session, identifier, task_id, document, existing):
                         self.stats['documents_uploaded'] += 1
                     else:
                         self.stats['documents_present'] += 1
 
     def run(self):
+        started = self.next_progress = monotonic()
         last_done = None
         if self.apply and self.odoo is None:
             raise ValueError('Odoo client is required for apply mode')
@@ -161,33 +168,60 @@ class Synchronizer:
                 **({'requires_create': 0, 'requires_update': 0} if self.odoo
                    else {'updates_unverified': 0}),
             })
+        last_complete = last_done
         for day in days_to_process(
             self.cfg.initial_date, last_done, self.cfg.today,
             self.cfg.overlap_days, self.cfg.max_days,
         ):
-            buffer: dict[str, dict] = {}
-            for kind in ('publicacao', 'atualizacao'):
+            updated_identifiers = set()
+            # Apply the preferred update snapshot first so replay cannot overwrite it with publication data.
+            for kind in ('atualizacao', 'publicacao'):
                 for modality in self.filters.modalities:
                     server_uf = self.filters.ufs[0] if len(self.filters.ufs) == 1 else None
-                    for item in self.pncp.list_day(
+                    completed = 0
+
+                    def progress(force=False):
+                        now = monotonic()
+                        if force or now >= self.next_progress:
+                            print(
+                                f'Progress day={day} query={kind} modality={modality} '
+                                f'pages_completed={completed} received={self.stats["seen"]} '
+                                f'relevant={self.stats["matched"]} '
+                                f'tasks_created={self.stats["created"]} tasks_updated={self.stats["updated"]} '
+                                f'attachments_uploaded={self.stats["documents_uploaded"]} '
+                                f'attachments_present={self.stats["documents_present"]} '
+                                f'elapsed_seconds={now - started:.0f} last_complete_day={last_complete}',
+                                file=sys.stderr, flush=True,
+                            )
+                            self.next_progress = now + 30
+
+                    progress(force=True)
+                    for page in self.pncp.list_day_pages(
                         kind, day, modality, self.cfg.page_size, self.cfg.max_pages,
                         uf=server_uf,
                     ):
-                        self.stats['seen'] += 1
-                        if not is_relevant(item, self.filters):
-                            self.stats['filtered'] += 1
-                            continue
-                        record = normalize(item)
-                        identifier = record['pncp_id']
-                        self.stats['matched'] += 1
-                        buffer[identifier] = record
-                        if len(buffer) >= 50:
-                            self._sync_batch(buffer)
-                            buffer.clear()
-            self._sync_batch(buffer)
+                        records = {}
+                        self.stats['seen'] += len(page)
+                        for item in page:
+                            if not is_relevant(item, self.filters):
+                                self.stats['filtered'] += 1
+                                continue
+                            record = normalize(item)
+                            identifier = record['pncp_id']
+                            self.stats['matched'] += 1
+                            if kind == 'atualizacao' or identifier not in updated_identifiers:
+                                records[identifier] = record
+                        self._sync_batch(records, progress)
+                        if kind == 'atualizacao':
+                            updated_identifiers.update(records)
+                        completed += 1
+                        progress(force=True)
             if self.apply and day < self.cfg.today and (last_done is None or day > last_done):
                 self.odoo.write_checkpoint(serialize_checkpoint(day))
                 last_done = day
+            if day < self.cfg.today and (last_complete is None or day > last_complete):
+                last_complete = day
             self.stats['days'] += 1
-            print(f'Batch {day.isoformat()}: completed, mode={"apply" if self.apply else "preview"}')
+            print(f'Batch {day.isoformat()}: completed, mode={"apply" if self.apply else "preview"}, '
+                  f'last_complete_day={last_complete}', flush=True)
         return dict(self.stats)
