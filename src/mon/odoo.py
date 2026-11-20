@@ -126,7 +126,7 @@ def _valid(metadata, name, types, *, writable=False, relation=None):
         or (writable and meta.get('readonly') is not False)
         or (relation and meta.get('relation') != relation)
     ):
-        raise ValueError(f'Incompatible or inaccessible Odoo field: {name}')
+        raise ValueError('Incompatible or inaccessible Odoo field metadata')
 
 
 def field_inventory(task: dict, settings: Settings) -> tuple[list[dict], dict, list[str]]:
@@ -135,9 +135,9 @@ def field_inventory(task: dict, settings: Settings) -> tuple[list[dict], dict, l
     for key, name in settings.field_map.items():
         source = FIELD_ALIASES.get(key, key)
         if source not in OFFICIAL_FIELDS:
-            errors.append(f'Unsupported Odoo field mapping: {key}')
+            errors.append('Unsupported Odoo field mapping')
         if source in configured:
-            errors.append(f'Duplicate Odoo source mapping: {source}')
+            errors.append('Duplicate Odoo source mapping')
         configured[source] = name
 
     for label, source, path, types, standard in FORM:
@@ -157,7 +157,7 @@ def field_inventory(task: dict, settings: Settings) -> tuple[list[dict], dict, l
         if source is None:
             continue
         if name is None:
-            errors.append(f'Missing or ambiguous Odoo field: {label}')
+            errors.append('Missing or ambiguous required Odoo field')
             continue
         expected = settings.pncp_field if source == 'identifier' else configured.get(source)
         if (
@@ -166,7 +166,7 @@ def field_inventory(task: dict, settings: Settings) -> tuple[list[dict], dict, l
             or (not standard and (not name.startswith('x_') or not TECHNICAL_FIELD.fullmatch(name)))
         ):
             entry['status'] = 'incompatible'
-            errors.append(f'Odoo field mapping does not match label: {label}')
+            errors.append('Odoo field mapping does not match label')
             continue
         try:
             _valid(task, name, types, writable=True, relation=PROJECT if source == 'project' else None)
@@ -182,7 +182,7 @@ def field_inventory(task: dict, settings: Settings) -> tuple[list[dict], dict, l
                     float_step(meta)
         except ValueError:
             entry['status'] = 'incompatible'
-            errors.append(f'Incompatible Odoo field metadata: {label}')
+            errors.append('Incompatible Odoo field metadata')
             continue
         entry['status'] = 'validated'
         if source not in ('project', 'identifier'):
@@ -215,7 +215,7 @@ class OdooClient:
                 json=params, timeout=(10, 40), allow_redirects=False,
             )
         except requests.RequestException as exc:
-            raise RuntimeError('Odoo connection failed') from exc
+            raise RuntimeError(f'Odoo {model}/{method}: connection failed') from exc
         if response.status_code != 200:
             raise RuntimeError(f'Odoo {model}/{method}: HTTP {response.status_code}')
         try:
@@ -276,7 +276,7 @@ class OdooClient:
         if report is not None:
             report.extend(inventory)
         if errors:
-            raise ValueError('; '.join(errors))
+            raise ValueError('; '.join(dict.fromkeys(errors)))
         self.cfg.require_odoo(write=write)
         if not self.cfg.pncp_field:
             raise ValueError('Missing ODOO_PNCP_FIELD')
