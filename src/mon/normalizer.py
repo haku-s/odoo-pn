@@ -96,6 +96,53 @@ def normalize(r: dict) -> dict:
         'url_origem': r.get('linkSistemaOrigem'),
     }
 
+    
+    # Preserve the distinction between absent and empty values.
+    provenance = {
+        'objeto': ('objetoCompra',),
+        'numero_edital': ('numeroCompra',),
+        'orgao': ('orgaoEntidade',),
+        'cnpj': ('orgaoEntidade',),
+        'uf': ('unidadeOrgao',),
+        'municipio': ('unidadeOrgao',),
+        'modalidade': ('modalidadeNome',),
+        'situacao': ('situacaoCompraNome',),
+        'valor_estimado': ('valorTotalEstimado',),
+        'data_publicacao': ('dataPublicacaoPncp',),
+        'data_atualizacao': (
+            'dataAtualizacaoGlobal',
+            'dataAtualizacao',
+        ),
+        'data_encerramento': ('dataEncerramentoProposta',),
+        'url_origem': ('linkSistemaOrigem',),
+    }
+
+    for field, keys in provenance.items():
+        if not any(key in r for key in keys):
+            base.pop(field)
+
+    nested = {
+        'orgao': (
+            'orgaoEntidade',
+            ('razaoSocial', 'razaosocial'),
+        ),
+        'cnpj': ('orgaoEntidade', ('cnpj',)),
+        'uf': ('unidadeOrgao', ('ufSigla',)),
+        'municipio': (
+            'unidadeOrgao',
+            ('municipioNome',),
+        ),
+    }
+
+    for field, (parent, keys) in nested.items():
+        obj = r.get(parent)
+        if (
+            isinstance(obj, dict)
+            and not any(key in obj for key in keys)
+        ):
+            base.pop(field, None)
+
+
     content = {
         k: v
         for k, v in base.items()
