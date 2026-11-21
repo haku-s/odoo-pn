@@ -78,4 +78,5 @@ def main(argv=None) -> int:
 if __name__ == '__main__':
     # urllib3 transport warnings can contain full request URLs.
     logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
+    logging.getLogger('pypdf').setLevel(logging.CRITICAL)
     sys.exit(main())
