@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, Mock, patch
 import requests
 
 from mon.checkpoint import days_to_process
-from mon.documents import attach, download, name_and_mime, source_marker
+from mon.documents import attach, download, name_and_mime, notice_fields, source_marker
 from mon.normalizer import clean_money, normalize, odoo_datetime
 from mon.odoo import OdooClient, selection_value
 from mon.pn import Document, PNCPClient, purchase_path
@@ -20,6 +20,39 @@ from test_monitor import (
 
 
 class OfficialFieldTests(unittest.TestCase):
+    def test_notice_fields_require_explicit_unique_values(self):
+        text = (
+            'CONCORRÊNCIA Nº 003/2026\n'
+            'DATA PARA ABERTURA DE PROPOSTAS: 14/12/2026 ÀS 10:00 HORAS;\n'
+            'INÍCIO DA SESSÃO PÚBLICA DE LANCES: 14/12/2026 ÀS 10:01 HORAS (horário de Brasília).\n'
+            'CRITÉRIO DE JULGAMENTO:\nMAIOR DESCONTO GLOBAL\n'
+            'Prazo para esclarecimentos: até três dias úteis antes da sessão.\n'
+        )
+        self.assertEqual(notice_fields(text), {
+            'notice_number': '003/2026',
+            'session_datetime': '2026-12-14 13:01:00',
+            'award_basis': 'Global',
+        })
+        self.assertNotIn('notice_number', notice_fields(text + 'EDITAL Nº 004/2026\n'))
+        self.assertEqual(
+            notice_fields('Prazo para esclarecimentos: 10/12/2026 às 18:00 (horário de Brasília).'),
+            {'clarification_deadline': '2026-12-10 21:00:00'},
+        )
+
+    def test_new_official_fields_derive_from_identity_modality_and_bidding_url(self):
+        record = normalize({
+            **RECORD, 'modalidadeId': 8, 'modoDisputaNome': 'Dispensa Com Disputa',
+            'linkSistemaOrigem': 'https://www.novobbmnet.com.br/fixture',
+        })
+        self.assertEqual(record['contract_type'], 'Dispensa com disputa')
+        self.assertEqual(record['dispute_platform'], 'BBMNET')
+        self.assertEqual(record['pncp_link'], 'https://pncp.gov.br/app/editais/12345678000190/2026/123')
+        self.assertNotIn('notice_number', record)
+        self.assertIsNone(normalize({
+            **RECORD, 'modalidadeId': 8, 'usuarioNome': 'BBMNET',
+            'linkSistemaOrigem': 'https://bbmnet.com.br.example.invalid/',
+        }).get('dispute_platform'))
+
     def test_distinct_identifiers_and_unresolved_criteria(self):
         record = normalize({
             **RECORD, 'processo': '0007/2026', 'numeroProcesso': 'wrong',
@@ -52,10 +85,27 @@ class OfficialFieldTests(unittest.TestCase):
 
 
 class RemoteContractTests(unittest.TestCase):
+    def test_criterion_requires_a_complete_unanimous_item_listing(self):
+        first = {'numeroItem': 1, 'criterioJulgamentoId': 1, 'criterioJulgamentoNome': 'Menor preço'}
+        for second_name, second_id, expected in (
+            ('Menor preço', 1, 'Menor preço'), ('Maior desconto', 2, None),
+        ):
+            with self.subTest(second_name=second_name):
+                session = FakePNCPSession([
+                    FakeResponse(data=[first]),
+                    FakeResponse(data=[{'numeroItem': 2, 'criterioJulgamentoId': second_id,
+                                       'criterioJulgamentoNome': second_name}]),
+                    FakeResponse(data=[]),
+                ])
+                with patch('mon.pn.LOOKUP_PAGE_SIZE', 1):
+                    self.assertEqual(PNCPClient(session).judgment_criterion(RECORD['numeroControlePNCP']),
+                                     expected)
+
     def test_lookup_includes_archived_tasks_and_verifies_project(self):
         identifier = RECORD['numeroControlePNCP']
         session = FakeOdooSession([FakeResponse(data=[
-            {'id': 15, 'x_pncp_id': identifier, 'project_id': [11, 'Test'], 'stage_id': [61, 'Initial']},
+            {'id': 15, 'name': 'Sample', 'x_pncp_id': identifier,
+             'project_id': [11, 'Test'], 'stage_id': [61, 'Initial']},
         ])])
         client = OdooClient(cfg(), session)
         self.assertEqual(client.tasks([identifier])[identifier]['id'], 15)
@@ -82,7 +132,7 @@ class PreflightTests(unittest.TestCase):
                 ('x_notice', 'Edital / aviso', 'char', False),
                 ('x_modality', 'Modalidade', 'selection', False),
                 ('x_contract_type', 'Tipo de contratação', 'selection', False),
-                ('x_criterion', 'Critério de julgamento', 'selection', False),
+                ('x_studio_criterio_de_julgamento_1', 'Critério de julgamento', 'selection', False),
                 ('x_award', 'Forma de adjudicação', 'char', False),
                 ('x_amount', 'Valor estimado', 'float', False),
                 ('tag_ids', 'Tags', 'many2many', False),
@@ -100,6 +150,15 @@ class PreflightTests(unittest.TestCase):
             )
         }
         self.task['x_modality']['selection'] = [['electronic', 'Electronic Procedure']]
+        self.task['x_contract_type']['selection'] = [['bid', 'Licitação']]
+        self.task['x_studio_criterio_de_julgamento_1']['selection'] = [['lowest', 'Menor preço']]
+        self.task['x_studio_criterio_de_julgamento'] = {
+            'string': 'Critério de julgamento', 'type': 'char', 'readonly': False,
+        }
+        self.task['x_award'] = {
+            'type': 'selection', 'readonly': False, 'string': 'Forma de adjudicação',
+            'selection': [['lot', 'Lote/Grupo'], ['global', 'Global']],
+        }
         self.task['project_id']['relation'] = 'project.project'
         self.task['stage_id']['relation'] = 'project.task.type'
         self.project = {
@@ -140,7 +199,9 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(
             {row['technical_name'] for row in report if row['write_enabled']},
             {'project_id', 'x_pncp_id', 'x_process', 'x_purchase', 'x_modality',
-             'x_amount', 'date_deadline', 'x_company', 'x_location'},
+             'x_amount', 'date_deadline', 'x_company', 'x_location', 'x_notice',
+             'x_contract_type', 'x_studio_criterio_de_julgamento_1', 'x_platform', 'x_link',
+             'x_session', 'x_questions', 'x_award'},
         )
         self.assertTrue(all(
             request[0].rsplit('/', 1)[-1] in {'fields_get', 'search_read', 'has_access'}
@@ -168,7 +229,7 @@ class PreflightTests(unittest.TestCase):
                     client.check_fields(write=True)
 
     def test_legacy_mapping_cannot_target_notice_or_manual_field(self):
-        for target in ('x_notice', 'x_platform', 'x_criterion'):
+        for target in ('x_notice', 'x_platform', 'x_studio_criterio_de_julgamento_1'):
             with self.subTest(target=target):
                 client = OdooClient(
                     cfg(field_map={'numero_edital': target}),
@@ -176,6 +237,19 @@ class PreflightTests(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(ValueError, 'does not match label'):
                     client.check_fields(write=True)
+
+    def test_judgment_criterion_uses_only_the_pinned_selector(self):
+        field = 'x_studio_criterio_de_julgamento_1'
+        self.task['x_another_criterion'] = self.task[field].copy()
+        for present in (True, False):
+            with self.subTest(present=present):
+                if not present:
+                    del self.task[field]
+                session = FakeOdooSession([FakeResponse(data=value) for value in self.responses])
+                client = OdooClient(cfg(), session)
+                client.check_fields(write=True)
+                mapped = client.mappings.get('judgment_criterion')
+                self.assertEqual(mapped[0] if mapped else None, field if present else None)
 
     def test_selection_label_mismatch(self):
 
@@ -331,6 +405,61 @@ class CompletionTests(unittest.TestCase):
         return Synchronizer(
             self.config, FILT, self.source, self.odoo, apply=apply,
         ).run()
+
+    def test_new_task_uses_official_process_organization_and_location(self):
+        self.source.list_day = Mock(side_effect=[[{**RECORD, 'processo': '123/2026'}], []])
+        self.run_sync()
+        self.assertEqual(self.odoo.created[0]['name'], '123/2026 - Sample Organization - Sample City/SP')
+        self.assertEqual(self.odoo.created[0]['x_pncp_id'], self.identifier)
+
+    def test_existing_legacy_title_is_migrated_without_changing_stage_or_manual_fields(self):
+        name = f'PNCP {self.identifier} - {RECORD["objetoCompra"][:130]}'
+        self.odoo.records[self.identifier] = {
+            'id': 8, 'name': name, 'x_amount': 379000.0,
+            'stage_id': [93, 'Later'], 'description': 'Manual',
+        }
+        self.source.list_day = Mock(side_effect=[[{**RECORD, 'processo': '123/2026'}], []])
+        self.run_sync()
+        self.assertEqual(self.odoo.updated, [(8, {'name': '123/2026 - Sample Organization - Sample City/SP'})])
+        self.assertEqual(self.odoo.records[self.identifier]['stage_id'], [93, 'Later'])
+        self.assertEqual(self.odoo.records[self.identifier]['description'], 'Manual')
+        self.assertFalse(self.odoo.created)
+
+    def test_confirmed_document_fields_and_attachment_resume_on_same_task(self):
+        path = purchase_path(self.identifier) + '/arquivos/1'
+        doc = Document(1, 'Test.pdf', 'https://pncp.gov.br/pncp-api' + path, path, 'Edital')
+        content = b'%PDF-1.5\nobject\n%%EOF\n'
+        self.source.documents = Mock(return_value=[doc])
+        self.source.session = Mock()
+        self.source.session.get.side_effect = lambda *a, **k: AttachmentTests.response(content)
+        self.odoo.require_access = Mock()
+        self.odoo.mappings.update({
+            'notice_number': ('x_notice', {'type': 'char'}),
+            'award_basis': ('x_award', {'type': 'selection', 'selection': [['global', 'Global']]}),
+            'session_datetime': ('x_session', {'type': 'datetime'}),
+        })
+        existing = {'id': 7, 'name': 'Manual', 'x_amount': 379000.0, 'x_award': 'user-choice',
+                    'stage_id': [90, 'Later']}
+        self.odoo.records[self.identifier] = existing
+        uploaded = []
+        self.odoo.attachments = Mock(side_effect=lambda task_id: list(uploaded))
+
+        def create_attachment(model, values):
+            uploaded.append({**values, 'id': 11, 'res_field': False, 'checksum': sha1(content).hexdigest()})
+            return 11
+
+        self.odoo.create = Mock(side_effect=create_attachment)
+        with patch('mon.sync.read_notice', return_value={
+            'notice_number': '007/2026', 'award_basis': 'Global', 'session_datetime': '2026-12-14 13:01:00',
+        }):
+            stats = self.run_sync()
+        self.assertEqual(stats['documents_uploaded'], 1)
+        self.source.session.get.assert_called_once()
+        self.assertEqual(self.odoo.updated, [(7, {'x_notice': '007/2026', 'x_session': '2026-12-14 13:01:00'})])
+        self.assertEqual(existing['x_award'], 'user-choice')
+        self.assertEqual(existing['stage_id'], [90, 'Later'])
+        self.assertFalse(self.odoo.created)
+        self.assertEqual(uploaded[0]['res_id'], 7)
 
     def test_update_only_official_fields_on_archived_task(self):
         task = {
@@ -562,17 +691,18 @@ class NumericAndPaginationTests(unittest.TestCase):
         Synchronizer(cfg(max_days=1), FILT, source, db, apply=True).run()
         self.assertFalse(db.updated)
 
-    def test_monetary_value_written_only_after_confirming_task_currency(self):
+    def test_monetary_value_is_rounded_before_creation_and_confirmed_on_readback(self):
         db = FakeOdoo()
         create_task = db.create_task
 
         def create(values):
-            self.assertNotIn('x_amount', values)
+            self.assertEqual(values['x_amount'], 100.01)
             task_id = create_task(values)
             db.records[values['x_pncp_id']]['x_currency'] = [18, 'BRL']
             return task_id
 
         db.create_task = create
+        db.task_currency_default = Mock(return_value=18)
         db.currency_step = Mock(return_value=Decimal('0.01'))
         db.mappings['estimated_value'] = (
             'x_amount', {'type': 'monetary', 'currency_field': 'x_currency'},
@@ -582,8 +712,18 @@ class NumericAndPaginationTests(unittest.TestCase):
             [{**RECORD, 'valorTotalEstimado': 100.005, 'orcamentoSigilosoCodigo': 1}], [],
         ])
         Synchronizer(cfg(max_days=1), FILT, source, db, apply=True).run()
-        db.currency_step.assert_called_once_with([18, 'BRL'])
-        self.assertEqual(db.updated, [(1, {'x_amount': 100.01})])
+        db.currency_step.assert_called_once_with(18)
+        self.assertFalse(db.updated)
+
+    def test_missing_monetary_default_blocks_creation_and_checkpoint(self):
+        db = FakeOdoo()
+        db.mappings['estimated_value'] = ('x_amount', {'type': 'monetary', 'currency_field': 'x_currency'})
+        db.task_currency_default = Mock(side_effect=ValueError('Missing BRL task currency default'))
+        db.create_task = Mock(wraps=db.create_task)
+        with self.assertRaisesRegex(ValueError, 'Missing BRL task currency default'):
+            Synchronizer(cfg(max_days=1), FILT, FakeSource(), db, apply=True).run()
+        db.create_task.assert_not_called()
+        self.assertFalse(db.checkpoints)
 
     def test_foreign_currency_cannot_be_used_for_estimate(self):
         session = FakeOdooSession([FakeResponse(data=[
@@ -591,6 +731,90 @@ class NumericAndPaginationTests(unittest.TestCase):
         ])])
         with self.assertRaisesRegex(ValueError, 'currency does not match'):
             OdooClient(cfg(), session).currency_step([18, 'USD'])
+
+    def test_currency_repair_requires_a_dedicated_stored_writable_field(self):
+        definition = {
+            'id': 19, 'name': 'x_currency', 'state': 'manual', 'ttype': 'many2one',
+            'relation': 'res.currency', 'readonly': False, 'store': True,
+            'related': False, 'compute': False, 'company_dependent': False,
+        }
+        for related in (False, 'project_id.company_id.currency_id'):
+            with self.subTest(related=related):
+                session = FakeOdooSession([
+                    FakeResponse(data=[{**definition, 'related': related}]),
+                    FakeResponse(data=[{'id': 18, 'name': 'BRL', 'rounding': 0.01}]),
+                ])
+                client = OdooClient(cfg(), session)
+                client.currency_amount_siblings = ()
+                client.mappings['estimated_value'] = (
+                    'x_amount', {'type': 'monetary', 'currency_field': 'x_currency'},
+                )
+                if related:
+                    with self.assertRaisesRegex(ValueError, 'independent'):
+                        client.assignable_task_currency()
+                    self.assertEqual(len(session.calls), 1)
+                else:
+                    self.assertEqual(client.assignable_task_currency(), 18)
+
+    def test_task_currency_default_uses_the_same_context_as_creation(self):
+        session = FakeOdooSession([FakeResponse(data={'x_currency': 18}), FakeResponse(data=25)])
+        client = OdooClient(cfg(), session)
+        client.mappings['estimated_value'] = ('x_amount', {'type': 'monetary', 'currency_field': 'x_currency'})
+        self.assertEqual(client.task_currency_default(), 18)
+        self.assertEqual(client.create_task({'x_amount': 10.0}), 25)
+        self.assertEqual(session.calls[0][1]['fields'], ['x_currency'])
+        self.assertEqual(session.calls[0][1]['context'], session.calls[1][1]['context'])
+
+    def test_shared_currency_requires_empty_siblings_and_matching_project_currency(self):
+        metadata = {
+            'id': 19, 'name': 'x_currency', 'state': 'manual', 'ttype': 'many2one',
+            'relation': 'res.currency', 'readonly': False, 'store': True,
+            'related': False, 'compute': False, 'company_dependent': False,
+        }
+        for company_currency in ([18, 'BRL'], [20, 'USD']):
+            with self.subTest(company_currency=company_currency):
+                session = FakeOdooSession([
+                    FakeResponse(data={}),
+                    FakeResponse(data=[metadata]),
+                    FakeResponse(data=[{'id': 18, 'name': 'BRL'}]),
+                    FakeResponse(data=[{'id': 11, 'company_id': [4, 'Example']}]),
+                    FakeResponse(data=[{'id': 4, 'currency_id': company_currency}]),
+                ])
+                client = OdooClient(cfg(), session)
+                client.currency_amount_siblings = ('x_proposal',)
+                client.mappings['estimated_value'] = (
+                    'x_amount', {'type': 'monetary', 'currency_field': 'x_currency'},
+                )
+                self.assertIsNone(client.task_currency_default())
+                if company_currency[1] == 'USD':
+                    with self.assertRaisesRegex(ValueError, 'project company'):
+                        client.assignable_task_currency()
+                else:
+                    self.assertEqual(client.assignable_task_currency(), 18)
+                    self.assertEqual(client.assignable_task_currency({'x_proposal': 0.0}), 18)
+                    with self.assertRaisesRegex(ValueError, 'other monetary values'):
+                        client.assignable_task_currency({'x_proposal': 50.0})
+                self.assertEqual(session.calls[0][1]['fields'], ['x_currency', 'x_proposal'])
+
+    def test_existing_incomplete_task_can_receive_currency_and_amount_together(self):
+        identifier = RECORD['numeroControlePNCP']
+        db = FakeOdoo()
+        db.records[identifier] = {'id': 7, 'name': 'Manual', 'x_currency': False, 'x_amount': 0.0,
+                                  'stage_id': [90, 'Later']}
+        db.mappings['estimated_value'] = ('x_amount', {'type': 'monetary', 'currency_field': 'x_currency'})
+        db.currency_step = Mock(return_value=Decimal('0.01'))
+        db.assignable_task_currency = Mock(return_value=18)
+        update = db.update_task
+
+        def write(task_id, values):
+            update(task_id, values)
+            db.records[identifier]['x_currency'] = [18, 'BRL']
+
+        db.update_task = write
+        Synchronizer(cfg(max_days=1), FILT, FakeSource(), db, apply=True).run()
+        self.assertEqual(db.updated, [(7, {'x_currency': 18, 'x_amount': 379000.0})])
+        self.assertEqual(db.records[identifier]['stage_id'], [90, 'Later'])
+        self.assertFalse(db.created)
 
     def test_repeated_consultation_page_is_incomplete(self):
         response = FakeResponse(data={'data': [RECORD], 'totalPaginas': 2, 'totalRegistros': 2})
