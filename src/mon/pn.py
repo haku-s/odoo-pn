@@ -19,6 +19,7 @@ BASE = f'{CONSULTATION_BASE}/v1/contratacoes'
 
 FILES_BASE = 'https://pncp.gov.br/api/pncp'
 MAX_DOCUMENTS = 100
+MAX_ITEMS = 1000
 LOOKUP_PAGE_SIZE = 50
 # Local pacing for the sequential collector.
 REQUEST_INTERVAL = 3.0
@@ -132,6 +133,7 @@ class Document:
     title: str
     url: str
     path: str
+    kind: str | None = None
 
 
 class PNCPClient:
@@ -309,7 +311,7 @@ class PNCPClient:
             if active:
                 download_path = f'{path}/{sequence}'
                 url = validate_document_url(row.get('url'), download_path)
-                documents.append(Document(sequence, title, url, download_path))
+                documents.append(Document(sequence, title, url, download_path, kind))
         return documents
 
     def budget_is_public(self, identifier: str) -> bool:
@@ -320,3 +322,32 @@ class PNCPClient:
         if type(code) is not int or code not in (1, 2, 3):
             raise ValueError('Missing or invalid purchase confidentiality code')
         return code == 1
+
+    def judgment_criterion(self, identifier: str) -> str | None:
+        path = purchase_path(identifier)
+        url = f'https://pncp.gov.br/pncp-api{path}/itens'
+        seen, criteria = set(), set()
+        for page in range(1, MAX_ITEMS // LOOKUP_PAGE_SIZE + 2):
+            batch = self._purchase_json(
+                url, f'item listing page {page}', pagina=page, tamanhoPagina=LOOKUP_PAGE_SIZE,
+            )
+            if not isinstance(batch, list) or len(batch) > LOOKUP_PAGE_SIZE:
+                raise ValueError('Invalid official item listing')
+            if len(seen) + len(batch) > MAX_ITEMS:
+                return None
+            for item in batch:
+                if not isinstance(item, dict):
+                    raise ValueError('Invalid official item metadata')
+                number = item.get('numeroItem')
+                if type(number) is not int or number <= 0 or number in seen:
+                    raise ValueError('Invalid or repeated official item number')
+                seen.add(number)
+                code = item.get('criterioJulgamentoId')
+                name = item.get('criterioJulgamentoNome')
+                if type(code) is int and code > 0 and isinstance(name, str) and name.strip():
+                    criteria.add((code, name.strip()))
+                else:
+                    criteria.add((None, None))
+            if len(batch) < LOOKUP_PAGE_SIZE:
+                return criteria.pop()[1] if len(criteria) == 1 else None
+        return None
