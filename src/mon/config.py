@@ -6,7 +6,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
@@ -111,9 +111,12 @@ class Settings:
     stage_id: int | None
     field_map: dict[str, str]
 
+    @staticmethod
+    def now() -> datetime:
+        return datetime.now(UTC)
+
     @classmethod
     def from_env(cls) -> 'Settings':
-        from datetime import datetime
         today = datetime.now(BRASILIA).date()
         initial = os.getenv('PNCP_INITIAL_DATE')
         try:
