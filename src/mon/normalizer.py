@@ -6,14 +6,21 @@ import math
 import re
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from urllib.parse import urlsplit
 
 from .config import BRASILIA
+from .relevance import fold
 
 PNCP_ID = re.compile(r'([0-9]{14})-1-([0-9]{6})/([0-9]{4})')
 PROPOSAL_TIME = re.compile(
     r'[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}'
     r'(?:\.[0-9]{1,9})?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])?'
 )
+DISPUTE_PLATFORMS = {
+    'bbmnetlicitacoes.com.br': 'BBMNET',
+    'novobbmnet.com.br': 'BBMNET',
+    'portaldecompraspublicas.com.br': 'Portal de Compras Públicas',
+}
 
 
 def odoo_datetime(value: object) -> str | None:
@@ -85,7 +92,33 @@ def normalize(record: dict) -> dict:
         ):
             raise ValueError('Purchase identity does not match its source fields')
 
-    result = {'pncp_id': identifier}
+    result = {
+        'pncp_id': identifier,
+        'pncp_link': f'https://pncp.gov.br/app/editais/{cnpj}/{year}/{sequence}',
+    }
+    modality = record.get('modalidadeId')
+    if type(modality) is int:
+        if modality in (1, 2, 3, 4, 5, 6, 7, 13, 16, 17, 18, 19, 20):
+            result['contract_type'] = 'Licitação'
+        elif modality == 8:
+            mode = fold(record.get('modoDisputaNome')).strip()
+            if mode in ('dispensa com disputa', 'dispensa sem disputa'):
+                result['contract_type'] = mode.capitalize()
+        elif modality == 9:
+            result['contract_type'] = 'Inexigibilidade'
+        elif modality == 12:
+            result['contract_type'] = 'Credenciamento'
+    origin = record.get('linkSistemaOrigem')
+    if isinstance(origin, str):
+        try:
+            url = urlsplit(origin)
+        except ValueError:
+            pass
+        else:
+            if url.scheme == 'https' and url.hostname and url.username is None:
+                platform = DISPUTE_PLATFORMS.get(url.hostname.removeprefix('www.'))
+                if platform:
+                    result['dispute_platform'] = platform
     for target, source in (
         ('title', 'objetoCompra'),
         ('process_number', 'processo'),
