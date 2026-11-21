@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import re
 import unicodedata
 
 from .config import Filters
+
+NR_SEPARATOR = r'\s*(?:[-–—]\s*)?'
+NR_TERM = re.compile(rf'nr{NR_SEPARATOR}0*([1-9][0-9]*)')
 
 
 def fold(s: object) -> str:
@@ -16,6 +20,16 @@ def fold(s: object) -> str:
         c for c in text
         if not unicodedata.combining(c)
     )
+
+
+def _contains_term(text: str, term: str) -> bool:
+    term = fold(term)
+    if term == 'aep':
+        return re.search(r'\baep\b', text) is not None
+    norm = NR_TERM.fullmatch(term)
+    if norm:
+        return re.search(rf'\bnr{NR_SEPARATOR}0*{norm[1]}\b', text) is not None
+    return term in text
 
 
 def is_relevant(record: dict, filt: Filters) -> bool:
@@ -38,12 +52,12 @@ def is_relevant(record: dict, filt: Filters) -> bool:
     )
 
     if any(
-        fold(term) in text
+        _contains_term(text, term)
         for term in filt.exclude_any
     ):
         return False
 
     return any(
-        fold(term) in text
+        _contains_term(text, term)
         for term in filt.include_any
     )
