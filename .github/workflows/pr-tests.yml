@@ -1,0 +1,28 @@
+name: Pull request tests
+
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  python-tests:
+    name: Python tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffadaca235ff9 # v9.0.0
+        with:
+          version: '0.13.8'
+          python-version: '3.15.2'
+
+      - name: Tests
+        env:
+          PYTHONPATH: src
+        run: uv run --locked python -m unittest discover -s src/tests -v
