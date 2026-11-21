@@ -317,9 +317,16 @@ class AttachmentTests(unittest.TestCase):
 
     def test_malformed_empty_and_wrong_extension_rejected(self):
 
-        for invalid in (b'', b' ', b'%PDF-1.5', b'<html>error</html>', b'plain text'):
+        for invalid in (
+            b'', b' ', b'%PDF-1.5', b'<html>error</html>', b'plain text',
+            self.content + b'\x00unexpected\x00',
+        ):
             with self.subTest(content=invalid), self.assertRaises(ValueError):
                 name_and_mime(self.doc, invalid)
+
+    def test_pdf_accepts_null_padding_after_end_marker(self):
+        _, mime = name_and_mime(self.doc, self.content + b'\x00\r\n')
+        self.assertEqual(mime, 'application/pdf')
 
     @staticmethod
     def response(body, status=200, headers=None):
