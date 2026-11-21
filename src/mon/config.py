@@ -22,7 +22,9 @@ FIELD_ALIASES = {
     'orgao': 'organization',
     'municipio': 'municipality_state',
 }
-OFFICIAL_FIELDS = frozenset(FIELD_ALIASES.values())
+NOTICE_FIELDS = frozenset({'notice_number', 'award_basis', 'session_datetime', 'clarification_deadline'})
+OPTIONAL_OFFICIAL_FIELDS = NOTICE_FIELDS | {'contract_type', 'judgment_criterion', 'dispute_platform', 'pncp_link'}
+OFFICIAL_FIELDS = frozenset(FIELD_ALIASES.values()) | OPTIONAL_OFFICIAL_FIELDS
 ALLOWED_FIELDS = OFFICIAL_FIELDS | frozenset(FIELD_ALIASES) | frozenset({
     'objeto', 'cnpj', 'uf',
     'situacao', 'data_publicacao',
