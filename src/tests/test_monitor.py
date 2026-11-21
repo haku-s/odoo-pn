@@ -3,7 +3,7 @@ import os
 import unittest
 
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -81,6 +81,27 @@ class PNCPTests(unittest.TestCase):
         )
 
         self.assertTrue(is_relevant(RECORD, f))
+
+    def test_workplace_abbreviation_matches_only_a_whole_word(self):
+        filters = Filters((6,), ('AEP',), (), ())
+        for text, expected in (('Avaliação (AEP)', True), ('aept', False), ('X-AEP/2026', True),
+                               ('XAEP', False)):
+            with self.subTest(text=text):
+                self.assertEqual(is_relevant({'objetoCompra': text}, filters), expected)
+
+    def test_regulatory_terms_match_the_complete_norm_number(self):
+        for term in ('nr1', 'nr-1', 'nr-01'):
+            filters = Filters((6,), (term,), (), ())
+            for text, expected in (('NR 1', True), ('NR-01', True), ('nr1', True),
+                                   ('NR – 1', True), ('NR-10', False), ('NR-12', False),
+                                   ('NR-17', False), ('INR-1', False)):
+                with self.subTest(term=term, text=text):
+                    self.assertEqual(is_relevant({'objetoCompra': text}, filters), expected)
+
+    def test_regulatory_exclusions_also_respect_the_complete_number(self):
+        filters = Filters((6,), ('treinamento',), ('nr-1',), ())
+        self.assertTrue(is_relevant({'objetoCompra': 'Treinamento NR-10'}, filters))
+        self.assertFalse(is_relevant({'objetoCompra': 'Treinamento NR 1'}, filters))
 
     def test_exclusion(self):
         f = Filters(
@@ -356,6 +377,7 @@ class FakeOdooSession:
 def cfg(**overrides):
     defaults = dict(
         today=TODAY,
+        now=lambda: datetime(2026, 11, 20, tzinfo=UTC),
         initial_date=TODAY - timedelta(days=1),
         overlap_days=2,
         max_days=7,
