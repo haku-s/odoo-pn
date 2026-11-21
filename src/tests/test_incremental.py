@@ -3,7 +3,7 @@ import io
 import os
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from hashlib import sha1
 from unittest.mock import Mock, patch
 
@@ -43,6 +43,45 @@ class IncrementalTests(unittest.TestCase):
         source.documents = Mock(return_value=[])
         source.budget_is_public = Mock(return_value=True)
         return source
+
+    def test_proposal_deadline_requires_seven_full_days_in_preview_and_apply(self):
+        self.config.now = lambda: datetime(2026, 11, 20, 13, tzinfo=UTC)
+        records = [
+            {**row, 'dataEncerramentoProposta': deadline}
+            for row, deadline in zip(THREE, ('2024-12-01T10:00:00', '2026-11-27T09:59:59',
+                                             '2026-11-27T10:00:00-03:00'), strict=True)
+        ]
+        absent = {**RECORD, 'numeroControlePNCP': '12345678000190-1-000126/2026'}
+        absent.pop('dataEncerramentoProposta')
+        records.append(absent)
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                source = self.source(FakeResponse(data=page(records, 1, 4)), FakeResponse(204))
+                stats = self.run_sync(source, apply=apply)
+                self.assertEqual(stats['skipped_expired'], 1)
+                self.assertEqual(stats['skipped_short_deadline'], 1)
+                self.assertEqual(stats['skipped_missing_deadline'], 1)
+                self.assertEqual(stats['matched'], 1)
+                source.documents.assert_called_once_with(THREE[2]['numeroControlePNCP'])
+                self.assertEqual(set(self.db.records), {THREE[2]['numeroControlePNCP']} if apply else set())
+
+    def test_expired_update_blocks_stale_publication_for_the_same_record(self):
+        expired = {**RECORD, 'dataEncerramentoProposta': '2024-12-01T10:00:00'}
+        source = self.source(FakeResponse(data=page([expired], 1, 1)),
+                             FakeResponse(data=page([RECORD], 1, 1)))
+        stats = self.run_sync(source)
+        self.assertEqual(stats['skipped_expired'], 1)
+        self.assertFalse(self.db.created)
+        source.documents.assert_not_called()
+
+    def test_apply_rechecks_seven_day_window_before_writing(self):
+        deadline = datetime(2026, 11, 27, 13, tzinfo=UTC)
+        self.config.now = Mock(side_effect=[deadline - timedelta(days=7),
+                                            deadline - timedelta(days=7) + timedelta(seconds=1)])
+        source = self.source(FakeResponse(data=page([RECORD], 1, 1)), FakeResponse(204))
+        stats = self.run_sync(source)
+        self.assertEqual(stats['skipped_short_deadline'], 1)
+        self.assertFalse(self.db.created or self.db.updated)
 
     def test_commits_three_records_before_next_page_and_recovers_after_interrupt_or_timeout(self):
         first = FakeResponse(data=page(THREE, 2, 4))
