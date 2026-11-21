@@ -7,7 +7,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 import requests
 
-from .config import FIELD_ALIASES, OFFICIAL_FIELDS, TECHNICAL_FIELD, Settings
+from .config import FIELD_ALIASES, OFFICIAL_FIELDS, OPTIONAL_OFFICIAL_FIELDS, TECHNICAL_FIELD, Settings
 from .relevance import fold
 
 TASK = 'project.task'
@@ -16,6 +16,8 @@ STAGE = 'project.task.type'
 ATTACHMENT = 'ir.attachment'
 MESSAGE = 'mail.message'
 CURRENCY = 'res.currency'
+COMPANY = 'res.company'
+MODEL_FIELD = 'ir.model.fields'
 CONTEXT = {'lang': 'pt_BR', 'active_test': False}
 TEXT = {'char', 'text'}
 
@@ -24,32 +26,36 @@ FORM = (
     ('Responsáveis', None, None, None, None),
     ('Número do processo', 'process_number', 'processo', TEXT, None),
     ('Número da licitação', 'purchase_number', 'numeroCompra', TEXT, None),
-    ('Edital / aviso', None, None, None, None),
+    ('Edital / aviso', 'notice_number', 'official notice number', TEXT, None),
     ('Modalidade', 'modality', 'modalidadeNome', TEXT | {'selection'}, None),
-    ('Tipo de contratação', None, None, None, None),
-    ('Critério de julgamento', None, None, None, None),
-    ('Forma de adjudicação', None, None, None, None),
+    ('Tipo de contratação', 'contract_type', 'modalidadeId / modoDisputaNome', {'selection'}, None),
+    ('Critério de julgamento', 'judgment_criterion', 'itens.criterioJulgamentoNome',
+     {'selection'}, 'x_studio_criterio_de_julgamento_1'),
+    ('Forma de adjudicação', 'award_basis', 'explicit scope in official notice', {'selection'}, None),
     ('Valor estimado', 'estimated_value', 'valorTotalEstimado', {'float', 'monetary'}, None),
     ('Tags', None, None, None, None),
     ('Prazo final', 'deadline', 'dataEncerramentoProposta', {'datetime'}, 'date_deadline'),
-    ('Data e hora da sessão', None, None, None, None),
-    ('Prazo para esclarecimentos', None, None, None, None),
+    ('Data e hora da sessão', 'session_datetime', 'explicit session time in official notice', {'datetime'}, None),
+    ('Prazo para esclarecimentos', 'clarification_deadline',
+     'explicit deadline in official notice', {'datetime'}, None),
     ('Órgão contratante', 'organization', 'orgaoEntidade.razaoSocial', TEXT, None),
     ('Município / UF', 'municipality_state',
      'unidadeOrgao.municipioNome / unidadeOrgao.ufSigla', TEXT, None),
     ('Identificador PNCP', 'identifier', 'numeroControlePNCP', TEXT, None),
-    ('Plataforma de disputa', None, None, None, None),
-    ('Link oficial do processo', None, None, None, None),
+    ('Plataforma de disputa', 'dispute_platform', 'linkSistemaOrigem', TEXT | {'selection'}, None),
+    ('Link oficial do processo', 'pncp_link', 'numeroControlePNCP → PNCP public page', TEXT, None),
     ('Resultado da Homologação', None, None, None, None),
 )
 
 OPERATIONS = {
-    TASK: {'fields_get', 'search_read', 'search_count', 'has_access', 'create', 'write'},
+    TASK: {'fields_get', 'search_read', 'search_count', 'default_get', 'has_access', 'create', 'write'},
     PROJECT: {'fields_get', 'search_read', 'has_access', 'write'},
     STAGE: {'fields_get', 'search_read'},
     ATTACHMENT: {'fields_get', 'search_read', 'has_access', 'create'},
     MESSAGE: {'fields_get', 'search_read', 'has_access'},
     CURRENCY: {'fields_get', 'search_read'},
+    COMPANY: {'search_read'},
+    MODEL_FIELD: {'search_read'},
 }
 ATTACHMENT_FIELDS = {
     'name': {'char'}, 'description': {'text'}, 'checksum': {'char'},
@@ -77,12 +83,14 @@ def selection_keys(meta: dict) -> dict:
     return keys
 
 
-def selection_value(meta: dict, value: str) -> str:
+def selection_value(meta: dict, value: str, *, required: bool = True) -> str | None:
     keys = [
         key for key, label in selection_keys(meta).items()
         if fold(label.strip()) == fold(value)
     ]
     if len(keys) != 1:
+        if not required:
+            return None
         raise ValueError('Official modality has no unique Odoo selection')
     return keys[0]
 
@@ -145,6 +153,8 @@ def field_inventory(task: dict, settings: Settings) -> tuple[list[dict], dict, l
             (name, meta) for name, meta in task.items()
             if fold(str(meta.get('string') or '').strip()) == fold(label)
         ]
+        if source == 'judgment_criterion':
+            matches = [(name, meta) for name, meta in matches if name == standard]
         name, meta = matches[0] if len(matches) == 1 else (None, {})
         entry = {
             'label': label, 'technical_name': name, 'type': meta.get('type'),
@@ -156,8 +166,10 @@ def field_inventory(task: dict, settings: Settings) -> tuple[list[dict], dict, l
         inventory.append(entry)
         if source is None:
             continue
+        required = source not in OPTIONAL_OFFICIAL_FIELDS or source in configured
         if name is None:
-            errors.append('Missing or ambiguous required Odoo field')
+            if required:
+                errors.append('Missing or ambiguous required Odoo field')
             continue
         expected = settings.pncp_field if source == 'identifier' else configured.get(source)
         if (
@@ -166,7 +178,8 @@ def field_inventory(task: dict, settings: Settings) -> tuple[list[dict], dict, l
             or (not standard and (not name.startswith('x_') or not TECHNICAL_FIELD.fullmatch(name)))
         ):
             entry['status'] = 'incompatible'
-            errors.append('Odoo field mapping does not match label')
+            if required:
+                errors.append('Odoo field mapping does not match label')
             continue
         try:
             _valid(task, name, types, writable=True, relation=PROJECT if source == 'project' else None)
@@ -182,7 +195,8 @@ def field_inventory(task: dict, settings: Settings) -> tuple[list[dict], dict, l
                     float_step(meta)
         except ValueError:
             entry['status'] = 'incompatible'
-            errors.append('Incompatible Odoo field metadata')
+            if required:
+                errors.append('Incompatible Odoo field metadata')
             continue
         entry['status'] = 'validated'
         if source not in ('project', 'identifier'):
@@ -198,6 +212,9 @@ class OdooClient:
         self.base = settings.odoo_url
         self.mappings = {}
         self.currency_steps: dict[int, Decimal] = {}
+        self._task_currency_defaults: dict | None = None
+        self._assignable_task_currency: int | None = None
+        self.currency_amount_siblings: tuple[str, ...] | None = None
         self.headers = {
             'Authorization': f'bearer {settings.odoo_api_key}',
             'Content-Type': 'application/json',
@@ -282,9 +299,9 @@ class OdooClient:
             raise ValueError('Missing ODOO_PNCP_FIELD')
         if not self.cfg.stage_id or self.cfg.stage_id <= 0:
             raise ValueError('Missing or invalid ODOO_STAGE_ID')
+        _valid(task, 'name', {'char'}, writable=write)
         if write:
             self._require_attachment_contract()
-            _valid(task, 'name', {'char'}, writable=True)
             _valid(task, 'stage_id', {'many2one'}, writable=True, relation=STAGE)
             _valid(project, self.cfg.checkpoint_field, {'text'}, writable=True)
         elif self.cfg.checkpoint_field:
@@ -328,6 +345,11 @@ class OdooClient:
         _valid(messages, 'res_id', {'many2one_reference', 'integer'})
         _valid(messages, 'attachment_ids', {'many2many'}, relation=ATTACHMENT)
         if mappings['estimated_value'][1]['type'] == 'monetary':
+            amount_field, amount = mappings['estimated_value']
+            self.currency_amount_siblings = tuple(
+                name for name, meta in task.items() if name != amount_field
+                and meta.get('type') == 'monetary' and meta.get('currency_field') == amount['currency_field']
+            )
             currency = self.fields(CURRENCY)
             _valid(currency, 'name', {'char'})
             _valid(currency, 'rounding', {'float'})
@@ -362,10 +384,11 @@ class OdooClient:
         if not ids:
             return {}
         identifier = self.cfg.pncp_field
-        fields = ['project_id', 'stage_id', identifier, *(name for name, _ in self.mappings.values())]
+        fields = ['name', 'project_id', 'stage_id', identifier, *(name for name, _ in self.mappings.values())]
         amount = self.mappings.get('estimated_value')
         if amount and amount[1]['type'] == 'monetary':
             fields.append(amount[1]['currency_field'])
+            fields.extend(name for name in self.currency_amount_siblings or () if name not in fields)
         rows = self.rows(TASK, [[identifier, 'in', ids]], fields, len(ids) + 1)
         by_id = {}
         for row in rows:
@@ -380,7 +403,7 @@ class OdooClient:
         return by_id
 
     def currency_step(self, currency_relation) -> Decimal:
-        currency_id = relation_id(currency_relation)
+        currency_id = currency_relation if positive_id(currency_relation) else relation_id(currency_relation)
         if currency_id is None:
             raise ValueError('Task currency is unavailable for the estimated value')
         if currency_id not in self.currency_steps:
@@ -396,8 +419,60 @@ class OdooClient:
             self.currency_steps[currency_id] = step
         return self.currency_steps[currency_id]
 
+    def _task_creation_context(self) -> dict:
+        return {**CONTEXT, 'default_project_id': self.cfg.project_id, 'default_stage_id': self.cfg.stage_id}
+
+    def task_currency_default(self) -> int | None:
+        field = self.mappings['estimated_value'][1]['currency_field']
+        if self._task_currency_defaults is None:
+            defaults = self.call(
+                TASK, 'default_get', fields=[field, *(self.currency_amount_siblings or ())],
+                context=self._task_creation_context(),
+            )
+            currency_id = defaults.get(field) if isinstance(defaults, dict) else None
+            if not isinstance(defaults, dict) or (currency_id is not None and currency_id is not False
+                                                   and not positive_id(currency_id)):
+                raise ValueError('Invalid task currency default')
+            self._task_currency_defaults = defaults
+        return self._task_currency_defaults.get(field) or None
+
+    def assignable_task_currency(self, task: dict | None = None) -> int:
+        field = self.mappings['estimated_value'][1]['currency_field']
+        siblings = self.currency_amount_siblings
+        if siblings is None or not field.startswith('x_'):
+            raise ValueError('Estimated value requires a writable independent task currency field')
+        values = self._task_currency_defaults if task is None else task
+        if siblings and (values is None or any(values.get(name) not in (None, 0) for name in siblings)):
+            raise ValueError('Cannot set shared task currency with other monetary values')
+        if self._assignable_task_currency is None:
+            attributes = {
+                'name': field, 'state': 'manual', 'ttype': 'many2one', 'relation': CURRENCY,
+                'readonly': False, 'store': True, 'related': False, 'compute': False,
+                'company_dependent': False,
+            }
+            rows = self.rows(MODEL_FIELD, [['model', '=', TASK], ['name', '=', field]], list(attributes), 2)
+            if len(rows) != 1 or any(rows[0].get(key) != value for key, value in attributes.items()):
+                raise ValueError('Estimated value requires a writable independent task currency field')
+            rows = self.rows(CURRENCY, [['name', '=', 'BRL'], ['active', '=', True]], ['name'], 2)
+            if len(rows) != 1 or rows[0].get('name') != 'BRL':
+                raise ValueError('Unique active BRL currency was not found')
+            brl = rows[0]['id']
+            if siblings:
+                company = relation_id(self.project(['company_id']).get('company_id'))
+                if company is None:
+                    raise ValueError('The project company currency could not be verified')
+                companies = self.rows(COMPANY, [['id', '=', company]], ['currency_id'], 2)
+                if (len(companies) != 1 or companies[0]['id'] != company
+                        or relation_id(companies[0].get('currency_id')) != brl):
+                    raise ValueError('A shared task currency requires BRL in the project company')
+            self._assignable_task_currency = brl
+        return self._assignable_task_currency
+
     def create(self, model: str, values: dict) -> int:
-        result = self.call(model, 'create', vals_list=[values])
+        params = {'vals_list': [values]}
+        if model == TASK:
+            params['context'] = self._task_creation_context()
+        result = self.call(model, 'create', **params)
         if isinstance(result, list) and len(result) == 1:
             result = result[0]
         if not positive_id(result):
