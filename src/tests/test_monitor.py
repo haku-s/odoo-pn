@@ -388,10 +388,8 @@ class OdooTests(unittest.TestCase):
         client = OdooClient(cfg(), session)
         client.create_task({'name': 'Sample'})
 
-        self.assertEqual(
-            session.calls[0][1],
-            {'vals_list': [{'name': 'Sample'}]},
-        )
+        self.assertEqual(session.calls[0][1]['vals_list'], [{'name': 'Sample'}])
+        self.assertNotIn('vals', session.calls[0][1])
 
         self.assertNotIn(
             'TEST_SECRET_NOT_REAL',
