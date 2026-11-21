@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import UTC, datetime, timedelta
 import os
 import sys
 from time import monotonic
@@ -13,6 +14,8 @@ from .documents import attach, download, pending_documents, read_notice
 from .normalizer import normalize
 from .odoo import TASK, amount_value, float_step, relation_id, selection_value
 from .relevance import fold, is_relevant
+
+MIN_PROPOSAL_WINDOW = timedelta(days=7)
 
 
 def changed_values(old: dict, official: dict) -> dict:
@@ -39,6 +42,20 @@ class Synchronizer:
         self.odoo = odoo
         self.apply = apply
         self.stats = Counter()
+
+    def _has_minimum_proposal_window(self, record: dict) -> bool:
+        deadline = record.get('deadline')
+        if deadline is None:
+            self.stats['skipped_missing_deadline'] += 1
+            return False
+        remaining = datetime.fromisoformat(deadline).replace(tzinfo=UTC) - self.cfg.now()
+        if remaining <= timedelta(0):
+            self.stats['skipped_expired'] += 1
+            return False
+        if remaining < MIN_PROPOSAL_WINDOW:
+            self.stats['skipped_short_deadline'] += 1
+            return False
+        return True
 
     def _values(self, record: dict, task: dict | None = None) -> dict:
         values = {}
@@ -177,6 +194,9 @@ class Synchronizer:
                 self.stats['documents_unverified'] += unverified
                 continue
 
+            if not self._has_minimum_proposal_window(record):
+                self.stats['matched'] -= 1
+                continue
             if old is None:
                 created = self._create_task(identifier, official)
                 self.stats['created'] += 1
@@ -246,6 +266,9 @@ class Synchronizer:
                                 f'Progress day={day} query={kind} modality={modality} '
                                 f'pages_completed={completed} received={self.stats["seen"]} '
                                 f'relevant={self.stats["matched"]} '
+                                f'skipped_expired={self.stats["skipped_expired"]} '
+                                f'skipped_short_deadline={self.stats["skipped_short_deadline"]} '
+                                f'skipped_missing_deadline={self.stats["skipped_missing_deadline"]} '
                                 f'tasks_created={self.stats["created"]} tasks_updated={self.stats["updated"]} '
                                 f'attachments_uploaded={self.stats["documents_uploaded"]} '
                                 f'attachments_present={self.stats["documents_present"]} '
@@ -267,12 +290,15 @@ class Synchronizer:
                                 continue
                             record = normalize(item)
                             identifier = record['pncp_id']
+                            if kind == 'atualizacao':
+                                updated_identifiers.add(identifier)
+                            elif identifier in updated_identifiers:
+                                continue
+                            if not self._has_minimum_proposal_window(record):
+                                continue
                             self.stats['matched'] += 1
-                            if kind == 'atualizacao' or identifier not in updated_identifiers:
-                                records[identifier] = record
+                            records[identifier] = record
                         self._sync_batch(records, progress)
-                        if kind == 'atualizacao':
-                            updated_identifiers.update(records)
                         completed += 1
                         progress(force=True)
             if self.apply and day < self.cfg.today and (last_done is None or day > last_done):
