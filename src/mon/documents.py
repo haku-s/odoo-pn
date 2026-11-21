@@ -119,7 +119,7 @@ def safe_name(document: Document) -> str:
 
 
 def _binary_kind(data: bytes) -> str:
-    if data.startswith(b'%PDF-') and data.rstrip().endswith(b'%%EOF'):
+    if data.startswith(b'%PDF-') and data.rstrip(b' \t\n\r\v\f\x00').endswith(b'%%EOF'):
         return 'pdf'
     if data.startswith(b'PK\x03\x04') and zipfile.is_zipfile(io.BytesIO(data)):
         return 'zip'
