@@ -7,14 +7,19 @@ import hashlib
 import io
 import re
 import zipfile
+from datetime import datetime
 from pathlib import PurePosixPath
 from time import monotonic
 from urllib.parse import urljoin
 
 import requests
+from pypdf import PdfReader
+from pypdf.errors import PyPdfError
 
+from .normalizer import odoo_datetime
 from .odoo import ATTACHMENT, TASK, direct_attachment
 from .pn import MAX_RATE_LIMIT_RETRY_WAIT, Document, PNCPSession, validate_document_url
+from .relevance import fold
 
 MAX_BYTES = 40 * 1024 * 1024
 DOWNLOAD_SECONDS = 120
@@ -46,6 +51,62 @@ ZIP_MEMBERS = {
     '.ods': 'content.xml', '.sxw': 'content.xml',
 }
 MARKER = 'PNCP document: '
+NOTICE_TIMESTAMP = (
+    r'[ \t]*(\d{2}/\d{2}/\d{4})[ \t]+as[ \t]+(\d{2}:\d{2})'
+    r'(?:[ \t]+horas)?[ \t]*\(horario\s+de\s+brasilia\)'
+)
+
+
+def notice_fields(text: str) -> dict[str, str]:
+    text = fold(text)
+    fields = {}
+    numbers = set(re.findall(
+        r'(?m)^[ \t]*(?:edital|aviso de contratacao direta|concorrencia|pregao)'
+        r'(?:[ \t]+eletronic[ao])?[ \t]+n[.°o]?[ \t]*\.?[ \t]*'
+        r'([0-9]{1,15}/[0-9]{4})[ \t]*$', text,
+    ))
+    if len(numbers) == 1:
+        fields['notice_number'] = numbers.pop()
+    bases = set(re.findall(
+        r'(?m)^[ \t]*criterio de julgamento:\s*(?:maior desconto|menor preco)'
+        r'[ \t]+(?:por[ \t]+)?(item|lote|grupo|global)[ \t]*$', text,
+    ))
+    if len(bases) == 1:
+        basis = bases.pop()
+        fields['award_basis'] = 'Lote/Grupo' if basis in {'lote', 'grupo'} else basis.capitalize()
+    for field, label in (
+        ('session_datetime', 'inicio da sessao publica(?: de lances)?'),
+        ('clarification_deadline', 'prazo para esclarecimentos'),
+    ):
+        timestamps = set(re.findall(rf'(?m)^[ \t]*{label}:{NOTICE_TIMESTAMP}', text))
+        if len(timestamps) == 1:
+            day, hour = timestamps.pop()
+            try:
+                local = datetime.strptime(f'{day} {hour}', '%d/%m/%Y %H:%M')
+            except ValueError:
+                continue
+            fields[field] = odoo_datetime(local.isoformat())
+    return fields
+
+
+def read_notice(content: bytes, document: Document, existing=()) -> dict[str, str]:
+    verify_document_revision(
+        source_marker(document), hashlib.sha1(content, usedforsecurity=False).hexdigest(), existing,
+    )
+    # shortcut: large, scanned and non-standard notices need a separate extraction path.
+    if not content.startswith(b'%PDF-') or len(content) > 5 * 1024 * 1024:
+        return {}
+    try:
+        pages = PdfReader(io.BytesIO(content), strict=True).pages[:3]
+        text = []
+        for page in pages:
+            stream = page.get_contents()
+            if stream is not None and len(stream.get_data()) > 1024 * 1024:
+                return {}
+            text.append(page.extract_text())
+    except (PyPdfError, ValueError, TypeError, OverflowError, RecursionError):
+        return {}
+    return notice_fields('\n'.join(text))
 
 
 def safe_name(document: Document) -> str:
@@ -164,6 +225,14 @@ def source_marker(document: Document) -> str:
     return f'{MARKER}{document.path}'
 
 
+def verify_document_revision(marker, checksum, existing):
+    if any(
+        row.get('description') == marker and row.get('checksum') != checksum
+        for row in existing
+    ):
+        raise RuntimeError('Official document content changed under an existing identity')
+
+
 def pending_documents(documents: list[Document], attachments: list[dict]) -> tuple[int, int]:
     pending = 0
     for doc in documents:
@@ -178,17 +247,14 @@ def pending_documents(documents: list[Document], attachments: list[dict]) -> tup
 
 
 def attach(odoo, session, identifier: str, task_id: int, document: Document,
-           existing: list[dict]) -> bool:
-    content = download(session, document)
+           existing: list[dict], *, content: bytes | None = None) -> bool:
+    if content is None:
+        content = download(session, document)
     name, mime = name_and_mime(document, content)
     checksum = hashlib.sha1(content, usedforsecurity=False).hexdigest()
     marker = source_marker(document)
 
-    if any(
-        row.get('description') == marker and row.get('checksum') != checksum
-        for row in existing
-    ):
-        raise RuntimeError('Official document content changed under an existing identity')
+    verify_document_revision(marker, checksum, existing)
     same_name = [row for row in existing if row.get('name') == name and row.get('checksum') != checksum]
     if same_name:
         root = f"{MARKER}{document.path.rsplit('/', 1)[0]}/"
