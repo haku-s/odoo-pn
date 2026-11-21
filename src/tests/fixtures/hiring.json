@@ -1,6 +1,7 @@
 {
   "numeroControlePNCP": "12345678000190-1-000123/2026",
   "numeroCompra": "045/2026",
+  "processo": "123/2026",
   "objetoCompra": "Software licensing for operational management",
   "informacaoComplementar": "Support and deployment services",
   "modalidadeId": 6,
