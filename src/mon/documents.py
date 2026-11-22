@@ -82,7 +82,8 @@ def notice_fields(text: str) -> dict[str, str]:
         if len(timestamps) == 1:
             day, hour = timestamps.pop()
             try:
-                local = datetime.strptime(f'{day} {hour}', '%d/%m/%Y %H:%M')
+                # odoo_datetime() interprets a naive timestamp as Brasília time.
+                local = datetime.strptime(f'{day} {hour}', '%d/%m/%Y %H:%M')  # noqa: DTZ007
             except ValueError:
                 continue
             fields[field] = odoo_datetime(local.isoformat())

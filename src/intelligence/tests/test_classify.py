@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from intelligence.classify import Classificacao, classificar, fold, split_terms
+from intelligence.classify import classificar, fold, split_terms
 
 
 def assunto(identificador, nome, inclusao, exclusao='', area='Saúde'):
