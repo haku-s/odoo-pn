@@ -259,12 +259,14 @@ class Synchronizer:
                     server_uf = self.filters.ufs[0] if len(self.filters.ufs) == 1 else None
                     completed = 0
 
+                    # This callback is consumed synchronously within this iteration.
+                    # Keep live counters instead of freezing them in defaults.
                     def progress(force=False):
                         now = monotonic()
                         if force or now >= self.next_progress:
                             print(
-                                f'Progress day={day} query={kind} modality={modality} '
-                                f'pages_completed={completed} received={self.stats["seen"]} '
+                                f'Progress day={day} query={kind} modality={modality} '  # noqa: B023
+                                f'pages_completed={completed} received={self.stats["seen"]} '  # noqa: B023
                                 f'relevant={self.stats["matched"]} '
                                 f'skipped_expired={self.stats["skipped_expired"]} '
                                 f'skipped_short_deadline={self.stats["skipped_short_deadline"]} '
@@ -272,7 +274,7 @@ class Synchronizer:
                                 f'tasks_created={self.stats["created"]} tasks_updated={self.stats["updated"]} '
                                 f'attachments_uploaded={self.stats["documents_uploaded"]} '
                                 f'attachments_present={self.stats["documents_present"]} '
-                                f'elapsed_seconds={now - started:.0f} last_complete_day={last_complete}',
+                                f'elapsed_seconds={now - started:.0f} last_complete_day={last_complete}',  # noqa: B023
                                 file=sys.stderr, flush=True,
                             )
                             self.next_progress = now + 30
