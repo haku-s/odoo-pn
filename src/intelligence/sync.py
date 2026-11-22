@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 import sys
+from typing import Any
 
 import requests
 
@@ -17,7 +18,7 @@ def _agora() -> str:
     return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
 
-def _mudou(antigo: dict, valores: dict) -> dict:
+def _mudou(antigo: dict[str, Any], valores: dict[str, Any]) -> dict[str, Any]:
     """Return only the fields whose normalised stored value differs."""
     return {
         nome: valor for nome, valor in valores.items()
@@ -33,7 +34,7 @@ class Synchronizer:
         self.apply = apply
         self.stats = Counter()
 
-    def _valores(self, item, assunto_id: int | None) -> dict:
+    def _valores(self, item, assunto_id: int | None) -> dict[str, Any]:
         valores = {
             'x_name': item.titulo,
             'x_studio_fontes': None,
@@ -50,7 +51,7 @@ class Synchronizer:
             valores['x_studio_data_de_publicacao'] = item.data_publicacao
         return valores
 
-    def _processar_fonte(self, fonte: dict, assuntos: list[dict]) -> None:
+    def _processar_fonte(self, fonte: dict[str, Any], assuntos: list[dict[str, Any]]) -> None:
         identificador_fonte = fonte['id']
         codigo = fonte['x_studio_codigo_da_fonte_1']
         if not fonte.get('x_studio_coleta_habilitada'):
@@ -104,7 +105,7 @@ class Synchronizer:
             self.stats['status_erros'] += 1
             print(f'Source {codigo}: could not record the failure', file=sys.stderr)
 
-    def _sincronizar(self, fonte: dict, itens: list, assuntos: list[dict]) -> None:
+    def _sincronizar(self, fonte: dict[str, Any], itens: list[Any], assuntos: list[dict[str, Any]]) -> None:
         identificador_fonte = fonte['id']
         identificadores = [item.identificador for item in itens]
         existente = self.odoo.publicacoes_por_identificador(identificador_fonte, identificadores)
@@ -142,18 +143,18 @@ class Synchronizer:
                 self._atualizar(atual, valores)
                 self.stats['atualizados' if _mudou(atual, valores) else 'inalterados'] += 1
 
-    def _criar(self, item, valores: dict) -> dict:
+    def _criar(self, item, valores: dict[str, Any]) -> dict[str, Any]:
         payload = dict(valores)
         payload['x_studio_primeira_coleta'] = _agora()
         payload['x_studio_ultima_atualizacao'] = payload['x_studio_primeira_coleta']
         try:
             publicacao_id = self.odoo.create_publicacao(payload)
-        except RuntimeError:
+        except RuntimeError as exc:
             confirmado = self.odoo.publicacoes_por_identificador(
                 valores['x_studio_fontes'], [item.identificador],
             ).get(item.identificador)
             if confirmado is None:
-                raise RuntimeError('Publication creation was not confirmed')
+                raise RuntimeError('Publication creation was not confirmed') from exc
             return confirmado
         confirmado = self.odoo.publicacoes_por_identificador(
             valores['x_studio_fontes'], [item.identificador],
@@ -162,7 +163,7 @@ class Synchronizer:
             raise RuntimeError('Created publication could not be confirmed')
         return confirmado
 
-    def _atualizar(self, atual: dict, valores: dict) -> None:
+    def _atualizar(self, atual: dict[str, Any], valores: dict[str, Any]) -> None:
         changes = _mudou(atual, valores)
         if not changes:
             return
@@ -183,7 +184,7 @@ class Synchronizer:
         ):
             raise RuntimeError('Publication update values were not confirmed')
 
-    def run(self) -> dict:
+    def run(self) -> dict[str, Any]:
         self.odoo.check(write=self.apply)
         fontes = self.odoo.fontes()
         assuntos = self.odoo.assuntos()
