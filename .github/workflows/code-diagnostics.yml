@@ -1,0 +1,113 @@
+name: Code Diagnostics
+
+# Manual, read-only diagnostics. Findings do not block other workflows.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: code-diagnostics-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    name: Diagnostic Report
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python and uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: '0.13.8'
+          python-version: '3.15.2'
+
+      - name: Install project dependencies
+        id: dependencies
+        continue-on-error: true
+        run: uv sync --locked
+
+      - name: Ruff - potential bugs
+        id: ruff
+        continue-on-error: true
+        run: >-
+          uvx ruff check src intelligence
+          --select E4,E7,E9,F,B,DTZ,S113,S307,S506,S602,S608,PLE
+
+      - name: Basedpyright - type errors
+        id: types
+        continue-on-error: true
+        run: >-
+          uvx basedpyright src intelligence
+          --level error --pythonversion 3.15 --pythonpath .venv/bin/python
+
+      - name: Deptry - dependency consistency
+        id: deptry
+        continue-on-error: true
+        run: uvx deptry .
+
+      - name: pip-audit - known vulnerabilities
+        id: audit
+        continue-on-error: true
+        run: |
+          uv export --locked --format requirements.txt --no-hashes \
+            --no-default-groups --no-emit-project \
+            --output-file "$RUNNER_TEMP/requirements-audit.txt"
+          uvx pip-audit --no-deps --disable-pip \
+            --requirement "$RUNNER_TEMP/requirements-audit.txt"
+
+      - name: Semgrep - Python security patterns
+        id: semgrep
+        continue-on-error: true
+        timeout-minutes: 12
+        run: >-
+          uvx semgrep scan --config p/python --error
+          --metrics=off --disable-version-check src intelligence
+
+      - name: Gitleaks - exposed secrets
+        id: secrets_scan
+        uses: gitleaks/gitleaks-action@v3
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Existing unit tests
+        id: unit_tests
+        continue-on-error: true
+        run: PYTHONPATH=src uv run --locked python -m unittest discover -s src/tests -v
+
+      - name: Integration unit tests
+        id: integration_tests
+        continue-on-error: true
+        run: PYTHONPATH=. uv run --locked python -m unittest discover -s intelligence/tests -v
+
+      - name: Results summary
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Code diagnostics
+
+          This workflow is informational only. It does not fix code, write to external services, or block other workflows.
+
+          | Check | Outcome |
+          | --- | --- |
+          | Project dependencies | ${{ steps.dependencies.outcome }} |
+          | Ruff | ${{ steps.ruff.outcome }} |
+          | Basedpyright | ${{ steps.types.outcome }} |
+          | Deptry | ${{ steps.deptry.outcome }} |
+          | pip-audit | ${{ steps.audit.outcome }} |
+          | Semgrep | ${{ steps.semgrep.outcome }} |
+          | Gitleaks | ${{ steps.secrets_scan.outcome }} |
+          | Existing unit tests | ${{ steps.unit_tests.outcome }} |
+          | Integration unit tests | ${{ steps.integration_tests.outcome }} |
+
+          **Interpretation:** `failure` means a finding **or** a tool/setup error; open the corresponding step log. `skipped` means the check did not execute. Diagnostic failures are deliberately non-blocking.
+          EOF
