@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any, TypeGuard
+
 import re
 from datetime import datetime, timezone
 
@@ -76,7 +78,7 @@ TECHNICAL = re.compile(r'^[a-z][a-z0-9_]*$')
 DOMINIO_ATIVOS = [['x_active', '=', True]]
 
 
-def positive_id(value) -> bool:
+def positive_id(value: object) -> TypeGuard[int]:
     return type(value) is int and value > 0
 
 
@@ -97,7 +99,7 @@ def normalizar_valor(nome: str, value):
     return value
 
 
-def _valid(metadata: dict, name: str, types: set[str], *, relation: str | None = None) -> dict:
+def _valid(metadata: dict[str, Any], name: str, types: set[str], *, relation: str | None = None) -> dict[str, Any]:
     meta = metadata.get(name)
     if not isinstance(meta, dict) or meta.get('type') not in types:
         raise ValueError(f'Incompatible Odoo field metadata: {name}')
@@ -106,7 +108,7 @@ def _valid(metadata: dict, name: str, types: set[str], *, relation: str | None =
     return meta
 
 
-def selection_keys(meta: dict) -> tuple[str, ...]:
+def selection_keys(meta: dict[str, Any]) -> tuple[str, ...]:
     choices = meta.get('selection')
     if not isinstance(choices, list) or not choices:
         raise ValueError('Missing selection options')
@@ -136,7 +138,7 @@ class OdooClient:
         }
         if settings.odoo_database:
             self.headers['X-Odoo-Database'] = settings.odoo_database
-        self._metadata: dict[str, dict] = {}
+        self._metadata: dict[str, dict[str, Any]] = {}
         self._selections: dict[str, tuple[str, ...]] = {}
 
     # ---------------------------------------------------------------- transport
@@ -160,7 +162,7 @@ class OdooClient:
         except ValueError as exc:
             raise RuntimeError('Invalid Odoo response format') from exc
 
-    def fields(self, model: str) -> dict:
+    def fields(self, model: str) -> dict[str, Any]:
         if model not in self._metadata:
             result = self.call(
                 model, 'fields_get', context=CONTEXT, attributes=FIELD_ATTRIBUTES,
@@ -222,7 +224,7 @@ class OdooClient:
                 raise ValueError('Odoo access denied: create')
 
     # ------------------------------------------------------------------- reads
-    def _registros(self, model: str, domain, fields: list[str], limite: int, rotulo: str) -> list[dict]:
+    def _registros(self, model: str, domain, fields: list[str], limite: int, rotulo: str) -> list[dict[str, Any]]:
         rows = self.call(
             model, 'search_read', domain=domain, fields=['id', *fields],
             limit=limite, context=CONTEXT,
@@ -231,7 +233,7 @@ class OdooClient:
             raise RuntimeError(f'Incomplete or oversized Odoo listing: {rotulo}')
         return rows
 
-    def fontes(self) -> list[dict]:
+    def fontes(self) -> list[dict[str, Any]]:
         rows = self._registros(
             FONTES, DOMINIO_ATIVOS,
             ['x_name', 'x_studio_codigo_da_fonte_1', 'x_studio_url',
@@ -254,7 +256,7 @@ class OdooClient:
             result.append(row)
         return result
 
-    def assuntos(self) -> list[dict]:
+    def assuntos(self) -> list[dict[str, Any]]:
         rows = self._registros(
             ASSUNTOS, DOMINIO_ATIVOS,
             ['x_name', 'x_studio_area', 'x_studio_termos_de_inclusao',
@@ -275,7 +277,7 @@ class OdooClient:
             result.append(row)
         return result
 
-    def publicacoes_por_identificador(self, fonte_id: int, identificadores: list[str]) -> dict[str, dict]:
+    def publicacoes_por_identificador(self, fonte_id: int, identificadores: list[str]) -> dict[str, dict[str, Any]]:
         if not identificadores:
             return {}
         rows = self.call(
@@ -303,7 +305,7 @@ class OdooClient:
         return found
 
     # ------------------------------------------------------------------ writes
-    def create_publicacao(self, valores: dict) -> int:
+    def create_publicacao(self, valores: dict[str, Any]) -> int:
         result = self.call(PUBLICACOES, 'create', vals_list=[valores], context=CONTEXT)
         if isinstance(result, list) and len(result) == 1:
             result = result[0]
@@ -311,7 +313,7 @@ class OdooClient:
             raise RuntimeError('Unexpected Odoo create response')
         return result
 
-    def update_publicacao(self, publicacao_id: int, valores: dict) -> None:
+    def update_publicacao(self, publicacao_id: int, valores: dict[str, Any]) -> None:
         result = self.call(
             PUBLICACOES, 'write', ids=[publicacao_id], vals=valores, context=CONTEXT,
         )

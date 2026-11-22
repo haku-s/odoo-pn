@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import math
 import re
 from datetime import datetime, timezone
@@ -68,7 +70,7 @@ def _text(value: object) -> str | None:
     return value.strip() or None
 
 
-def _object(record: dict, key: str) -> dict:
+def _object(record: dict[str, Any], key: str) -> dict[str, Any]:
     value = record.get(key)
     if value is None:
         return {}
@@ -77,7 +79,7 @@ def _object(record: dict, key: str) -> dict:
     return value
 
 
-def normalize(record: dict) -> dict:
+def normalize(record: dict[str, Any]) -> dict[str, Any]:
     identifier = record.get('numeroControlePNCP')
     cnpj, year, sequence = purchase_identity(identifier)
     org = _object(record, 'orgaoEntidade')
