@@ -22,7 +22,8 @@ from mon.documents import download
 from mon.odoo import OdooClient
 from mon.pn import Document, PNCPClient, purchase_path
 from mon.sync import Synchronizer
-from test_monitor import (
+
+from .test_monitor import (
     FILT, RECORD, TODAY, FakeOdoo, FakeSource, cfg,
 )
 
@@ -480,7 +481,7 @@ class ConfigurationAndOutputTests(unittest.TestCase):
         db.create.assert_not_called()
 
     def test_workflow_uses_only_secret_for_odoo_url(self):
-        workflow = Path(__file__).resolve().parents[2] / '.github/workflows/sync.yml'
+        workflow = Path(__file__).resolve().parents[3] / '.github/workflows/sync.yml'
         references = [
             line.strip() for line in workflow.read_text().splitlines()
             if 'ODOO_URL' in line

@@ -13,7 +13,8 @@ from mon.normalizer import clean_money, normalize, odoo_datetime
 from mon.odoo import OdooClient, selection_value
 from mon.pn import Document, PNCPClient, purchase_path
 from mon.sync import Synchronizer
-from test_monitor import (
+
+from .test_monitor import (
     FILT, RECORD, TODAY, FakeOdoo, FakeOdooSession, FakePNCPSession, FakeResponse,
     FakeSource, cfg,
 )

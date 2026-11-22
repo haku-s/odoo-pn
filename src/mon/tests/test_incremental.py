@@ -11,8 +11,9 @@ from mon.checkpoint import days_to_process, parse_checkpoint, serialize_checkpoi
 from mon.config import Settings
 from mon.pn import Document, PNCPClient, purchase_path
 from mon.sync import Synchronizer
-from test_monitor import FILT, RECORD, TODAY, FakeOdoo, FakePNCPSession, FakeResponse, FakeSource, cfg
-from test_runtime_safety import json_response, simulated_client
+
+from .test_monitor import FILT, RECORD, TODAY, FakeOdoo, FakePNCPSession, FakeResponse, FakeSource, cfg
+from .test_runtime_safety import json_response, simulated_client
 
 
 DAY = TODAY - timedelta(days=5)
