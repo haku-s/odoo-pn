@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
+from typing import Any
 
 
 def fold(value: object) -> str:
@@ -26,7 +27,7 @@ def split_terms(value: object) -> tuple[str, ...]:
     return tuple(terms)
 
 
-def _pattern(term: str) -> re.Pattern:
+def _pattern(term: str) -> re.Pattern[str]:
     return re.compile(rf'\b{re.escape(term)}\b')
 
 
@@ -41,8 +42,8 @@ class Classificacao:
     detalhes: dict[str, int] = field(default_factory=dict)
 
 
-def classificar(titulo: object, resumo: object, assuntos: list[dict]) -> Classificacao:
-    texto = fold(' '.join(part for part in (titulo, resumo) if part))
+def classificar(titulo: object, resumo: object, assuntos: list[dict[str, Any]]) -> Classificacao:
+    texto = fold(' '.join(str(part) for part in (titulo, resumo) if part))
     if not texto.strip():
         return Classificacao(None, None, 0, False, True, False, {})
 
