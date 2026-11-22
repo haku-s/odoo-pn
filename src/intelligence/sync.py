@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from itertools import batched
 import sys
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -110,7 +111,9 @@ class Synchronizer:
             valores['x_studio_data_de_publicacao'] = item.data_publicacao
         return valores
 
-    def _processar_fonte(self, fonte: dict[str, Any], assuntos: list[dict[str, Any]]) -> None:
+    def _processar_fonte(
+        self, fonte: dict[str, Any], assuntos: list[dict[str, Any]], start: datetime, end: datetime,
+    ) -> None:
         identificador_fonte = fonte['id']
         codigo = fonte['x_studio_codigo_da_fonte_1']
         auditoria_fonte = None
@@ -134,13 +137,12 @@ class Synchronizer:
             self.stats['fontes_nao_implementadas'] += 1
             print(f'Source {codigo}: no collector implemented', file=sys.stderr)
             return
-        desde = datetime.now(timezone.utc) - timedelta(days=self.cfg.max_age_days)
         try:
             itens = coletar(
-                codigo, self.session, fonte.get('x_studio_url'), desde,
+                codigo, self.session, fonte.get('x_studio_url'), start,
                 self.cfg.max_items_per_source,
                 method=fonte.get('x_studio_metodo_de_coleta'),
-                timeout=getattr(self.cfg, 'request_timeout', (10, 40)),
+                timeout=getattr(self.cfg, 'request_timeout', (10, 40)), until=end,
             )
         except Exception as exc:  # noqa: BLE001 - report and keep other sources running
             if auditoria_fonte is not None:
@@ -372,6 +374,8 @@ class Synchronizer:
             raise RuntimeError('Publication update values were not confirmed')
 
     def run(self) -> dict[str, Any]:
+        start = datetime.now(ZoneInfo('America/Sao_Paulo')).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
         self.odoo.check(write=self.apply)
         fontes = self.odoo.fontes()
         assuntos = self.odoo.assuntos()
@@ -407,7 +411,7 @@ class Synchronizer:
                 'fontes': [],
             }
         for fonte in fontes:
-            self._processar_fonte(fonte, assuntos)
+            self._processar_fonte(fonte, assuntos, start, end)
         if self._auditoria is not None:
             self._imprimir_auditoria()
-        return dict(self.stats)
+        return {'collection_date': start.date().isoformat(), **self.stats}
