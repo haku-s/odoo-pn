@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import logging
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ DOMINIO_OFICIAL = {
 }
 
 MAX_XML_BYTES = 20 * 1024 * 1024
+MAX_CAMARA_INVALID_LOGS = 5
 
 TIPOS = {
     'agencia_brasil': 'Notícia',
@@ -192,6 +194,11 @@ def coletar_camara(session, url, desde, limite):
     pagina = 1
     itens = []
     identificadores_vistos = set()
+    identificadores_aceitos = set()
+    invalidos = 0
+    validos = 0
+    primeiro_invalido = None
+    logger = logging.getLogger(__name__)
     # Keep a constant page size for the whole pagination: changing it between
     # requests shifts the offset and makes the API repeat earlier records.
     tamanho_pagina = min(100, limite)
@@ -211,27 +218,45 @@ def coletar_camara(session, url, desde, limite):
             break
         antes = len(identificadores_vistos)
         for registro in lote:
-            identificador = registro.get('id')
-            ementa = _texto(registro.get('ementa'))
-            uri = _texto(registro.get('uri'), 2000)
-            if type(identificador) is not int or identificador <= 0 or not ementa or not uri:
-                raise RespostaInvalida('Invalid proposition record')
-            if identificador in identificadores_vistos:
-                # Ignore repeated records across pages; stop when a page adds
-                # nothing new (pagination without progress).
-                continue
-            identificadores_vistos.add(identificador)
+            identificador = registro.get('id') if isinstance(registro, dict) else None
             try:
-                data = _data_hora(registro.get('dataApresentacao'))
+                if type(identificador) is not int or identificador <= 0:
+                    raise RespostaInvalida('Missing or invalid proposition identifier')
+                if identificador in identificadores_aceitos:
+                    # Keep the first valid record. An invalid earlier occurrence
+                    # must not suppress a later corrected record with the same ID.
+                    continue
+                identificadores_vistos.add(identificador)
+                ementa = _texto(registro.get('ementa'))
+                uri = _texto(registro.get('uri'), 2000)
+                if not ementa:
+                    raise RespostaInvalida('Missing proposition summary')
+                if not uri:
+                    raise RespostaInvalida('Missing proposition URL')
+                try:
+                    data = _data_hora(registro.get('dataApresentacao'))
+                except RespostaInvalida as exc:
+                    raise RespostaInvalida('Invalid proposition date') from exc
+                numero = registro.get('numero')
+                if type(numero) is not int or numero <= 0:
+                    raise RespostaInvalida('Invalid proposition number')
             except RespostaInvalida as exc:
-                raise RespostaInvalida('Invalid proposition date') from exc
+                invalidos += 1
+                if primeiro_invalido is None:
+                    primeiro_invalido = str(exc)
+                if invalidos <= MAX_CAMARA_INVALID_LOGS:
+                    logger.warning(
+                        'Source camara: skipped invalid proposition page=%d id=%s reason=%s',
+                        pagina, identificador if type(identificador) is int else 'unknown', exc,
+                    )
+                continue
+
+            identificadores_aceitos.add(identificador)
+            validos += 1
             if data and data < desde.strftime('%Y-%m-%d %H:%M:%S'):
                 continue
             sigla = _texto(registro.get('siglaTipo')) or 'PROPOSIÇÃO'
-            numero = registro.get('numero')
             ano = registro.get('ano')
-            if type(numero) is not int or numero <= 0:
-                raise RespostaInvalida('Invalid proposition number')
             titulo = f'{sigla} {numero}/{ano}' if type(ano) is int and ano > 0 else f'{sigla} {numero}'
             itens.append(Item(
                 identificador=str(identificador),
@@ -248,6 +273,15 @@ def coletar_camara(session, url, desde, limite):
         pagina += 1
         if pagina > 50:
             raise RespostaInvalida('Proposition pagination limit exceeded')
+    if invalidos:
+        if validos == 0:
+            raise RespostaInvalida(
+                f'No valid proposition records ({invalidos} invalid; first: {primeiro_invalido})'
+            )
+        logger.warning(
+            'Source camara: skipped_invalid_propositions=%d valid_propositions=%d',
+            invalidos, validos,
+        )
     return itens
 
 
