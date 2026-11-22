@@ -6,7 +6,7 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
 
@@ -104,7 +104,8 @@ def _data_hora(value: object) -> str | None:
         '%d/%m/%Y',
     ):
         try:
-            candidatos.append(datetime.strptime(valor, formato))
+            # Naive source timestamps are assigned their source timezone below.
+            candidatos.append(datetime.strptime(valor, formato))  # noqa: DTZ007
         except ValueError:
             continue
     for candidato in candidatos:
@@ -156,7 +157,7 @@ def coletar_agencia_brasil(session, url, desde, limite):
         raise RespostaInvalida('Invalid RSS document') from exc
     itens = []
     for elemento in raiz.iter('item'):
-        def campo(nome):
+        def campo(nome, *, elemento=elemento):
             alvo = elemento.find(nome)
             return alvo.text if alvo is not None else None
 
@@ -195,7 +196,7 @@ def coletar_camara(session, url, desde, limite):
     while len(itens) < limite:
         dados = _json(_get(session, url, {
             'dataInicio': desde.strftime('%Y-%m-%d'),
-            'dataFim': datetime.now().strftime('%Y-%m-%d'),
+            'dataFim': datetime.now(UTC).astimezone().strftime('%Y-%m-%d'),
             'ordenarPor': 'id',
             'ordem': 'DESC',
             'itens': tamanho_pagina,
@@ -253,7 +254,7 @@ def coletar_senado(session, url, desde, limite):
     url = _url_oficial('senado', url)
     dados = _json(_get(session, url, {
         'dataInicioApresentacao': desde.strftime('%Y-%m-%d'),
-        'dataFimApresentacao': datetime.now().strftime('%Y-%m-%d'),
+        'dataFimApresentacao': datetime.now(UTC).astimezone().strftime('%Y-%m-%d'),
     }, (10, 60)))
     if not isinstance(dados, list):
         raise RespostaInvalida('Invalid process response')
