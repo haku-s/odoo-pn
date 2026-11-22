@@ -3,7 +3,7 @@ name = "pnx"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
-    "pillow>=12.2,<13",
+    "pillow>=13.0.0,<14",
     "pypdf>=7.1.1,<8",
     "requests>=2.34.2,<3",
     "urllib3>=2.8.0,<3",
