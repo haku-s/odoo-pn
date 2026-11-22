@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+
 import argparse
 import json
 import logging
@@ -25,7 +26,7 @@ def _session(cfg: Settings) -> requests.Session:
     return session
 
 
-def _todas_as_fontes_falharam(stats: dict) -> bool:
+def _todas_as_fontes_falharam(stats: dict[str, int]) -> bool:
     """True when at least one source was attempted and none completed.
 
     A source only counts as completed after its collection *and*
