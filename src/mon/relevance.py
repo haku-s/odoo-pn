@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import re
 import unicodedata
 
@@ -32,7 +34,7 @@ def _contains_term(text: str, term: str) -> bool:
     return term in text
 
 
-def is_relevant(record: dict, filt: Filters) -> bool:
+def is_relevant(record: dict[str, Any], filt: Filters) -> bool:
     unit = record.get('unidadeOrgao')
     if unit is not None and not isinstance(unit, dict):
         raise ValueError('Unexpected organization unit format')
