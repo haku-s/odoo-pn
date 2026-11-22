@@ -3,6 +3,8 @@ compatible with the Publications model."""
 
 from __future__ import annotations
 
+from typing import Any
+
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -122,7 +124,7 @@ def _data_hora(value: object) -> str | None:
     raise RespostaInvalida(f'Unsupported publication date: {value!r}')
 
 
-def _get(session: requests.Session, url: str, params: dict, timeout) -> requests.Response:
+def _get(session: requests.Session, url: str, params: dict[str, Any], timeout) -> requests.Response:
     try:
         resposta = session.get(url, params=params, timeout=timeout, allow_redirects=False)
     except requests.RequestException as exc:
