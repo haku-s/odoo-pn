@@ -59,10 +59,10 @@ jobs:
         id: audit
         continue-on-error: true
         run: |
-          uv export --locked --format requirements.txt --no-hashes \
+          uv export --locked --quiet --format requirements.txt \
             --no-default-groups --no-emit-project \
             --output-file "$RUNNER_TEMP/requirements-audit.txt"
-          uvx pip-audit --no-deps --disable-pip \
+          uvx pip-audit --require-hashes --disable-pip \
             --requirement "$RUNNER_TEMP/requirements-audit.txt"
 
       - name: Semgrep - Python security patterns
