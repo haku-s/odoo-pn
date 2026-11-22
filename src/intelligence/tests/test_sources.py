@@ -483,7 +483,7 @@ class DailyApiTest(unittest.TestCase):
 
 
 class BancoCentralTest(unittest.TestCase):
-    url = 'https://api.bcb.gov.br/dados/serie/bcdata.sgs.12/dados/ultimos/3'
+    url = 'https://api.bcb.gov.br/dados/serie/bcdata.sgs.12/dados/ultimos/3?formato=json'
     day = datetime(2026, 11, 19, tzinfo=ZoneInfo('America/Sao_Paulo'))
 
     def collect(self, payload, status):

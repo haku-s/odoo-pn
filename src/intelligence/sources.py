@@ -585,7 +585,7 @@ _BCB_NO_OBSERVATION = 'br.gov.bcb.pec.sgs.comum.excecoes.SGSNegocioException: Va
 
 
 def coletar_bcb(session, url, desde, limite, *, until: datetime | None = None) -> list[Item]:
-    if url not in (_BCB_SERIES, _BCB_SERIES + '/ultimos/3'):
+    if not isinstance(url, str) or url.removesuffix('?formato=json') not in (_BCB_SERIES, _BCB_SERIES + '/ultimos/3'):
         raise ValueError('Banco Central source does not match the configured SGS series')
     day = desde.strftime('%d/%m/%Y')
     address = _BCB_SERIES + '?' + urlencode({'formato': 'json', 'dataInicial': day, 'dataFinal': day})
