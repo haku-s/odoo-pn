@@ -82,18 +82,18 @@ class RequestPacingTests(unittest.TestCase):
                 service = SimulatedPNCP([first_page, *responses])
 
                 def validate_connection(pool, conn):
-                    if len(service.attempts) == slow_attempt:
-                        service.now += 4
+                    if len(service.attempts) == slow_attempt:  # noqa: B023
+                        service.now += 4  # noqa: B023
 
                 def send_request(conn, method, url, *args, **kwargs):
                     page = int(parse_qs(urlsplit(url).query)['pagina'][0])
-                    service.attempts.append((page, service.now))
+                    service.attempts.append((page, service.now))  # noqa: B023
 
                 with (
                     patch.object(HTTPSConnectionPool, '_validate_conn', validate_connection),
                     patch.object(connection, 'request', send_request),
-                    patch.object(connection, 'getresponse', lambda conn: service.response()),
-                    patch('mon.pn.monotonic', side_effect=lambda: service.now),
+                    patch.object(connection, 'getresponse', lambda conn: service.response()),  # noqa: B023
+                    patch('mon.pn.monotonic', side_effect=lambda: service.now),  # noqa: B023
                     patch('mon.pn.sleep', side_effect=service.sleep),
                     patch('urllib3.connectionpool.log.warning'),
                 ):
@@ -104,7 +104,7 @@ class RequestPacingTests(unittest.TestCase):
                         self.assertEqual(next(records), RECORD)
                         with self.assertRaisesRegex(RuntimeError, 'consultation page 2: HTTP 429'):
                             next(records)
-                self.assertEqual(service.attempts, list(zip([1, 2, 2, 2, 2], expected_times)))
+                self.assertEqual(service.attempts, list(zip([1, 2, 2, 2, 2], expected_times, strict=True)))
 
     def test_page_two_can_recover_after_rate_limit(self):
         records = [RECORD, {**RECORD, 'numeroControlePNCP': '12345678000190-1-000124/2026'}]
@@ -120,7 +120,7 @@ class RequestPacingTests(unittest.TestCase):
                 self.assertEqual([
                     (parse_qs(urlsplit(url).query)['pagina'][0], stamp)
                     for url, stamp in service.attempts
-                ], list(zip(['1'] + ['2'] * (failures + 1), expected_times)))
+                ], list(zip(['1'] + ['2'] * (failures + 1), expected_times, strict=True)))
 
     def test_other_http_failures_keep_exponential_backoff(self):
         with simulated_client([(503, {}, b'')] * 3 + [(204, {}, b'')]) as (client, service):
@@ -322,7 +322,7 @@ class ResumeTests(unittest.TestCase):
                     if (kind, day, modality) == ('atualizacao', completed_day, 6):
                         yield [RECORD]
                     if (kind, day, modality) == ('publicacao', failed_day, 8):
-                        if failure == 'interrupt':
+                        if failure == 'interrupt':  # noqa: B023
                             raise KeyboardInterrupt
                         yield from page_client.list_day_pages(kind, day, modality, page_size, max_pages, uf)
 
