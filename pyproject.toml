@@ -5,4 +5,12 @@ requires-python = ">=3.14"
 dependencies = [
     "pypdf>=7.1.1,<8",
     "requests>=2.34.2,<3",
+    "urllib3>=2.8.0,<3",
 ]
+
+[tool.deptry]
+known_first_party = ["intelligence", "mon", "test_monitor", "test_runtime_safety"]
+
+[tool.ruff.lint.per-file-ignores]
+# Naive timestamps are intentional input fixtures for the Odoo/date parser.
+"src/intelligence/tests/test_sources.py" = ["DTZ001"]
