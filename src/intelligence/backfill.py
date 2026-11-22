@@ -92,15 +92,22 @@ def _locate(settings, session, timeout, feeds, source, row, article, identifier)
             try:
                 feeds[source_id] = _feed_images(source, settings, session, timeout)
             except (ValueError, RuntimeError) as exc:
-                feeds[source_id] = {}
-                print(f'Source {code}: backfill feed lookup failed ({type(exc).__name__})', file=sys.stderr)
-        item = feeds[source_id].get(identifier)
-        if item is not None:
-            if item.url != article:
-                return None
-            image = item.image_url
+                feeds[source_id] = exc
+        cached = feeds[source_id]
+        if isinstance(cached, (ValueError, RuntimeError)):
+            metadata_error = cached
+        else:
+            item = cached.get(identifier)
+            if item is not None:
+                if item.url != article:
+                    return None
+                image = item.image_url
     else:
         return None
+    if not image_allowed(article, permissions=permissions):
+        if metadata_error:
+            raise metadata_error
+        return image
     if image and image_allowed(article, image, permissions=permissions):
         return image
     fallback = image_reference(session, article, permissions=permissions, timeout=timeout)
@@ -124,7 +131,7 @@ def backfill(settings, odoo, session, *, apply: bool, limit: int, after_id: int)
         ('processed', 'identified', 'eligible', 'updated', 'without_image', 'permission_unverified', 'failed'), 0,
     ))
     by_source: dict[str, Counter[str]] = {}
-    feeds: dict[int, dict[str, Item]] = {}
+    feeds: dict[int, dict[str, Item] | ValueError | RuntimeError] = {}
     permissions = settings.image_permissions
     connect, read = settings.request_timeout
     timeout = (min(connect, 5), min(read, 15))
@@ -149,9 +156,10 @@ def backfill(settings, odoo, session, *, apply: bool, limit: int, after_id: int)
                 source_id is not None and source and code not in _LEGISLATIVE_SOURCES
                 and isinstance(identifier, str) and isinstance(article, str)
             ):
-                if image_allowed(article, permissions=permissions):
+                permitted = image_allowed(article, permissions=permissions)
+                if permitted or not apply:
                     image = _locate(settings, session, timeout, feeds, source, row, article, identifier)
-                else:
+                if not permitted and not image:
                     scoped['permission_unverified'] += 1
                     continue
             if image is None or not isinstance(article, str):

@@ -387,6 +387,13 @@ class AvatarTest(unittest.TestCase):
         self.assertIsNone(client.avatar_field(write=True))
         self.assertEqual(session.chamadas, [])
 
+    def test_read_only_avatar_resolution_needs_no_configured_field(self):
+        client, session = self.client(12, field=None)
+        self.assertEqual(client.avatar_field(), AVATAR)
+        self.assertEqual(client.avatar_missing_count(AVATAR), 12)
+        self.assertEqual([call['url'].rsplit('/', 1)[-1] for call in session.chamadas],
+                         ['fields_get', 'get_view', 'search_count'])
+
     def test_wrong_ambiguous_and_read_only_fields_are_rejected(self):
         both = AVATAR_ARCH.replace('</sheet>',
                                    '<field name="x_other" string="Avatar" widget="image"/></sheet>')
