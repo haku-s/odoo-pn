@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Any, TypeGuard
-
+import base64
+import binascii
+import json
 import re
+from collections.abc import Collection
 from datetime import datetime, timezone
+from typing import Any, TypeGuard
+from xml.etree import ElementTree
 
 import requests
 
@@ -63,11 +67,13 @@ PUBLICACOES_LEITURA = [
     'x_studio_resumo', 'x_studio_primeira_coleta', 'x_studio_ultima_atualizacao',
 ]
 CAMPOS_MANY2ONE = {'x_studio_fontes', 'x_studio_assunto_1'}
+PUBLICATION_IDENTITY = ('x_studio_fontes', 'x_studio_identificador_externo', 'x_studio_url')
+AVATAR_RESPONSE_LIMIT = 8 * 1024 * 1024
 
 OPERATIONS = {
     FONTES: {'fields_get', 'search_read', 'search_count', 'create', 'write', 'has_access'},
     ASSUNTOS: {'fields_get', 'search_read', 'search_count', 'has_access'},
-    PUBLICACOES: {'fields_get', 'search_read', 'search_count', 'create', 'write', 'has_access'},
+    PUBLICACOES: {'fields_get', 'get_view', 'search_read', 'search_count', 'create', 'write', 'has_access'},
     MODEL_FIELD: {'search_read'},
 }
 
@@ -126,6 +132,47 @@ def selection_keys(meta: dict[str, Any]) -> tuple[str, ...]:
     return tuple(keys)
 
 
+def _binary(value: object) -> tuple[str, bytes]:
+    if value is False:
+        return 'false', b''
+    if value is None:
+        return 'null', b''
+    if value == '':
+        return 'empty_string', b''
+    encoded = value.get('content') if isinstance(value, dict) else value
+    if not isinstance(encoded, str) or len(encoded) > AVATAR_RESPONSE_LIMIT:
+        raise RuntimeError('Unexpected Odoo Avatar binary value')
+    try:
+        data = base64.b64decode(encoded.replace('\r', '').replace('\n', ''), validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise RuntimeError('Invalid Odoo Avatar Base64 value') from exc
+    size = value.get('size') if isinstance(value, dict) else len(data)
+    if not data or type(size) is not int or size != len(data):
+        raise RuntimeError('Unexpected Odoo Avatar binary size')
+    return ('base64_object' if isinstance(value, dict) else 'base64_string'), data
+
+
+class OdooHTTPError(RuntimeError):
+    def __init__(self, model: str, method: str, status_code: int, *, validation_rejected: bool = False):
+        super().__init__(f'Odoo {model}/{method}: HTTP {status_code}')
+        self.model = model
+        self.method = method
+        self.status_code = status_code
+        self.validation_rejected = validation_rejected
+
+
+def _validation_rejected(response: requests.Response) -> bool:
+    if response.status_code != 422:
+        return False
+    try:
+        error = response.json()
+    except ValueError:
+        return False
+    return isinstance(error, dict) and error.get('name') in (
+        'odoo.exceptions.UserError', 'odoo.exceptions.ValidationError',
+    )
+
+
 class OdooClient:
     def __init__(self, settings, session: requests.Session | None = None):
         settings.require_odoo()
@@ -140,9 +187,11 @@ class OdooClient:
             self.headers['X-Odoo-Database'] = settings.odoo_database
         self._metadata: dict[str, dict[str, Any]] = {}
         self._selections: dict[str, tuple[str, ...]] = {}
+        self._avatar: tuple[str, bool] | None = None
+        self._avatar_write_checked = False
 
     # ---------------------------------------------------------------- transport
-    def call(self, model: str, method: str, **params):
+    def call(self, model: str, method: str, *, response_limit: int | None = None, **params):
         if method not in OPERATIONS.get(model, ()):
             raise ValueError('Operation not permitted')
         try:
@@ -152,13 +201,28 @@ class OdooClient:
                 json=params,
                 timeout=self.cfg.request_timeout,
                 allow_redirects=False,
+                stream=response_limit is not None,
             )
+            if response_limit:
+                with response:
+                    if response.status_code != 200:
+                        raise OdooHTTPError(model, method, response.status_code)
+                    body = bytearray()
+                    for chunk in response.iter_content(chunk_size=65536):
+                        body.extend(chunk)
+                        if len(body) > response_limit:
+                            raise RuntimeError('Odoo response exceeds the permitted size')
+                    return json.loads(body)
+            if response.status_code != 200:
+                raise OdooHTTPError(
+                    model, method, response.status_code,
+                    validation_rejected=method == 'create' and _validation_rejected(response),
+                )
+            return response.json()
+        except requests.JSONDecodeError as exc:
+            raise RuntimeError('Invalid Odoo response format') from exc
         except requests.RequestException as exc:
             raise RuntimeError(f'Odoo {model}/{method}: connection failed') from exc
-        if response.status_code != 200:
-            raise RuntimeError(f'Odoo {model}/{method}: HTTP {response.status_code}')
-        try:
-            return response.json()
         except ValueError as exc:
             raise RuntimeError('Invalid Odoo response format') from exc
 
@@ -233,18 +297,21 @@ class OdooClient:
             raise RuntimeError(f'Incomplete or oversized Odoo listing: {rotulo}')
         return rows
 
-    def fontes(self) -> list[dict[str, Any]]:
+    def fontes(self, *, include_archived: bool = False) -> list[dict[str, Any]]:
+        fields = ['x_name', 'x_studio_codigo_da_fonte_1', 'x_studio_url',
+                  'x_studio_metodo_de_coleta', 'x_studio_coleta_habilitada']
+        if include_archived:
+            fields.append('x_active')
         rows = self._registros(
-            FONTES, DOMINIO_ATIVOS,
-            ['x_name', 'x_studio_codigo_da_fonte_1', 'x_studio_url',
-             'x_studio_metodo_de_coleta', 'x_studio_coleta_habilitada'],
-            1000, 'sources',
+            FONTES, [] if include_archived else DOMINIO_ATIVOS, fields, 1000, 'sources',
         )
         result = []
         seen = set()
         for row in rows:
             if not isinstance(row, dict) or not positive_id(row.get('id')):
                 raise RuntimeError('Invalid Odoo source record')
+            if include_archived and type(row.get('x_active')) is not bool:
+                raise RuntimeError('Missing Odoo source active flag')
             code = row.get('x_studio_codigo_da_fonte_1')
             if not isinstance(code, str) or not code.strip() or not TECHNICAL.fullmatch(code):
                 raise RuntimeError('Invalid Odoo source code')
@@ -303,6 +370,215 @@ class OdooClient:
                 encontrado[nome] = normalizar_valor(nome, row.get(nome))
             found[key] = encontrado
         return found
+
+    def publicacoes_por_urls(self, source_ids: Collection[int], urls: Collection[str]) -> set[str]:
+        if not source_ids or not urls:
+            return set()
+        if not all(positive_id(value) for value in source_ids) or not all(
+            isinstance(url, str) and url for url in urls
+        ):
+            raise ValueError('Invalid Odoo publication URL lookup')
+        source_set, url_set = set(source_ids), set(urls)
+        rows = self._registros(
+            PUBLICACOES,
+            [['x_studio_fontes', 'in', sorted(source_set)], ['x_studio_url', 'in', sorted(url_set)]],
+            ['x_studio_fontes', 'x_studio_url'], 1000, 'publication URLs',
+        )
+        found = set()
+        for row in rows:
+            if not isinstance(row, dict) or not positive_id(row.get('id')):
+                raise RuntimeError('Invalid Odoo publication record')
+            url = row.get('x_studio_url')
+            if (not isinstance(url, str) or url not in url_set
+                    or relation_id(row.get('x_studio_fontes')) not in source_set):
+                raise RuntimeError('Unexpected Odoo publication URL match')
+            found.add(url)
+        return found
+
+    # ------------------------------------------------------------------ avatar
+    def _avatar_schema(self) -> tuple[str, bool]:
+        if self._avatar is not None:
+            return self._avatar
+        metadata = self.fields(PUBLICACOES)
+        view = self.call(PUBLICACOES, 'get_view', view_type='form', context=CONTEXT, response_limit=1024 * 1024)
+        arch = view.get('arch') if isinstance(view, dict) and view.get('model') == PUBLICACOES else None
+        if not isinstance(arch, str) or '<!DOCTYPE' in arch:
+            raise ValueError('Invalid Odoo publication form')
+        try:
+            form = ElementTree.fromstring(arch)
+        except ElementTree.ParseError as exc:
+            raise ValueError('Invalid Odoo publication form XML') from exc
+        if form.tag != 'form':
+            raise ValueError('Unexpected Odoo publication view type')
+        candidates: dict[str, bool] = {}
+        nodes = list(form)
+        while nodes:
+            node = nodes.pop()
+            if node.tag != 'field':
+                nodes.extend(node)
+                continue
+            name = node.get('name', '')
+            meta = metadata.get(name, {})
+            label = node.get('string', meta.get('string'))
+            if node.get('widget') != 'image' or not isinstance(label, str) or label.strip().casefold() != 'avatar':
+                continue
+            editable = node.get('readonly', 'False') in ('False', '0')
+            candidates[name] = candidates.get(name, False) or editable
+        if len(candidates) != 1:
+            raise ValueError('Publication form does not identify a unique Avatar image widget')
+        field, editable = next(iter(candidates.items()))
+        if not TECHNICAL.fullmatch(field):
+            raise ValueError('Invalid Odoo Avatar field name')
+        meta = _valid(metadata, field, {'binary'})
+        if meta.get('store') is not True or meta.get('related'):
+            raise ValueError('Odoo Avatar must be a stored, independent binary field')
+        self._avatar = field, editable and meta.get('readonly') is False
+        return self._avatar
+
+    def avatar_field(self, *, write: bool = False) -> str | None:
+        configured = getattr(self.cfg, 'avatar_field', None)
+        if write and not configured:
+            return None
+        field, editable = self._avatar_schema()
+        if configured and configured != field:
+            raise ValueError('Configured field does not match the publication form Avatar')
+        if write and not self._avatar_write_checked:
+            if not editable or not self._avatar_access([]):
+                raise ValueError('Odoo Avatar write access was not verified')
+            self._avatar_write_checked = True
+        return field
+
+    def _require_avatar(self, field: str, *, write: bool = False) -> None:
+        if not field or self.avatar_field(write=write) != field:
+            raise ValueError('Odoo Avatar is not enabled')
+
+    def _avatar_access(self, ids: list[int]) -> bool:
+        result = self.call(PUBLICACOES, 'has_access', ids=ids, operation='write', context=CONTEXT)
+        if type(result) is not bool:
+            raise RuntimeError('Invalid Odoo Avatar access response')
+        return result
+
+    def _avatar_domain(self, field: str, *, filled: bool = False) -> list[list[Any]]:
+        metadata = self.fields(PUBLICACOES)
+        active = [[name, '=', True] for name in ('x_active', 'active')
+                  if metadata.get(name, {}).get('type') == 'boolean']
+        if not active:
+            raise ValueError('Odoo publication archive flag could not be verified')
+        return [*active, [field, '!=' if filled else '=', False]]
+
+    def _avatar_count(self, domain: list[list[Any]]) -> int:
+        count = self.call(PUBLICACOES, 'search_count', domain=domain, context=CONTEXT)
+        if type(count) is not int or count < 0:
+            raise RuntimeError('Invalid Odoo Avatar count')
+        return count
+
+    def _avatar_sample(self, field: str, domain: list[list[Any]], *, filled: bool) -> str:
+        rows = self.call(
+            PUBLICACOES, 'search_read', domain=domain, fields=['id', field], limit=1,
+            context={**CONTEXT, 'bin_size': False}, response_limit=AVATAR_RESPONSE_LIMIT,
+        )
+        if (not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict)
+                or not positive_id(rows[0].get('id')) or field not in rows[0]):
+            raise RuntimeError('Odoo Avatar sample was not returned')
+        representation, content = _binary(rows[0][field])
+        if bool(content) != filled:
+            raise RuntimeError('Odoo Avatar sample did not match the binary domain')
+        return representation
+
+    def avatar_info(self) -> dict[str, Any]:
+        """Inspect the resolved form and report binary shapes without including images."""
+        configured = getattr(self.cfg, 'avatar_field', None)
+        report: dict[str, Any] = {'model': PUBLICACOES, 'field': None}
+        try:
+            field, editable = self._avatar_schema()
+            report.update(field=field, type='binary', widget='image')
+            if configured and configured != field:
+                raise ValueError('Configured field does not match the publication form Avatar')
+            report['writable'] = editable and self._avatar_access([])
+            for label, filled in (('empty', False), ('populated', True)):
+                domain = self._avatar_domain(field, filled=filled)
+                count = self._avatar_count(domain)
+                report[label] = count
+                report[f'{label}_representation'] = self._avatar_sample(field, domain, filled=filled) if count else None
+        except (RuntimeError, ValueError) as exc:
+            return {**report, 'status': 'blocked', 'reason': str(exc)}
+        report['status'] = ('confirmed' if configured else 'available') if report['writable'] else 'read_only'
+        return report
+
+    def avatar_missing_count(self, field: str) -> int:
+        self._require_avatar(field)
+        return self._avatar_count(self._avatar_domain(field))
+
+    def avatar_missing_page(self, field: str, *, after_id: int, limit: int) -> list[dict[str, Any]]:
+        self._require_avatar(field)
+        if type(after_id) is not int or after_id < 0 or type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError('Invalid Odoo Avatar page bounds')
+        rows = self.call(
+            PUBLICACOES, 'search_read', domain=[*self._avatar_domain(field), ['id', '>', after_id]],
+            fields=['id', *PUBLICATION_IDENTITY, 'x_studio_data_de_publicacao'],
+            limit=limit, order='id asc', context=CONTEXT, response_limit=AVATAR_RESPONSE_LIMIT,
+        )
+        if not isinstance(rows, list) or len(rows) > limit:
+            raise RuntimeError('Invalid Odoo Avatar page')
+        for row in rows:
+            if not isinstance(row, dict) or not positive_id(row.get('id')) or row['id'] <= after_id:
+                raise RuntimeError('Invalid Odoo Avatar page order')
+            after_id = row['id']
+        return rows
+
+    def _avatar_publication(self, publication_id: int, domain: list[list[Any]], fields: list[str],
+                            *, binary: bool = False) -> dict[str, Any] | None:
+        if not positive_id(publication_id):
+            raise ValueError('Invalid Odoo publication ID')
+        rows = self.call(
+            PUBLICACOES, 'search_read', domain=[['id', '=', publication_id], *domain], fields=['id', *fields],
+            limit=2, context={**CONTEXT, 'bin_size': False},
+            response_limit=AVATAR_RESPONSE_LIMIT if binary else None,
+        )
+        if rows == []:
+            return None
+        if (not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict)
+                or not positive_id(rows[0].get('id')) or rows[0]['id'] != publication_id
+                or any(key not in rows[0] for key in fields)):
+            raise RuntimeError('Invalid Odoo Avatar publication lookup')
+        return rows[0]
+
+    def avatar_missing(self, publication_id: int, field: str) -> bool:
+        self._require_avatar(field)
+        return self._avatar_publication(publication_id, self._avatar_domain(field), []) is not None
+
+    def confirm_avatar(self, publication_id: int, field: str, encoded: str) -> None:
+        self._require_avatar(field)
+        _, expected = _binary(encoded)
+        row = self._avatar_publication(publication_id, [], [field], binary=True)
+        if not row or not expected or _binary(row[field])[1] != expected:
+            raise RuntimeError('Odoo Avatar write was not confirmed')
+
+    def write_avatar(self, publication_id: int, field: str, encoded: str, *,
+                     expected: dict[str, Any] | None = None) -> bool:
+        self._require_avatar(field, write=True)
+        if not isinstance(encoded, str) or not _binary(encoded)[1]:
+            raise ValueError('Invalid Odoo Avatar write payload')
+        if not positive_id(publication_id) or not self._avatar_access([publication_id]):
+            raise ValueError('Odoo publication Avatar write access was not verified')
+        matches = self._avatar_publication(publication_id, self._avatar_domain(field), list(PUBLICATION_IDENTITY))
+        if matches is None:
+            return False
+        if expected is not None and (expected.get('id') != publication_id or any(
+            normalizar_valor(key, matches[key]) != normalizar_valor(key, expected.get(key))
+            for key in PUBLICATION_IDENTITY
+        )):
+            raise RuntimeError('Odoo publication identity changed before the Avatar write')
+        try:
+            self.update_publicacao(publication_id, {field: encoded})
+        except RuntimeError as exc:
+            try:
+                self.confirm_avatar(publication_id, field, encoded)
+            except RuntimeError:
+                raise RuntimeError('Odoo Avatar write was not confirmed') from exc
+        else:
+            self.confirm_avatar(publication_id, field, encoded)
+        return True
 
     # ------------------------------------------------------------------ writes
     def create_publicacao(self, valores: dict[str, Any]) -> int:

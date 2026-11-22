@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import UTC, datetime
+from unittest.mock import patch
 
 from intelligence import sources
 
@@ -41,6 +42,16 @@ RSS = b"""<?xml version="1.0" encoding="utf-8"?>
 <pubDate>Mon, 01 Jan 2024 10:00:00 -0300</pubDate>
 <description>Antiga</description></item>
 </channel></rss>"""
+
+EBC_FEED = 'https://agenciabrasil.ebc.com.br/rss/ultimasnoticias/feed.xml'
+
+
+def agency_feed(content=None, *, status=200):
+    with patch.object(
+        sources, 'read_public', return_value=(content, EBC_FEED),
+        side_effect=RuntimeError(f'Source HTTP {status}') if status != 200 else None,
+    ):
+        return sources.coletar_agencia_brasil(None, EBC_FEED, datetime(2026, 11, 1, tzinfo=UTC), 10)
 
 CAMARA = {'dados': [
     {'id': 2655695, 'siglaTipo': 'PL', 'numero': 5756, 'ano': 2026,
@@ -130,11 +141,7 @@ class DateTest(unittest.TestCase):
 
 class AgenciaBrasilTest(unittest.TestCase):
     def test_parse(self):
-        session = FakeSession([FakeResponse(content=RSS)])
-        itens = sources.coletar_agencia_brasil(
-            session, 'https://agenciabrasil.ebc.com.br/rss/ultimasnoticias/feed.xml',
-            datetime(2026, 11, 1), 10,
-        )
+        itens = agency_feed(RSS)
         self.assertEqual(len(itens), 1)
         item = itens[0]
         self.assertEqual(item.titulo, 'Nota um')
@@ -144,14 +151,8 @@ class AgenciaBrasilTest(unittest.TestCase):
         self.assertIn('Resumo', item.resumo)
 
     def test_dtd_rejected(self):
-        session = FakeSession([
-            FakeResponse(content=b'<?xml version="1.0"?><!DOCTYPE r [<!ENTITY a "b">]><r/>'),
-        ])
         with self.assertRaises(sources.RespostaInvalida):
-            sources.coletar_agencia_brasil(
-                session, 'https://agenciabrasil.ebc.com.br/rss/ultimasnoticias/feed.xml',
-                datetime(2026, 11, 1), 10,
-            )
+            agency_feed(b'<?xml version="1.0"?><!DOCTYPE r [<!ENTITY a "b">]><r/>')
 
     def test_foreign_domain_rejected(self):
         with self.assertRaises(ValueError):
@@ -401,17 +402,11 @@ class IbgeTest(unittest.TestCase):
 class RobustaTest(unittest.TestCase):
     def test_rss_without_items(self):
         rss = b'<?xml version="1.0"?><rss version="2.0"><channel></channel></rss>'
-        session = FakeSession([FakeResponse(content=rss)])
-        self.assertEqual(sources.coletar_agencia_brasil(
-            session, 'https://agenciabrasil.ebc.com.br/rss/ultimasnoticias/feed.xml',
-            datetime(2026, 11, 1), 10), [])
+        self.assertEqual(agency_feed(rss), [])
 
     def test_http_500(self):
-        session = FakeSession([FakeResponse(status=500)])
         with self.assertRaises(sources.RespostaInvalida):
-            sources.coletar_agencia_brasil(
-                session, 'https://agenciabrasil.ebc.com.br/rss/ultimasnoticias/feed.xml',
-                datetime(2026, 11, 1), 10)
+            agency_feed(status=500)
 
     def test_http_401(self):
         session = FakeSession([FakeResponse(status=401)])

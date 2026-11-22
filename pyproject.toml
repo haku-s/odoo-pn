@@ -3,6 +3,7 @@ name = "pnx"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
+    "pillow>=12.2,<13",
     "pypdf>=7.1.1,<8",
     "requests>=2.34.2,<3",
     "urllib3>=2.8.0,<3",
@@ -10,6 +11,9 @@ dependencies = [
 
 [tool.deptry]
 known_first_party = ["intelligence", "mon", "test_monitor", "test_runtime_safety"]
+
+[tool.deptry.package_module_name_map]
+pillow = "PIL"
 
 [tool.ruff.lint.per-file-ignores]
 # Naive timestamps are intentional input fixtures for the Odoo/date parser.

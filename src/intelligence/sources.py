@@ -5,17 +5,20 @@ from __future__ import annotations
 
 from typing import Any
 
+import json
 import logging
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from urllib.parse import urlsplit
+from html.parser import HTMLParser
+from urllib.parse import unquote, urljoin, urlsplit
 
 import requests
 
 from .classify import fold
+from .network import read_public, validate_url
 
 DOMINIO_OFICIAL = {
     'agencia_brasil': {'agenciabrasil.ebc.com.br'},
@@ -26,6 +29,32 @@ DOMINIO_OFICIAL = {
 
 MAX_XML_BYTES = 20 * 1024 * 1024
 MAX_CAMARA_INVALID_LOGS = 5
+
+EBC_HOST = 'agenciabrasil.ebc.com.br'
+EBC_IMAGE_HOST = 'imagens.ebc.com.br'
+IBGE_ARTICLE_HOST = 'agenciadenoticias.ibge.gov.br'
+EBC_FEEDS = {
+    f'https://{EBC_HOST}/rss/ultimasnoticias/feed.xml',
+    f'https://{EBC_HOST}/feed/ultimasnoticias/feed.xml',
+}
+RSS_PUBLISHERS = {
+    **dict.fromkeys(EBC_FEEDS, EBC_HOST),
+    'https://www.camara.leg.br/noticias/rss/dinamico/EDUCACAO': 'www.camara.leg.br',
+    'https://www.camara.leg.br/noticias/rss/dinamico/SAUDE': 'www.camara.leg.br',
+    'https://www.camara.leg.br/noticias/rss/dinamico/TRABALHO': 'www.camara.leg.br',
+    'https://agencia.fiocruz.br/rss.xml': 'agencia.fiocruz.br',
+    'https://revistapesquisa.fapesp.br/feed/': 'revistapesquisa.fapesp.br',
+    'https://www.gov.br/saude/pt-br/assuntos/noticias/noticias/atom.xml': 'www.gov.br',
+    'https://portal.tcu.gov.br/rss.xml': 'portal.tcu.gov.br',
+}
+ATOM = '{http://www.w3.org/2005/Atom}'
+MEDIA = '{http://search.yahoo.com/mrss/}'
+CONTENT = '{http://purl.org/rss/1.0/modules/content/}encoded'
+DC_DATE = '{http://purl.org/dc/elements/1.1/}date'
+_EBC_PROXY = re.compile(
+    r'https://imagens\.ebc\.com\.br/[A-Za-z0-9_-]{27}=/[1-9][0-9]{0,3}x[1-9][0-9]{0,3}/smart/'
+    r'(https://agenciabrasil\.ebc\.com\.br/sites/default/files/[^?#]+(?:\?itok=[A-Za-z0-9_-]{1,128})?)'
+)
 
 TIPOS = {
     'agencia_brasil': 'Notícia',
@@ -51,20 +80,13 @@ class Item:
     data_publicacao: str | None  # UTC '%Y-%m-%d %H:%M:%S'
     resumo: str | None
     tipo: str | None
+    image_url: str | None = None
 
 
 def _url_oficial(codigo: str, url: object) -> str:
     if not isinstance(url, str) or not url:
         raise ValueError('Source URL is not configured')
-    try:
-        parsed = urlsplit(url)
-    except ValueError as exc:
-        raise ValueError('Invalid source URL') from exc
-    host = (parsed.hostname or '').lower()
-    if parsed.scheme != 'https' or host not in DOMINIO_OFICIAL[codigo]:
-        raise ValueError('Source URL does not belong to the official domain')
-    if parsed.username or parsed.password or parsed.fragment:
-        raise ValueError('Invalid source URL')
+    validate_url(url, DOMINIO_OFICIAL[codigo])
     return url
 
 
@@ -102,6 +124,10 @@ def _data_hora(value: object) -> str | None:
         candidatos.append(parsedate_to_datetime(valor))
     except (TypeError, ValueError):
         pass
+    try:
+        candidatos.append(datetime.fromisoformat(valor))
+    except ValueError:
+        pass
     for formato in (
         '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M', '%Y-%m-%d %H:%M:%S',
         '%Y-%m-%d %H:%M', '%Y-%m-%d', '%d/%m/%Y %H:%M:%S', '%d/%m/%Y %H:%M',
@@ -123,14 +149,14 @@ def _data_hora(value: object) -> str | None:
         return candidato.astimezone().astimezone(
             __import__('datetime').timezone.utc
         ).replace(tzinfo=None).strftime('%Y-%m-%d %H:%M:%S')
-    raise RespostaInvalida(f'Unsupported publication date: {value!r}')
+    raise RespostaInvalida('Unsupported publication date')
 
 
 def _get(session: requests.Session, url: str, params: dict[str, Any], timeout) -> requests.Response:
     try:
         resposta = session.get(url, params=params, timeout=timeout, allow_redirects=False)
     except requests.RequestException as exc:
-        raise RuntimeError(f'Source request failed: {exc}') from exc
+        raise RuntimeError('Source request failed') from exc
     if resposta.status_code != 200:
         raise RespostaInvalida(f'Source HTTP {resposta.status_code}')
     return resposta
@@ -143,49 +169,173 @@ def _json(response: requests.Response):
         raise RespostaInvalida('Invalid JSON response') from exc
 
 
-# ---------------------------------------------------------------- Agência Brasil
-def coletar_agencia_brasil(session, url, desde, limite):
-    url = _url_oficial('agencia_brasil', url)
-    resposta = _get(session, url, {}, (10, 40))
-    conteudo = resposta.content
-    # The stdlib XML parser expands internal entities.  Refuse documents that
-    # carry a DTD (the only way to declare entities) and cap the payload, which
-    # removes both the external-entity (XXE) and entity-expansion vectors.
-    if len(conteudo) > MAX_XML_BYTES:
-        raise RespostaInvalida('RSS document exceeds the size limit')
-    if b'<!DOCTYPE' in conteudo.upper() or b'<!ENTITY' in conteudo.upper():
-        raise RespostaInvalida('RSS document declares a DTD')
-    try:
-        raiz = ET.fromstring(conteudo)
-    except ET.ParseError as exc:
-        raise RespostaInvalida('Invalid RSS document') from exc
-    itens = []
-    for elemento in raiz.iter('item'):
-        def campo(nome, *, elemento=elemento):
-            alvo = elemento.find(nome)
-            return alvo.text if alvo is not None else None
+# ------------------------------------------------------------------------- Feeds
+def rss_publisher(url: object) -> str | None:
+    return RSS_PUBLISHERS.get(url) if isinstance(url, str) else None
 
-        link = _texto(campo('link'), 2000)
-        titulo = _texto(campo('title'))
-        if not link or not titulo:
-            raise RespostaInvalida('RSS item without title or link')
-        try:
-            data = _data_hora(campo('pubDate'))
-        except RespostaInvalida:
-            data = None
-        if data and data < desde.strftime('%Y-%m-%d %H:%M:%S'):
+
+def _linked_url(base: str, value: str | None, host: str) -> str | None:
+    if not value or len(value) > 2000:
+        return None
+    try:
+        target = urljoin(base, value.strip())
+        validate_url(target, {host})
+    except ValueError:
+        return None
+    return target
+
+
+def is_ebc_image_proxy(url: str) -> bool:
+    try:
+        validate_url(url, {EBC_IMAGE_HOST})
+    except ValueError:
+        return False
+    match = _EBC_PROXY.fullmatch(url)
+    if not match:
+        return False
+    path = unquote(urlsplit(match[1]).path)
+    return (
+        not {'.', '..'}.intersection(path.split('/'))
+        and not any(c.isspace() or ord(c) < 32 or ord(c) == 127 or c in '%\\?#' for c in path)
+        and path.lower().endswith(('.jpeg', '.jpg', '.png', '.webp'))
+    )
+
+
+class _ArticleImages(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.urls: set[str] = set()
+
+    def handle_starttag(self, tag, attrs):
+        if tag.rsplit(':', 1)[-1] == 'img':
+            values = dict(attrs)
+            url = values.get('src')
+            if url and values.get('width') != '1' and values.get('height') != '1':
+                self.urls.add(url)
+
+
+def _field(element: ET.Element, name: str) -> str | None:
+    node = element.find(name)
+    if node is None:
+        return None
+    # Atom XHTML content carries real child elements rather than escaped markup.
+    if len(node):
+        return (node.text or '') + ''.join(ET.tostring(child, encoding='unicode') for child in node)
+    return node.text
+
+
+def _feed_image(element: ET.Element, article: str, host: str, *html: str | None) -> str | None:
+    for node in element.iter(MEDIA + 'content'):
+        if node.get('medium') == 'image' or node.get('type', '').lower().startswith('image/'):
+            image = _linked_url(article, node.get('url'), host)
+            if image:
+                return image
+    for node in element.iter(MEDIA + 'thumbnail'):
+        image = _linked_url(article, node.get('url'), host)
+        if image:
+            return image
+    for node in [*element.findall('enclosure'), *element.findall(ATOM + 'link')]:
+        if node.tag == ATOM + 'link' and node.get('rel') != 'enclosure':
             continue
-        itens.append(Item(
-            identificador=link,
-            titulo=titulo,
-            url=link,
-            data_publicacao=data,
-            resumo=_html_para_texto(campo('description')),
-            tipo=TIPOS['agencia_brasil'],
+        if node.get('type', '').lower().startswith('image/'):
+            image = _linked_url(article, node.get('url') or node.get('href'), host)
+            if image:
+                return image
+    if host == EBC_HOST:
+        featured = element.findtext('imagem-destaque', '').strip()
+        if is_ebc_image_proxy(featured):
+            return featured
+        image = _linked_url(article, featured, host)
+        return image if image and urlsplit(image).path.startswith('/sites/default/files/') else None
+    for markup in html:
+        if markup:
+            parser = _ArticleImages()
+            parser.feed(markup)
+            if len(parser.urls) == 1:
+                image = _linked_url(article, next(iter(parser.urls)), host)
+                if image:
+                    return image
+    return None
+
+
+def collect_feed(url: str, since: datetime, limit: int, timeout: tuple[int, int]) -> list[Item]:
+    host = rss_publisher(url)
+    if host is None:
+        raise ValueError('Feed URL is not approved')
+    try:
+        endpoints = EBC_FEEDS if host == EBC_HOST else {url}
+        body, final_url = read_public(url, allowed_urls=endpoints, max_bytes=MAX_XML_BYTES, timeout=timeout)
+    except ValueError as exc:
+        raise RespostaInvalida('Feed request destination is not approved') from exc
+    except RuntimeError as exc:
+        raise RespostaInvalida(str(exc)) from exc
+    # Decode before checking for DTDs so alternate encodings cannot hide declarations.
+    try:
+        decoded = body.decode('utf-8-sig')
+    except UnicodeDecodeError as exc:
+        raise RespostaInvalida('Feed encoding is not UTF-8') from exc
+    if '<!DOCTYPE' in decoded.upper():
+        raise RespostaInvalida('Feed declares a DTD')
+    try:
+        root = ET.fromstring(decoded)
+    except ET.ParseError as exc:
+        raise RespostaInvalida('Invalid feed XML') from exc
+
+    atom = root.tag == ATOM + 'feed'
+    channel = root.find('channel') if root.tag == 'rss' and root.get('version') == '2.0' else None
+    if atom:
+        entries = root.findall(ATOM + 'entry')
+    elif channel is not None:
+        entries = channel.findall('item')
+    else:
+        raise RespostaInvalida('Unexpected feed format')
+
+    items = []
+    identifiers: set[str] = set()
+    links: set[str] = set()
+    cutoff = since.strftime('%Y-%m-%d %H:%M:%S')
+    for entry in entries:
+        if atom:
+            address = next((link.get('href') for link in entry.findall(ATOM + 'link')
+                            if link.get('rel', 'alternate') == 'alternate' and link.get('href')), None)
+            title = _texto(_field(entry, ATOM + 'title'))
+            identity = _texto(entry.findtext(ATOM + 'id'), 2000)
+            date = entry.findtext(ATOM + 'published') or entry.findtext(ATOM + 'updated')
+            summary = _field(entry, ATOM + 'summary')
+            content = _field(entry, ATOM + 'content')
+        else:
+            address = entry.findtext('link')
+            title = _texto(_field(entry, 'title'))
+            identity = _texto(entry.findtext('guid'), 2000)
+            date = entry.findtext('pubDate') or entry.findtext(DC_DATE)
+            summary = _field(entry, 'description')
+            content = _field(entry, CONTENT)
+        link = _linked_url(final_url, address, host)
+        if not title or not link:
+            raise RespostaInvalida('Feed item has no title or approved link')
+        identifier = link if host == EBC_HOST else identity or link
+        try:
+            published = _data_hora(date)
+        except RespostaInvalida:
+            published = None
+        if (published and published < cutoff) or identifier in identifiers or link in links:
+            continue
+        identifiers.add(identifier)
+        links.add(link)
+        items.append(Item(
+            identificador=identifier, titulo=title, url=link, data_publicacao=published,
+            resumo=_html_para_texto(summary if host == EBC_HOST else summary or content), tipo='Notícia',
+            image_url=_feed_image(entry, link, host, summary, content),
         ))
-        if len(itens) >= limite:
+        if len(items) >= limit:
             break
-    return itens
+    return items
+
+
+def coletar_agencia_brasil(session, url, desde, limite):
+    if rss_publisher(url) != EBC_HOST:
+        raise ValueError('Feed URL is not approved for this source')
+    return collect_feed(url, desde, limite, (10, 40))
 
 
 # ----------------------------------------------------------------------- Câmara
@@ -330,6 +480,25 @@ def coletar_senado(session, url, desde, limite):
 
 
 # ------------------------------------------------------------------------ IBGE
+def ibge_image_url(value: object) -> str | None:
+    if not isinstance(value, str) or len(value) > 8192:
+        return None
+    try:
+        metadata = json.loads(value)
+    except ValueError:
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    for key in ('image_intro', 'image_fulltext'):
+        path = metadata.get(key)
+        if not isinstance(path, str):
+            continue
+        target = _linked_url(f'https://{IBGE_ARTICLE_HOST}/', path, IBGE_ARTICLE_HOST)
+        if target and urlsplit(target).path.startswith('/images/agenciadenoticias/'):
+            return target
+    return None
+
+
 def coletar_ibge(session, url, desde, limite):
     url = _url_oficial('ibge', url)
     pagina = 1
@@ -373,6 +542,7 @@ def coletar_ibge(session, url, desde, limite):
                 data_publicacao=data,
                 resumo=_texto(registro.get('introducao')),
                 tipo=tipo,
+                image_url=ibge_image_url(registro.get('imagens')),
             ))
             if len(itens) >= limite:
                 break
@@ -392,7 +562,12 @@ COLETORES = {
 }
 
 
-def coletar(codigo: str, session, url, desde, limite) -> list[Item]:
+def coletar(codigo: str, session, url, desde, limite, *, method=None, timeout=(10, 40)) -> list[Item]:
+    if codigo == 'agencia_brasil' or (method == 'RSS' and codigo not in COLETORES):
+        publisher = rss_publisher(url)
+        if publisher is None or (codigo == 'agencia_brasil' and publisher != EBC_HOST):
+            raise FonteNaoImplementada('Feed URL is not approved')
+        return collect_feed(url, desde, limite, timeout)
     coletor = COLETORES.get(codigo)
     if coletor is None:
         raise FonteNaoImplementada(codigo)

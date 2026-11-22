@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 
 from intelligence.odoo import (
     OdooClient,
+    OdooHTTPError,
     normalizar_valor,
 )
 
@@ -73,6 +75,15 @@ class FakeResponse:
     def json(self):
         return self._payload
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        pass
+
+    def iter_content(self, chunk_size):
+        yield json.dumps(self._payload).encode()
+
 
 class FakeSession:
     def __init__(self, respostas=None):
@@ -80,11 +91,12 @@ class FakeSession:
         self.chamadas = []
         self.headers = {}
 
-    def post(self, url, headers=None, json=None, timeout=None, allow_redirects=False):
+    def post(self, url, headers=None, json=None, timeout=None, allow_redirects=False, stream=False):
         self.chamadas.append({'url': url, 'json': json})
         if not self.respostas:
             raise AssertionError('no queued response')
-        return FakeResponse(self.respostas.pop(0))
+        payload = self.respostas.pop(0)
+        return payload if isinstance(payload, FakeResponse) else FakeResponse(payload)
 
 
 class ClientTest(unittest.TestCase):
@@ -324,6 +336,155 @@ class ArquivamentoTest(unittest.TestCase):
         client.publicacoes_por_identificador(1, ['a'])
         dominio = session.chamadas[0]['json']['domain']
         self.assertNotIn(['x_active', '=', True], dominio)
+
+
+AVATAR = 'x_test_avatar'
+AVATAR_IMAGE = 'Ynl0ZXM='
+AVATAR_ARCH = '<form><sheet><field name="x_test_avatar" widget="image" class="oe_avatar ml-3 mr-3"/></sheet></form>'
+PUBLICATION = {
+    'id': 7,
+    'x_studio_fontes': [1, 'Source'],
+    'x_studio_identificador_externo': 'article-1',
+    'x_studio_url': 'https://example.test/article-1',
+}
+
+
+class AvatarTest(unittest.TestCase):
+    def client(self, *responses, field=AVATAR, arch=AVATAR_ARCH, metadata=None):
+        cfg = type('Cfg', (), {
+            'odoo_url': 'https://example.test', 'odoo_database': '',
+            'odoo_api_key': 'test-key', 'require_odoo': lambda self: None,
+            'request_timeout': (10, 40), 'avatar_field': field,
+        })()
+        model = 'x_publicacoes'
+        session = FakeSession([
+            metadata if metadata is not None else {
+                AVATAR: campo('binary', string='Avatar'), 'x_active': campo('boolean'),
+            },
+            {'model': model, 'id': 8, 'models': {model: [AVATAR]}, 'arch': arch},
+            *responses,
+        ])
+        return OdooClient(cfg, session=session), session
+
+    def test_report_probes_real_binary_shapes_without_exposing_values(self):
+        client, session = self.client(
+            True, 2, [{'id': 1, AVATAR: False}], 1,
+            [{'id': 2, AVATAR: {'content': AVATAR_IMAGE, 'size': 5}}],
+        )
+        report = client.avatar_info()
+        self.assertEqual(report['field'], AVATAR)
+        self.assertEqual(report['widget'], 'image')
+        self.assertEqual(report['type'], 'binary')
+        self.assertTrue(report['writable'])
+        self.assertEqual(report['populated'], 1)
+        self.assertEqual(report['empty_representation'], 'false')
+        self.assertEqual(report['populated_representation'], 'base64_object')
+        self.assertNotIn(AVATAR_IMAGE, str(report))
+        self.assertFalse(any(call['url'].endswith(('/create', '/write')) for call in session.chamadas))
+
+    def test_explicit_configuration_is_required_for_image_writes(self):
+        client, session = self.client(field=None)
+        self.assertIsNone(client.avatar_field(write=True))
+        self.assertEqual(session.chamadas, [])
+
+    def test_read_only_avatar_resolution_needs_no_configured_field(self):
+        client, session = self.client(12, field=None)
+        self.assertEqual(client.avatar_field(), AVATAR)
+        self.assertEqual(client.avatar_missing_count(AVATAR), 12)
+        self.assertEqual([call['url'].rsplit('/', 1)[-1] for call in session.chamadas],
+                         ['fields_get', 'get_view', 'search_count'])
+
+    def test_wrong_ambiguous_and_read_only_fields_are_rejected(self):
+        both = AVATAR_ARCH.replace('</sheet>',
+                                   '<field name="x_other" string="Avatar" widget="image"/></sheet>')
+        for name, arch, metadata in (
+            ('x_other', AVATAR_ARCH, None),
+            (AVATAR, both, {AVATAR: campo('binary', string='Avatar'), 'x_other': campo('binary')}),
+            (AVATAR, AVATAR_ARCH, {AVATAR: campo('binary', string='Avatar', readonly=True)}),
+        ):
+            with self.subTest(name=name, arch=arch):
+                client, _ = self.client(True, field=name, arch=arch, metadata=metadata)
+                with self.assertRaises(ValueError):
+                    client.avatar_field(write=True)
+
+    def test_missing_page_uses_active_empty_domain_and_id_order(self):
+        client, session = self.client([PUBLICATION])
+        self.assertEqual(client.avatar_missing_page(AVATAR, after_id=4, limit=2), [PUBLICATION])
+        params = session.chamadas[-1]['json']
+        self.assertIn(['x_active', '=', True], params['domain'])
+        self.assertIn([AVATAR, '=', False], params['domain'])
+        self.assertIn(['id', '>', 4], params['domain'])
+        self.assertEqual(params['order'], 'id asc')
+        self.assertEqual(params['limit'], 2)
+        self.assertNotIn(AVATAR, params['fields'])
+
+    def test_write_preserves_filled_or_archived_record(self):
+        client, session = self.client(True, True, [])
+        self.assertFalse(client.write_avatar(7, AVATAR, AVATAR_IMAGE, expected=PUBLICATION))
+        self.assertFalse(any(call['url'].endswith('/write') for call in session.chamadas))
+        self.assertIn(['x_active', '=', True], session.chamadas[-1]['json']['domain'])
+        self.assertIn([AVATAR, '=', False], session.chamadas[-1]['json']['domain'])
+
+    def test_write_checks_identity_before_update(self):
+        client, session = self.client(True, True, [{**PUBLICATION, 'x_studio_url': 'other'}])
+        with self.assertRaisesRegex(RuntimeError, 'identity'):
+            client.write_avatar(7, AVATAR, AVATAR_IMAGE, expected=PUBLICATION)
+        self.assertFalse(any(call['url'].endswith('/write') for call in session.chamadas))
+
+    def test_write_only_avatar_and_confirms_binary_content(self):
+        for content in (AVATAR_IMAGE, {'content': AVATAR_IMAGE, 'size': 5}):
+            with self.subTest(content_type=type(content).__name__):
+                client, session = self.client(True, True, [PUBLICATION], True, [{'id': 7, AVATAR: content}])
+                self.assertTrue(client.write_avatar(7, AVATAR, AVATAR_IMAGE, expected=PUBLICATION))
+                self.assertEqual(session.chamadas[-2]['json']['vals'], {AVATAR: AVATAR_IMAGE})
+                self.assertEqual(session.chamadas[-2]['json']['ids'], [7])
+
+    def test_write_failure_is_unconfirmed_if_read_back_differs(self):
+        client, _ = self.client(True, True, [PUBLICATION], False, [{'id': 7, AVATAR: 'YQ=='}])
+        with self.assertRaisesRegex(RuntimeError, 'confirmed'):
+            client.write_avatar(7, AVATAR, AVATAR_IMAGE, expected=PUBLICATION)
+
+    def test_write_readback_recovers_uncertain_response(self):
+        client, session = self.client(True, True, [PUBLICATION], False, [{'id': 7, AVATAR: AVATAR_IMAGE}])
+        self.assertTrue(client.write_avatar(7, AVATAR, AVATAR_IMAGE, expected=PUBLICATION))
+        self.assertEqual(sum(call['url'].endswith('/write') for call in session.chamadas), 1)
+
+    def test_create_rejection_needs_known_odoo_error_and_hides_response_details(self):
+        for status, name, rejected in (
+            (422, 'odoo.exceptions.ValidationError', True),
+            (422, 'werkzeug.exceptions.UnprocessableEntity', False),
+            (500, 'odoo.exceptions.ValidationError', False),
+        ):
+            with self.subTest(status=status, name=name):
+                client, session = self.client()
+                response = FakeResponse({'name': name, 'message': AVATAR_IMAGE})
+                response.status_code = status
+                session.respostas = [response]
+                with self.assertRaises(OdooHTTPError) as caught:
+                    client.create_publicacao({AVATAR: AVATAR_IMAGE})
+                self.assertIs(caught.exception.validation_rejected, rejected)
+                self.assertNotIn(AVATAR_IMAGE, str(caught.exception))
+
+    def test_exact_url_lookup_checks_archived_and_rejects_unrequested_rows(self):
+        client, session = self.client()
+        url = PUBLICATION['x_studio_url']
+        session.respostas = [[PUBLICATION], [{**PUBLICATION, 'x_studio_fontes': [3, 'Other']}]]
+        self.assertEqual(client.publicacoes_por_urls([1, 2], [url]), {url})
+        self.assertIs(session.chamadas[0]['json']['context']['active_test'], False)
+        self.assertNotIn(['x_active', '=', True], session.chamadas[0]['json']['domain'])
+        with self.assertRaises(RuntimeError):
+            client.publicacoes_por_urls([1, 2], [url])
+
+    def test_source_inventory_includes_archived_and_rejects_duplicate_codes(self):
+        client, session = self.client()
+        row = {'id': 1, 'x_active': False, 'x_studio_codigo_da_fonte_1': 'source',
+               'x_studio_metodo_de_coleta': 'RSS'}
+        session.respostas = [[row], [row, {**row, 'id': 2, 'x_active': True}]]
+        self.assertEqual(client.fontes(include_archived=True), [row])
+        self.assertEqual(session.chamadas[0]['json']['domain'], [])
+        self.assertIn('x_active', session.chamadas[0]['json']['fields'])
+        with self.assertRaisesRegex(RuntimeError, 'Duplicate'):
+            client.fontes(include_archived=True)
 
 
 if __name__ == '__main__':
