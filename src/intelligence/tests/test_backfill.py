@@ -159,6 +159,19 @@ class BackfillTests(TestCase):
         self.historic.assert_not_called()
         self.prepare.assert_not_called()
 
+    def test_preview_identifies_feed_reference_before_permission_is_configured(self):
+        self.cfg.image_permissions.clear()
+        self.collect.return_value = [
+            module.Item(ARTICLE, 'Relevant news', ARTICLE, None, None, 'Notícia', IMAGE),
+        ]
+        result = module.backfill(self.cfg, self.odoo, self.session, apply=False, limit=10, after_id=0)
+        self.assertEqual(result['identified'], 1)
+        self.assertEqual(result['permission_unverified'], 1)
+        self.assertEqual(result['eligible'], 0)
+        self.assertEqual(result['updated'], 0)
+        self.historic.assert_not_called()
+        self.prepare.assert_not_called()
+
     def test_overlapping_feed_cannot_associate_mismatched_url(self):
         self.collect.return_value = [
             module.Item(ARTICLE, 'An unrelated story', ARTICLE + '-different', None, None, 'Notícia', IMAGE),

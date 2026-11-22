@@ -437,10 +437,10 @@ class OdooClient:
 
     def avatar_field(self, *, write: bool = False) -> str | None:
         configured = getattr(self.cfg, 'avatar_field', None)
-        if not configured:
+        if write and not configured:
             return None
         field, editable = self._avatar_schema()
-        if configured != field:
+        if configured and configured != field:
             raise ValueError('Configured field does not match the publication form Avatar')
         if write and not self._avatar_write_checked:
             if not editable or not self._avatar_access([]):

@@ -13,7 +13,7 @@ import requests
 from .config import Settings
 from .backfill import backfill
 from .odoo import OdooClient
-from .sources import rss_publisher
+from .sources import EBC_HOST, rss_publisher
 from .sync import Synchronizer
 
 USER_AGENT = 'odoo-data-sync/1.0'
@@ -63,9 +63,13 @@ def main(argv=None) -> int:
             metadata: dict[str, object] = {
                 'fontes': sum(source['x_active'] for source in sources),
                 'assuntos': len(odoo.assuntos()),
+                'new_feed_endpoints_present': len({
+                    source['x_studio_url'] for source in sources
+                    if rss_publisher(source['x_studio_url']) not in (None, EBC_HOST)
+                }),
                 'avatar': {
                     key: avatar[key]
-                    for key in ('status', 'type', 'widget', 'writable',
+                    for key in ('status', 'type', 'widget', 'writable', 'empty', 'populated',
                                 'empty_representation', 'populated_representation')
                     if key in avatar
                 },
