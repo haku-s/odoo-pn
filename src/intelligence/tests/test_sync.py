@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 from intelligence import sync
@@ -153,6 +154,19 @@ class SyncTest(unittest.TestCase):
         return Cfg()
 
     # ------------------------------------------------------------ write safety
+    def test_all_enabled_sources_share_the_sao_paulo_run_date(self):
+        clock = datetime(2026, 11, 20, 2, 59, 59, tzinfo=UTC)
+        odoo = FakeOdoo([fonte(1, 'agencia_brasil'), fonte(2, 'camara')], ASSUNTOS)
+        with patch.object(sync, 'datetime', wraps=datetime) as mocked_clock:
+            mocked_clock.now.side_effect = lambda zone: clock.astimezone(zone)
+            stats = self.run_sync(odoo, [], apply=False)
+        self.assertEqual(stats['collection_date'], '2026-11-19')
+        self.assertEqual(self.chamadas.call_count, 2)
+        for call in self.chamadas.call_args_list:
+            self.assertEqual(call.args[3].astimezone(UTC), datetime(2026, 11, 19, 3, tzinfo=UTC))
+            self.assertEqual(call.kwargs['until'].astimezone(UTC), datetime(2026, 11, 20, 3, tzinfo=UTC))
+        mocked_clock.now.assert_called_once()
+
     def test_preview_does_not_write(self):
         odoo = FakeOdoo([fonte(1, 'agencia_brasil')], ASSUNTOS)
         stats = self.run_sync(odoo, [item('a')], apply=False)

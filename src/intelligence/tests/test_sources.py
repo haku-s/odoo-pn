@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 from unittest.mock import patch
 
 from intelligence import sources
@@ -445,3 +446,36 @@ class RegistryTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class DailyApiTest(unittest.TestCase):
+    def test_daily_api_queries_and_filters_share_the_same_day(self):
+        start = datetime(2026, 11, 19, tzinfo=ZoneInfo('America/Sao_Paulo'))
+        end = start + timedelta(days=1)
+        cases = (
+            (
+                'camara', 'https://dadosabertos.camara.leg.br/api/v2/proposicoes',
+                'dados', 'dataApresentacao', camara_pagina(4)['dados'],
+                {'dataInicio': '2026-11-19', 'dataFim': '2026-11-19'},
+            ),
+            (
+                'senado', 'https://legis.senado.leg.br/dadosabertos/processo',
+                None, 'dataApresentacao', [dict(SENADO[0], codigoMateria=i) for i in range(1, 5)],
+                {'dataInicioApresentacao': '2026-11-19', 'dataFimApresentacao': '2026-11-19'},
+            ),
+            (
+                'ibge', 'https://servicodados.ibge.gov.br/api/v3/noticias',
+                'items', 'data_publicacao', ibge_pagina(4)['items'],
+                {'de': '11/19/2026', 'ate': '11/19/2026'},
+            ),
+        )
+        for code, url, key, field, rows, expected_filter in cases:
+            with self.subTest(collector=code):
+                values = ['2026-11-19T02:59:59Z', '2026-11-19', '2026-11-20', None]
+                for row, value in zip(rows, values, strict=True):
+                    row[field] = value
+                session = FakeSession([FakeResponse(payload={key: rows} if key else rows)])
+                items = sources.coletar(code, session, url, start, 10, until=end)
+                self.assertEqual([item.identificador for item in items], ['2'])
+                _, params = session.chamadas[0]
+                self.assertEqual({name: params[name] for name in expected_filter}, expected_filter)
