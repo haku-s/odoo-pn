@@ -20,6 +20,9 @@ on:
           - images-preview
           - images-apply
         default: preview
+      preview_source:
+        description: 'Optional source code to test in preview, including a disabled source'
+        type: string
       image_limit:
         description: 'Maximum records per image backfill (1 to 500)'
         type: number
@@ -64,6 +67,7 @@ jobs:
         env:
           PYTHONPATH: src
           MODE: ${{ inputs.mode }}
+          PREVIEW_SOURCE: ${{ inputs.preview_source }}
           IMAGE_LIMIT: ${{ inputs.image_limit }}
           IMAGE_AFTER_ID: ${{ inputs.image_after_id }}
           INTEL_AVATAR_FIELD: ${{ secrets.INTEL_AVATAR_FIELD }}
@@ -72,6 +76,9 @@ jobs:
           ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
         run: |
           args=("$MODE" --summary-only)
+          if [[ -n "$PREVIEW_SOURCE" ]]; then
+            args+=(--preview-source "$PREVIEW_SOURCE")
+          fi
           if [[ "$MODE" == images-* ]]; then
             args+=(--limit "$IMAGE_LIMIT" --after-id "$IMAGE_AFTER_ID")
           fi

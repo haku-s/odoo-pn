@@ -167,6 +167,18 @@ class SyncTest(unittest.TestCase):
             self.assertEqual(call.kwargs['until'].astimezone(UTC), datetime(2026, 11, 20, 3, tzinfo=UTC))
         mocked_clock.now.assert_called_once()
 
+    def test_targeted_preview_can_read_one_disabled_source_without_writes(self):
+        odoo = FakeOdoo([fonte(1, 'agencia_brasil'), fonte(2, 'bcb_sgs', habilitada=False)], ASSUNTOS)
+        with patch.object(sync, 'coletar', return_value=[]) as collect:
+            stats = sync.Synchronizer(self.cfg(), odoo, object()).run(preview_source='bcb_sgs')
+        self.assertEqual(stats['fontes_concluidas'], 1)
+        collect.assert_called_once()
+        self.assertEqual(collect.call_args.args[0], 'bcb_sgs')
+        self.assertFalse(odoo._fontes[1]['x_studio_coleta_habilitada'])
+        self.assertEqual(odoo.criadas + odoo.atualizadas + odoo.status, [])
+        with self.assertRaises(ValueError):
+            sync.Synchronizer(self.cfg(), odoo, object(), apply=True).run(preview_source='bcb_sgs')
+
     def test_preview_does_not_write(self):
         odoo = FakeOdoo([fonte(1, 'agencia_brasil')], ASSUNTOS)
         stats = self.run_sync(odoo, [item('a')], apply=False)

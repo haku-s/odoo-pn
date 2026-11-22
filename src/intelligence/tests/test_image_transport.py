@@ -54,6 +54,26 @@ class ImageTransportTests(unittest.TestCase):
 
 
 class PublicTransportTests(unittest.TestCase):
+    def test_falls_back_to_a_second_public_address_on_connect_timeout(self):
+        with patch.object(network.socket, 'getaddrinfo', return_value=[
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2001:4860:4860::8888', 443, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('8.8.8.8', 443)),
+        ]), patch.object(network, 'HTTPSConnectionPool') as connect:
+            from unittest.mock import Mock
+            first, second = Mock(), Mock()
+            connect.side_effect = [first, second]
+            first.urlopen.side_effect = OSError('Network unreachable')
+            response = second.urlopen.return_value
+            response.status = 200
+            response.headers = {}
+            response.read1.side_effect = [b'data', b'']
+            self.assertEqual(network.read_public(ARTICLE, allowed_urls={ARTICLE}, max_bytes=100, timeout=(2, 3)),
+                             (b'data', ARTICLE))
+            self.assertEqual([call.args[0] for call in connect.call_args_list],
+                             ['2001:4860:4860::8888', '8.8.8.8'])
+            first.close.assert_called_once()
+            second.close.assert_called_once()
+
     def test_private_dns_answer_rejected_before_connect(self):
         with patch.object(network.socket, 'getaddrinfo', return_value=[
             (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('8.8.8.8', 443)),
@@ -72,7 +92,7 @@ class PublicTransportTests(unittest.TestCase):
         )
         for status, headers, chunks, error in cases:
             with self.subTest(status=status, headers=headers, chunks=chunks):
-                with patch.object(network, '_public_address', return_value='8.8.8.8'), \
+                with patch.object(network, '_public_addresses', return_value=['8.8.8.8']), \
                      patch.object(network, 'HTTPSConnectionPool') as connect:
                     response = connect.return_value.urlopen.return_value
                     response.status = status

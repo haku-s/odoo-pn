@@ -373,11 +373,18 @@ class Synchronizer:
         ):
             raise RuntimeError('Publication update values were not confirmed')
 
-    def run(self) -> dict[str, Any]:
+    def run(self, *, preview_source: str | None = None) -> dict[str, Any]:
+        if preview_source and self.apply:
+            raise ValueError('Testing one source is only available in preview mode')
         start = datetime.now(ZoneInfo('America/Sao_Paulo')).replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1)
         self.odoo.check(write=self.apply)
         fontes = self.odoo.fontes()
+        if preview_source:
+            selected = next((source for source in fontes if source['x_studio_codigo_da_fonte_1'] == preview_source), None)
+            if selected is None:
+                raise ValueError('Requested preview source was not found among active sources')
+            fontes = [{**selected, 'x_studio_coleta_habilitada': True}]
         assuntos = self.odoo.assuntos()
         if any(_publisher(source) and source.get('x_studio_coleta_habilitada') for source in fontes):
             for source in self.odoo.fontes(include_archived=True):
