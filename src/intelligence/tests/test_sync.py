@@ -7,7 +7,6 @@ from unittest.mock import patch
 
 from intelligence import sync
 from intelligence.__main__ import _todas_as_fontes_falharam
-from intelligence.odoo import PUBLICACOES_LEITURA
 from intelligence.sources import Item
 
 
@@ -206,7 +205,7 @@ class SyncTest(unittest.TestCase):
     def test_many2one_false_is_equal_to_empty(self):
         odoo = FakeOdoo([fonte(1, 'agencia_brasil')], ASSUNTOS,
                         {(1, 'a'): registro('a', x_studio_assunto_1=None)})
-        stats = self.run_sync(odoo, [item('a', titulo='Título', resumo='')], apply=True)
+        self.run_sync(odoo, [item('a', titulo='Título', resumo='')], apply=True)
         # The stored subject is absent and the item is unclassified: no update.
         self.assertEqual(odoo.atualizadas, [])
         self.assertEqual(odoo.criadas, [])

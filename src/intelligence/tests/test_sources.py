@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import unittest
-from datetime import datetime
+from datetime import UTC, datetime
 
 from intelligence import sources
 
@@ -446,7 +445,7 @@ class RobustaTest(unittest.TestCase):
 class RegistryTest(unittest.TestCase):
     def test_unimplemented_source(self):
         with self.assertRaises(sources.FonteNaoImplementada):
-            sources.coletar('dou_inlabs', FakeSession([]), 'https://inlabs.in.gov.br/', datetime.now(), 10)
+            sources.coletar('dou_inlabs', FakeSession([]), 'https://inlabs.in.gov.br/', datetime.now(UTC), 10)
 
 
 if __name__ == '__main__':
