@@ -5,9 +5,6 @@ from __future__ import annotations
 import unittest
 
 from intelligence.odoo import (
-    ASSUNTOS,
-    FONTES,
-    PUBLICACOES,
     OdooClient,
     normalizar_valor,
 )
