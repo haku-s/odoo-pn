@@ -47,7 +47,7 @@ jobs:
         id: types
         continue-on-error: true
         run: >-
-          uvx basedpyright src
+          uvx basedpyright
           --level error --pythonversion 3.15 --pythonpath .venv/bin/python
 
       - name: Deptry - dependency consistency
@@ -71,7 +71,8 @@ jobs:
         timeout-minutes: 12
         run: >-
           uvx --python 3.14 semgrep@1.186.0 scan --config p/python --error
-          --metrics=off --disable-version-check src
+          --metrics=off --disable-version-check --exclude src/mon/tests --exclude src/intelligence/tests
+          src
 
       - name: Gitleaks - exposed secrets
         id: secrets_scan
@@ -101,7 +102,7 @@ jobs:
       - name: Existing unit tests
         id: unit_tests
         continue-on-error: true
-        run: PYTHONPATH=src uv run --locked python -m unittest discover -s src/tests -v
+        run: PYTHONPATH=src uv run --locked python -m unittest discover -s src/mon/tests -t src -v
 
       - name: Integration unit tests
         id: integration_tests

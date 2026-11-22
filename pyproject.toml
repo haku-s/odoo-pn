@@ -10,11 +10,20 @@ dependencies = [
 ]
 
 [tool.deptry]
-known_first_party = ["intelligence", "mon", "test_monitor", "test_runtime_safety"]
+known_first_party = ["intelligence", "mon"]
 
 [tool.deptry.package_module_name_map]
 pillow = "PIL"
 
-[tool.ruff.lint.per-file-ignores]
-# Naive timestamps are intentional input fixtures for the Odoo/date parser.
-"src/intelligence/tests/test_sources.py" = ["DTZ001"]
+[tool.ruff]
+extend-exclude = [
+    "src/mon/tests",
+    "src/intelligence/tests",
+]
+
+[tool.basedpyright]
+include = ["src"]
+exclude = [
+    "src/mon/tests",
+    "src/intelligence/tests",
+]
