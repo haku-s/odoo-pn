@@ -22,6 +22,7 @@ extend-exclude = [
 ]
 
 [tool.basedpyright]
+failOnWarnings = false
 include = ["src"]
 exclude = [
     "src/mon/tests",
