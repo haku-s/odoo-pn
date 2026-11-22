@@ -13,12 +13,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import urlencode, unquote, urljoin, urlsplit
 
 import requests
 
 from .classify import fold
-from .network import read_public, validate_url
+from .network import read_public, read_public_response, validate_url
 
 DOMINIO_OFICIAL = {
     'agencia_brasil': {'agenciabrasil.ebc.com.br'},
@@ -580,11 +580,50 @@ def coletar_ibge(session, url, desde, limite, *, until: datetime | None = None):
     return itens
 
 
+_BCB_SERIES = 'https://api.bcb.gov.br/dados/serie/bcdata.sgs.12/dados'
+_BCB_NO_OBSERVATION = 'br.gov.bcb.pec.sgs.comum.excecoes.SGSNegocioException: Value(s) not found'
+
+
+def coletar_bcb(session, url, desde, limite, *, until: datetime | None = None) -> list[Item]:
+    if not isinstance(url, str) or url.removesuffix('?formato=json') not in (_BCB_SERIES, _BCB_SERIES + '/ultimos/3'):
+        raise ValueError('Banco Central source does not match the configured SGS series')
+    day = desde.strftime('%d/%m/%Y')
+    address = _BCB_SERIES + '?' + urlencode({'formato': 'json', 'dataInicial': day, 'dataFinal': day})
+    raw, _, status = read_public_response(
+        address, allowed_urls={address}, max_bytes=32 * 1024, timeout=(5, 12), accepted_statuses=(200, 404),
+    )
+    try:
+        payload = json.loads(raw)
+    except ValueError as exc:
+        raise RespostaInvalida('Invalid Banco Central response format') from exc
+    if status == 404:
+        error = payload.get('erro') if isinstance(payload, dict) else None
+        if isinstance(error, dict) and error.get('statusCode') == 404 and error.get('detail') == _BCB_NO_OBSERVATION:
+            return []
+        raise RespostaInvalida('Banco Central returned an unrecognized HTTP 404 response')
+    if payload == []:
+        return []
+    if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], dict):
+        raise RespostaInvalida('Invalid Banco Central observation')
+    value = payload[0].get('valor')
+    if payload[0].get('data') != day or not isinstance(value, str) or not re.fullmatch(r'-?[0-9]{1,30}(?:\.[0-9]{1,30})?', value):
+        raise RespostaInvalida('Invalid Banco Central observation date or value')
+    return [Item(
+        identificador=f'12:{desde.date().isoformat()}',
+        titulo='Banco Central — série SGS 12',
+        url=address,
+        data_publicacao=None,
+        resumo=f'SGS 12 — data de referência: {day}. Valor: {value}.',
+        tipo='Divulgação estatística',
+    )]
+
+
 COLETORES = {
     'agencia_brasil': coletar_agencia_brasil,
     'camara': coletar_camara,
     'senado': coletar_senado,
     'ibge': coletar_ibge,
+    'bcb_sgs': coletar_bcb,
 }
 
 

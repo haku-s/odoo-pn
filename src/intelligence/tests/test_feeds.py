@@ -115,7 +115,7 @@ class SharedFeedTest(TestCase):
         for status, headers in scenarios:
             with (
                 self.subTest(status=status),
-                patch.object(network, '_public_address', return_value='8.8.8.8'),
+                patch.object(network, '_public_addresses', return_value=['8.8.8.8']),
                 patch.object(network, 'HTTPSConnectionPool') as pool,
             ):
                 response = pool.return_value.urlopen.return_value

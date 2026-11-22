@@ -7,7 +7,7 @@ from urllib.parse import urljoin, urlsplit
 
 from requests.certs import where
 from urllib3 import HTTPSConnectionPool, Timeout
-from urllib3.exceptions import HTTPError
+from urllib3.exceptions import ConnectTimeoutError, HTTPError, ReadTimeoutError
 
 
 def validate_url(url: str, allowed_hosts: set[str] | frozenset[str]) -> None:
@@ -24,7 +24,7 @@ def validate_url(url: str, allowed_hosts: set[str] | frozenset[str]) -> None:
         raise ValueError('Public HTTPS destination is not approved')
 
 
-def _public_address(host: str) -> str:
+def _public_addresses(host: str) -> list[str]:
     try:
         answers = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
     except OSError as exc:
@@ -38,7 +38,37 @@ def _public_address(host: str) -> str:
     if not addresses:
         raise RuntimeError('Public HTTPS DNS lookup returned no addresses')
     # Connect directly to the validated address while verifying the original hostname.
-    return addresses[0]
+    return list(dict.fromkeys(addresses))
+
+
+def _open_https(hostname: str, target: str, deadline: float, timeout: tuple[int, int]):
+    last_error = None
+    for address in _public_addresses(hostname)[:4]:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            break
+        pool = HTTPSConnectionPool(
+            address, port=443, server_hostname=hostname, assert_hostname=hostname,
+            cert_reqs='CERT_REQUIRED', ca_certs=where(),
+        )
+        try:
+            response = pool.urlopen(
+                'GET', target,
+                headers={'Host': hostname, 'Accept-Encoding': 'identity',
+                         'User-Agent': 'odoo-data-sync/1.0'},
+                timeout=Timeout(total=remaining, connect=timeout[0], read=timeout[1]),
+                preload_content=False, decode_content=False, retries=False, redirect=False,
+            )
+        except (OSError, HTTPError) as exc:
+            pool.close()
+            if not isinstance(exc, (OSError, ConnectTimeoutError, ReadTimeoutError)):
+                raise
+            last_error = exc
+        else:
+            return pool, response
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError('Public HTTPS request timed out')
 
 
 def read_public(
@@ -46,6 +76,17 @@ def read_public(
     allowed_hosts: set[str] | frozenset[str] | None = None, max_bytes: int,
     timeout: tuple[int, int],
 ) -> tuple[bytes, str]:
+    body, final, _ = read_public_response(
+        url, allowed_urls=allowed_urls, allowed_hosts=allowed_hosts, max_bytes=max_bytes, timeout=timeout,
+    )
+    return body, final
+
+
+def read_public_response(
+    url: str, *, allowed_urls: set[str] | frozenset[str] | None = None,
+    allowed_hosts: set[str] | frozenset[str] | None = None, max_bytes: int,
+    timeout: tuple[int, int], accepted_statuses: tuple[int, ...] = (200,),
+) -> tuple[bytes, str, int]:
     if allowed_hosts is None:
         allowed_hosts = {urlsplit(value).hostname or '' for value in allowed_urls or ()}
     deadline = monotonic() + sum(timeout)
@@ -56,25 +97,11 @@ def read_public(
         parts = urlsplit(url)
         hostname = parts.hostname
         assert hostname is not None
-        address = _public_address(hostname)
-        remaining = deadline - monotonic()
-        if remaining <= 0:
-            raise RuntimeError('Public HTTPS request timed out')
-        pool = HTTPSConnectionPool(
-            address, port=443, server_hostname=hostname, assert_hostname=hostname,
-            cert_reqs='CERT_REQUIRED', ca_certs=where(),
-        )
         target = parts.path or '/'
         if parts.query:
             target += '?' + parts.query
         try:
-            response = pool.urlopen(
-                'GET', target,
-                headers={'Host': hostname, 'Accept-Encoding': 'identity',
-                         'User-Agent': 'odoo-data-sync/1.0'},
-                timeout=Timeout(total=remaining, connect=timeout[0], read=timeout[1]),
-                preload_content=False, decode_content=False, retries=False, redirect=False,
-            )
+            pool, response = _open_https(hostname, target, deadline, timeout)
             try:
                 if response.status in {301, 302, 303, 307, 308}:
                     location = response.headers.get('Location')
@@ -82,7 +109,7 @@ def read_public(
                         raise RuntimeError('Public HTTPS redirect has no destination')
                     url = urljoin(url, location)
                     continue
-                if response.status != 200:
+                if response.status not in accepted_statuses:
                     raise RuntimeError(f'Public HTTPS request returned HTTP {response.status}')
                 if response.headers.get('Content-Encoding', 'identity').lower() != 'identity':
                     raise RuntimeError('Unsupported public HTTPS content encoding')
@@ -93,15 +120,14 @@ def read_public(
                 while monotonic() < deadline:
                     chunk = response.read1(min(65536, max_bytes - len(data) + 1), decode_content=False)
                     if not chunk:
-                        return bytes(data), url
+                        return bytes(data), url, response.status
                     data.extend(chunk)
                     if len(data) > max_bytes:
                         raise RuntimeError('Public HTTPS response exceeds its size limit')
                 raise RuntimeError('Public HTTPS request timed out')
             finally:
                 response.close()
+                pool.close()
         except (OSError, HTTPError) as exc:
-            raise RuntimeError('Public HTTPS request failed') from exc
-        finally:
-            pool.close()
+            raise RuntimeError(f'Public HTTPS request failed ({type(exc).__name__})') from exc
     raise RuntimeError('Public HTTPS redirect limit reached')
