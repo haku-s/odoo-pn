@@ -50,7 +50,10 @@ def main(argv=None) -> int:
     parser.add_argument('--limit', type=int, default=100, help='Maximum records per image backfill')
     parser.add_argument('--after-id', type=int, default=0, help='Resume image backfill after this record ID')
     parser.add_argument('--summary-only', action='store_true', help='Omit instance details from output')
+    parser.add_argument('--preview-source', help='Test one registered source without changing its status')
     args = parser.parse_args(argv)
+    if args.preview_source and args.command != 'preview':
+        parser.error('--preview-source requires preview mode')
     stage = 'settings'
     try:
         cfg = Settings.from_env()
@@ -111,11 +114,14 @@ def main(argv=None) -> int:
             cfg, odoo, _session(cfg), apply=(args.command == 'apply'),
             show_classification_details=not args.summary_only,
         )
-        stats = synchronizer.run()
+        stats = synchronizer.run(preview_source=args.preview_source)
         output: dict[str, object] = {'mode': args.command, 'counts': stats}
         if not args.summary_only:
             output['sources'] = synchronizer.source_audit
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        if args.preview_source and stats.get('fontes_concluidas') != 1:
+            print('Requested source did not complete the preview', file=sys.stderr)
+            return 1
         if _todas_as_fontes_falharam(stats) or stats.get('status_erros', 0) > 0:
             print('Every attempted source failed or the status update failed', file=sys.stderr)
             return 1

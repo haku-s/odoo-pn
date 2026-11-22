@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import UTC, datetime, timedelta
+import json
 from zoneinfo import ZoneInfo
 from unittest.mock import patch
 
@@ -479,3 +480,44 @@ class DailyApiTest(unittest.TestCase):
                 self.assertEqual([item.identificador for item in items], ['2'])
                 _, params = session.chamadas[0]
                 self.assertEqual({name: params[name] for name in expected_filter}, expected_filter)
+
+
+class BancoCentralTest(unittest.TestCase):
+    url = 'https://api.bcb.gov.br/dados/serie/bcdata.sgs.12/dados/ultimos/3?formato=json'
+    day = datetime(2026, 11, 19, tzinfo=ZoneInfo('America/Sao_Paulo'))
+
+    def collect(self, payload, status):
+        with patch.object(sources, 'read_public_response', create=True,
+                          return_value=(json.dumps(payload).encode(), self.url, status)) as read:
+            rows = sources.coletar('bcb_sgs', None, self.url, self.day, 10, until=self.day + timedelta(days=1))
+        self.request = read.call_args.args[0]
+        return rows
+
+    def test_uses_configured_series_and_the_explicit_collection_day(self):
+        row, = self.collect([{'data': '19/11/2026', 'valor': '0.050788'}], 200)
+        self.assertIn('bcdata.sgs.12/dados?', self.request)
+        self.assertIn('dataInicial=19%2F11%2F2026&dataFinal=19%2F11%2F2026', self.request)
+        self.assertEqual(row.identificador, '12:2026-11-19')
+        self.assertIsNone(row.data_publicacao)
+        self.assertIn('19/11/2026', row.resumo)
+        self.assertEqual(row.tipo, 'Divulgação estatística')
+        self.assertIn('0.050788', row.resumo)
+
+    def test_only_recognized_no_observation_is_an_empty_day(self):
+        self.assertEqual(self.collect({'erro': {
+            'statusCode': 404,
+            'detail': 'br.gov.bcb.pec.sgs.comum.excecoes.SGSNegocioException: Value(s) not found',
+        }}, 404), [])
+        for payload, status in [
+            ('A serie nao existe!', 404),
+            ([{'data': '18/11/2026', 'valor': '0.050788'}], 200),
+            ([{'data': '19/11/2026', 'valor': 'Infinity'}], 200),
+        ]:
+            with self.subTest(payload=payload), self.assertRaises(sources.RespostaInvalida):
+                self.collect(payload, status)
+
+    def test_arbitrary_urls_are_rejected_before_request(self):
+        with patch.object(sources, 'read_public_response', create=True) as read:
+            with self.assertRaises(ValueError):
+                sources.coletar('bcb_sgs', None, self.url.replace('api.bcb.gov.br', 'example.test'), self.day, 10)
+        read.assert_not_called()
