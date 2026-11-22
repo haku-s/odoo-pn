@@ -40,6 +40,7 @@ class Classificacao:
     sem_correspondencia: bool
     excluido: bool
     detalhes: dict[str, int] = field(default_factory=dict)
+    termos_correspondentes: tuple[str, ...] = ()
 
 
 def classificar(titulo: object, resumo: object, assuntos: list[dict[str, Any]]) -> Classificacao:
@@ -49,6 +50,7 @@ def classificar(titulo: object, resumo: object, assuntos: list[dict[str, Any]]) 
 
     pontuacoes: dict[int, int] = {}
     nomes: dict[int, str] = {}
+    termos_por_assunto: dict[int, tuple[str, ...]] = {}
     detalhes: dict[str, int] = {}
     excluidos: set[int] = set()
     for assunto in assuntos:
@@ -64,11 +66,12 @@ def classificar(titulo: object, resumo: object, assuntos: list[dict[str, Any]]) 
             detalhes[nomes[identificador]] = 0
             continue
         inclusoes = split_terms(assunto.get('x_studio_termos_de_inclusao'))
-        acertos = sum(
-            1 for termo in inclusoes if _pattern(termo).search(texto)
+        correspondentes = tuple(
+            termo for termo in inclusoes if _pattern(termo).search(texto)
         )
-        pontuacoes[identificador] = acertos
-        detalhes[nomes[identificador]] = acertos
+        termos_por_assunto[identificador] = correspondentes
+        pontuacoes[identificador] = len(correspondentes)
+        detalhes[nomes[identificador]] = len(correspondentes)
 
     candidatos = {i: p for i, p in pontuacoes.items() if p > 0}
     if not candidatos:
@@ -82,4 +85,5 @@ def classificar(titulo: object, resumo: object, assuntos: list[dict[str, Any]]) 
     identificador = vencedores[0]
     return Classificacao(
         identificador, nomes[identificador], melhor, False, False, False, detalhes,
+        termos_por_assunto[identificador],
     )
