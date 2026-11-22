@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import base64
 import hashlib
 import io
@@ -20,6 +22,12 @@ from .normalizer import odoo_datetime
 from .odoo import ATTACHMENT, TASK, direct_attachment
 from .pn import MAX_RATE_LIMIT_RETRY_WAIT, Document, PNCPSession, validate_document_url
 from .relevance import fold
+
+
+def _odoo_checksum(content: bytes) -> str:
+    # Odoo ir.attachment.checksum uses SHA-1 for content identity, not authentication.
+    return hashlib.sha1(content, usedforsecurity=False).hexdigest()  # nosemgrep: python.lang.security.insecure-hash-algorithms.insecure-hash-algorithm-sha1
+
 
 MAX_BYTES = 40 * 1024 * 1024
 DOWNLOAD_SECONDS = 120
@@ -92,7 +100,7 @@ def notice_fields(text: str) -> dict[str, str]:
 
 def read_notice(content: bytes, document: Document, existing=()) -> dict[str, str]:
     verify_document_revision(
-        source_marker(document), hashlib.sha1(content, usedforsecurity=False).hexdigest(), existing,
+        source_marker(document), _odoo_checksum(content), existing,
     )
     # shortcut: large, scanned and non-standard notices need a separate extraction path.
     if not content.startswith(b'%PDF-') or len(content) > 5 * 1024 * 1024:
@@ -234,7 +242,7 @@ def verify_document_revision(marker, checksum, existing):
         raise RuntimeError('Official document content changed under an existing identity')
 
 
-def pending_documents(documents: list[Document], attachments: list[dict]) -> tuple[int, int]:
+def pending_documents(documents: list[Document], attachments: list[dict[str, Any]]) -> tuple[int, int]:
     pending = 0
     for doc in documents:
         name = safe_name(doc)
@@ -248,11 +256,11 @@ def pending_documents(documents: list[Document], attachments: list[dict]) -> tup
 
 
 def attach(odoo, session, identifier: str, task_id: int, document: Document,
-           existing: list[dict], *, content: bytes | None = None) -> bool:
+           existing: list[dict[str, Any]], *, content: bytes | None = None) -> bool:
     if content is None:
         content = download(session, document)
     name, mime = name_and_mime(document, content)
-    checksum = hashlib.sha1(content, usedforsecurity=False).hexdigest()
+    checksum = _odoo_checksum(content)
     marker = source_marker(document)
 
     verify_document_revision(marker, checksum, existing)
