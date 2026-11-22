@@ -1,0 +1,62 @@
+name: Data Sync
+
+# Independent workflow for the record collection package.
+# It does not touch the procurement workflow (sync.yml) or src/mon.
+#
+# Activation: this workflow is dispatched manually.  Scheduled execution is
+# intentionally not enabled; add a `schedule:` entry and set the default mode
+# to `apply` only after the preview runs have been reviewed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Execution mode'
+        type: choice
+        options:
+          - inspect
+          - preview
+          - apply
+        default: preview
+
+permissions:
+  contents: read
+
+concurrency:
+  group: data-sync-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Record Validation
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: '0.13.8'
+          python-version: '3.15.2'
+
+      - name: Tests
+        env:
+          PYTHONPATH: src
+        run: uv run --locked python -m unittest discover -s src/intelligence/tests -v
+
+      - name: Run
+        env:
+          PYTHONPATH: src
+          # `mode` comes from a workflow_dispatch choice input (inspect|preview|apply),
+          # so it is not attacker-controlled free text.  The same Odoo credential
+          # as the procurement integration is reused via the existing secret.
+          MODE: ${{ inputs.mode }}
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
+        run: timeout --kill-after=30s 50m uv run --locked python -u -m intelligence "$MODE"
