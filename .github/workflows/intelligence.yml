@@ -71,7 +71,6 @@ jobs:
           IMAGE_LIMIT: ${{ inputs.image_limit }}
           IMAGE_AFTER_ID: ${{ inputs.image_after_id }}
           INTEL_AVATAR_FIELD: ${{ secrets.INTEL_AVATAR_FIELD }}
-          INTEL_IMAGE_PERMISSIONS: ${{ secrets.INTEL_IMAGE_PERMISSIONS }}
           ODOO_URL: ${{ secrets.ODOO_URL }}
           ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
         run: |

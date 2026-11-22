@@ -17,6 +17,7 @@ from urllib.parse import urlencode, unquote, urljoin, urlsplit
 
 import requests
 
+from .camara_media import HOST as CAMARA_MEDIA_HOST, credited_photo
 from .classify import fold
 from .network import read_public, read_public_response, validate_url
 
@@ -81,6 +82,7 @@ class Item:
     resumo: str | None
     tipo: str | None
     image_url: str | None = None
+    image_credit: str | None = None
 
 
 def _url_oficial(codigo: str, url: object) -> str:
@@ -337,10 +339,14 @@ def collect_feed(
             continue
         identifiers.add(identifier)
         links.add(link)
+        photo = None
+        if host == CAMARA_MEDIA_HOST:
+            photo = credited_photo(link, content or '') or credited_photo(link, summary or '')
         items.append(Item(
             identificador=identifier, titulo=title, url=link, data_publicacao=published,
             resumo=_html_para_texto(summary if host == EBC_HOST else summary or content), tipo='Notícia',
-            image_url=_feed_image(entry, link, host, summary, content),
+            image_url=photo[0] if photo else _feed_image(entry, link, host, summary, content),
+            image_credit=photo[1] if photo else None,
         ))
         if len(items) >= limit:
             break
