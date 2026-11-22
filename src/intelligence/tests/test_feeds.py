@@ -1,6 +1,7 @@
 """Feed parsing and publisher-specific image references."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -73,6 +74,22 @@ class SharedFeedTest(TestCase):
 
     def test_old_entries_are_filtered(self):
         self.assertEqual(collect(rss(date='Sat, 31 Oct 2026 12:00:00 GMT')), [])
+
+    def test_daily_feed_uses_sao_paulo_midnight_and_requires_a_date(self):
+        start = datetime(2026, 11, 19, tzinfo=ZoneInfo('America/Sao_Paulo'))
+        end = start + timedelta(days=1)
+        cases = (
+            ('Thu, 19 Nov 2026 02:59:59 GMT', False),
+            ('Thu, 19 Nov 2026 03:00:00 GMT', True),
+            ('Fri, 20 Nov 2026 02:59:59 GMT', True),
+            ('Fri, 20 Nov 2026 03:00:00 GMT', False),
+            ('bad-date', False),
+            ('', False),
+        )
+        for date, accepted in cases:
+            with self.subTest(date=date), patch.object(sources, 'read_public', return_value=(rss(date=date), URL)):
+                items = sources.coletar('health', None, URL, start, 20, method='RSS', until=end)
+                self.assertEqual(bool(items), accepted)
 
     def test_empty_feed(self):
         self.assertEqual(collect(b'<rss version="2.0"><channel/></rss>'), [])

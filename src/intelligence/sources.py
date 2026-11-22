@@ -152,6 +152,18 @@ def _data_hora(value: object) -> str | None:
     raise RespostaInvalida('Unsupported publication date')
 
 
+def _utc_timestamp(value: datetime) -> str:
+    if value.tzinfo is not None:
+        value = value.astimezone(UTC)
+    return value.strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _date_in_window(value: str | None, start: str, end: str | None) -> bool:
+    if value is None:
+        return end is None
+    return value >= start and (end is None or value < end)
+
+
 def _get(session: requests.Session, url: str, params: dict[str, Any], timeout) -> requests.Response:
     try:
         resposta = session.get(url, params=params, timeout=timeout, allow_redirects=False)
@@ -258,7 +270,9 @@ def _feed_image(element: ET.Element, article: str, host: str, *html: str | None)
     return None
 
 
-def collect_feed(url: str, since: datetime, limit: int, timeout: tuple[int, int]) -> list[Item]:
+def collect_feed(
+    url: str, since: datetime, limit: int, timeout: tuple[int, int], *, until: datetime | None = None,
+) -> list[Item]:
     host = rss_publisher(url)
     if host is None:
         raise ValueError('Feed URL is not approved')
@@ -293,7 +307,8 @@ def collect_feed(url: str, since: datetime, limit: int, timeout: tuple[int, int]
     items = []
     identifiers: set[str] = set()
     links: set[str] = set()
-    cutoff = since.strftime('%Y-%m-%d %H:%M:%S')
+    start = _utc_timestamp(since)
+    end = _utc_timestamp(until) if until is not None else None
     for entry in entries:
         if atom:
             address = next((link.get('href') for link in entry.findall(ATOM + 'link')
@@ -318,7 +333,7 @@ def collect_feed(url: str, since: datetime, limit: int, timeout: tuple[int, int]
             published = _data_hora(date)
         except RespostaInvalida:
             published = None
-        if (published and published < cutoff) or identifier in identifiers or link in links:
+        if not _date_in_window(published, start, end) or identifier in identifiers or link in links:
             continue
         identifiers.add(identifier)
         links.add(link)
@@ -332,15 +347,17 @@ def collect_feed(url: str, since: datetime, limit: int, timeout: tuple[int, int]
     return items
 
 
-def coletar_agencia_brasil(session, url, desde, limite):
+def coletar_agencia_brasil(session, url, desde, limite, *, until: datetime | None = None):
     if rss_publisher(url) != EBC_HOST:
         raise ValueError('Feed URL is not approved for this source')
-    return collect_feed(url, desde, limite, (10, 40))
+    return collect_feed(url, desde, limite, (10, 40), until=until)
 
 
 # ----------------------------------------------------------------------- Câmara
-def coletar_camara(session, url, desde, limite):
+def coletar_camara(session, url, desde, limite, *, until: datetime | None = None):
     url = _url_oficial('camara', url)
+    start = _utc_timestamp(desde)
+    end = _utc_timestamp(until) if until is not None else None
     pagina = 1
     itens = []
     identificadores_vistos = set()
@@ -355,7 +372,7 @@ def coletar_camara(session, url, desde, limite):
     while len(itens) < limite:
         dados = _json(_get(session, url, {
             'dataInicio': desde.strftime('%Y-%m-%d'),
-            'dataFim': datetime.now(UTC).astimezone().strftime('%Y-%m-%d'),
+            'dataFim': (desde if until is not None else datetime.now(UTC).astimezone()).strftime('%Y-%m-%d'),
             'ordenarPor': 'id',
             'ordem': 'DESC',
             'itens': tamanho_pagina,
@@ -403,7 +420,7 @@ def coletar_camara(session, url, desde, limite):
 
             identificadores_aceitos.add(identificador)
             validos += 1
-            if data and data < desde.strftime('%Y-%m-%d %H:%M:%S'):
+            if not _date_in_window(data, start, end):
                 continue
             sigla = _texto(registro.get('siglaTipo')) or 'PROPOSIÇÃO'
             ano = registro.get('ano')
@@ -436,11 +453,13 @@ def coletar_camara(session, url, desde, limite):
 
 
 # ---------------------------------------------------------------------- Senado
-def coletar_senado(session, url, desde, limite):
+def coletar_senado(session, url, desde, limite, *, until: datetime | None = None):
     url = _url_oficial('senado', url)
+    start = _utc_timestamp(desde)
+    end = _utc_timestamp(until) if until is not None else None
     dados = _json(_get(session, url, {
         'dataInicioApresentacao': desde.strftime('%Y-%m-%d'),
-        'dataFimApresentacao': datetime.now(UTC).astimezone().strftime('%Y-%m-%d'),
+        'dataFimApresentacao': (desde if until is not None else datetime.now(UTC).astimezone()).strftime('%Y-%m-%d'),
     }, (10, 60)))
     if not isinstance(dados, list):
         raise RespostaInvalida('Invalid process response')
@@ -456,7 +475,7 @@ def coletar_senado(session, url, desde, limite):
             data = _data_hora(registro.get('dataApresentacao'))
         except RespostaInvalida as exc:
             raise RespostaInvalida('Invalid process date') from exc
-        if data and data < desde.strftime('%Y-%m-%d %H:%M:%S'):
+        if not _date_in_window(data, start, end):
             continue
         identificacao = _texto(registro.get('identificacao')) or str(identificador)
         url_documento = _texto(registro.get('urlDocumento'), 2000)
@@ -499,19 +518,26 @@ def ibge_image_url(value: object) -> str | None:
     return None
 
 
-def coletar_ibge(session, url, desde, limite):
+def coletar_ibge(session, url, desde, limite, *, until: datetime | None = None):
     url = _url_oficial('ibge', url)
+    start = _utc_timestamp(desde)
+    end = _utc_timestamp(until) if until is not None else None
     pagina = 1
     itens = []
     identificadores_vistos = set()
     # Keep a constant page size for the whole pagination.
     tamanho_pagina = min(100, limite)
+    date_params = {}
+    if until is not None:
+        date = desde.strftime('%m/%d/%Y')
+        date_params = {'de': date, 'ate': date}
     while len(itens) < limite:
         dados = _json(_get(session, url, {
             # The official API uses `qtd` for the page size; `quantidade` is
             # not recognised and silently falls back to the default.
             'qtd': tamanho_pagina,
             'page': pagina,
+            **date_params,
         }, (10, 40)))
         if not isinstance(dados, dict) or not isinstance(dados.get('items'), list):
             raise RespostaInvalida('Invalid news response')
@@ -532,7 +558,7 @@ def coletar_ibge(session, url, desde, limite):
                 data = _data_hora(registro.get('data_publicacao'))
             except RespostaInvalida as exc:
                 raise RespostaInvalida('Invalid news date') from exc
-            if data and data < desde.strftime('%Y-%m-%d %H:%M:%S'):
+            if not _date_in_window(data, start, end):
                 continue
             tipo = TIPOS['ibge'] if fold(registro.get('tipo')) == 'noticia' else None
             itens.append(Item(
@@ -562,13 +588,15 @@ COLETORES = {
 }
 
 
-def coletar(codigo: str, session, url, desde, limite, *, method=None, timeout=(10, 40)) -> list[Item]:
+def coletar(
+    codigo: str, session, url, desde, limite, *, method=None, timeout=(10, 40), until: datetime | None = None,
+) -> list[Item]:
     if codigo == 'agencia_brasil' or (method == 'RSS' and codigo not in COLETORES):
         publisher = rss_publisher(url)
         if publisher is None or (codigo == 'agencia_brasil' and publisher != EBC_HOST):
             raise FonteNaoImplementada('Feed URL is not approved')
-        return collect_feed(url, desde, limite, timeout)
+        return collect_feed(url, desde, limite, timeout, until=until)
     coletor = COLETORES.get(codigo)
     if coletor is None:
         raise FonteNaoImplementada(codigo)
-    return coletor(session, url, desde, limite)
+    return coletor(session, url, desde, limite, until=until)
