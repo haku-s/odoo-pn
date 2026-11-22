@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import TracebackType
+from typing import Self, cast
 import logging
 from time import monotonic, sleep
 from urllib.parse import urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
+from urllib3.connectionpool import ConnectionPool
 from urllib3.exceptions import InvalidHeader, MaxRetryError
+from urllib3.response import BaseHTTPResponse
 from urllib3.util.retry import Retry
 
 from .normalizer import purchase_identity
@@ -31,13 +35,23 @@ MAX_RETRY_AFTER = 30
 
 
 class PNCPRetry(Retry):
-    def increment(self, method=None, url=None, response=None, _pool=None, **kwargs):
+    def increment(
+        self, method: str | None = None, url: str | None = None,
+        response: BaseHTTPResponse | None = None, error: Exception | None = None,
+        _pool: ConnectionPool | None = None, _stacktrace: TracebackType | None = None,
+    ) -> Self:
         if response is not None:
             limit = MAX_RATE_LIMIT_RETRY_AFTER if response.status == 429 else MAX_RETRY_AFTER
             if (self.get_retry_after(response) or 0) > limit:
                 # Return the HTTP response through urllib3's existing exhausted-status path.
-                raise MaxRetryError(_pool, url, 'PNCP Retry-After exceeds the local wait limit')
-        return super().increment(method, url, response, _pool=_pool, **kwargs)
+                raise MaxRetryError(
+                    cast(ConnectionPool, _pool), url,
+                    RuntimeError('PNCP Retry-After exceeds the local wait limit'),
+                )
+        return super().increment(
+            method=method, url=url, response=response, error=error,
+            _pool=_pool, _stacktrace=_stacktrace,
+        )
 
     def sleep(self, response=None):
         delay = self.get_retry_after(response) if response is not None else None
@@ -64,12 +78,15 @@ class PNCPAdapter(HTTPAdapter):
     def finish_attempt(self):
         self._next_attempt = max(self._next_attempt, monotonic() + REQUEST_INTERVAL)
 
-    def send(self, request, **kwargs):
+    def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
         wait = self._next_attempt - monotonic()
         if wait > 0:
             sleep(wait)
         try:
-            response = super().send(request, **kwargs)
+            response = super().send(
+                request, stream=stream, timeout=timeout, verify=verify,
+                cert=cert, proxies=proxies,
+            )
         finally:
             # Connection setup can delay the actual HTTP request.
             self.finish_attempt()
@@ -79,6 +96,8 @@ class PNCPAdapter(HTTPAdapter):
             except InvalidHeader as exc:
                 response.close()
                 raise requests.exceptions.InvalidHeader('Invalid PNCP redirect wait') from exc
+            if delay is None:
+                return response
             if delay > MAX_RETRY_AFTER:
                 response.close()
                 raise RuntimeError('PNCP redirect Retry-After exceeds the local wait limit')
