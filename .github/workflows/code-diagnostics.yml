@@ -70,7 +70,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 12
         run: >-
-          uvx semgrep scan --config p/python --error
+          uvx --python 3.14 semgrep@1.186.0 scan --config p/python --error
           --metrics=off --disable-version-check src
 
       - name: Gitleaks - exposed secrets
