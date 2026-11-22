@@ -514,20 +514,21 @@ if __name__ == '__main__':
 
 
 class SyncImagesTest(unittest.TestCase):
-    ARTICLE = 'https://agenciabrasil.ebc.com.br/saude/noticia/2026-11/titulo'
-    PHOTO = 'https://agenciabrasil.ebc.com.br/sites/default/files/photo.png'
+    ARTICLE = 'https://www.camara.leg.br/noticias/12345-sample'
+    PHOTO = 'https://www.camara.leg.br/midias/image/photo.png'
     FIELD = 'x_confirmed_avatar'
+    CREDIT = 'João Silva / Câmara dos Deputados'
 
     def setUp(self):
         from types import SimpleNamespace
         from unittest.mock import Mock
 
-        self.eligible = Item('a', 'Saúde mental', self.ARTICLE, None, None, 'Notícia', self.PHOTO)
+        self.eligible = Item('a', 'Saúde mental', self.ARTICLE, None, None, 'Notícia', self.PHOTO, self.CREDIT)
         self.cfg = SimpleNamespace(
             max_age_days=30, max_items_per_source=100, request_timeout=(2, 3),
-            avatar_field=self.FIELD, image_permissions={self.ARTICLE: self.PHOTO},
+            avatar_field=self.FIELD,
         )
-        self.odoo = FakeOdoo([fonte(1, 'agencia_brasil')], ASSUNTOS)
+        self.odoo = FakeOdoo([fonte(1, 'camara_saude', url='https://www.camara.leg.br/noticias/rss/dinamico/SAUDE')], ASSUNTOS)
         self.odoo.avatar_field = Mock(return_value=self.FIELD)
         self.odoo.avatar_missing = Mock(return_value=True)
         self.odoo.confirm_avatar = Mock()
@@ -564,11 +565,11 @@ class SyncImagesTest(unittest.TestCase):
     def test_different_feed_reference_can_use_authorized_article_image(self):
         from dataclasses import replace
 
-        candidate = replace(self.eligible, image_url=self.PHOTO + '?variant=1')
-        with patch('intelligence.images.image_reference', return_value=self.PHOTO) as metadata:
+        candidate = replace(self.eligible, image_credit=None)
+        with patch('intelligence.images.image_reference', return_value=(self.PHOTO, self.CREDIT)) as metadata:
             result, download = self.run_sync([candidate])
         metadata.assert_called_once()
-        self.assertEqual(download.call_args.args[1], self.PHOTO)
+        self.assertEqual(download.call_args.args[0], self.PHOTO)
         self.assertEqual(result['images_written'], 1)
 
     def test_existing_avatar_is_preserved_and_empty_avatar_is_enriched(self):

@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 
@@ -35,24 +34,6 @@ def _timeout(var: str, default: int) -> tuple[int, int]:
     return (10, seconds)
 
 
-def _image_permissions() -> dict[str, str]:
-    raw = os.getenv('INTEL_IMAGE_PERMISSIONS', '')
-    if not raw:
-        return {}
-    if len(raw) > 128_000:
-        raise ValueError('INTEL_IMAGE_PERMISSIONS exceeds its size limit')
-    try:
-        values = json.loads(raw)
-    except ValueError as exc:
-        raise ValueError('Invalid INTEL_IMAGE_PERMISSIONS JSON') from exc
-    if not isinstance(values, dict) or any(
-        not isinstance(value, str) or not key.startswith('https://') or not value.startswith('https://')
-        for key, value in values.items()
-    ):
-        raise ValueError('INTEL_IMAGE_PERMISSIONS must map HTTPS article URLs to HTTPS image URLs')
-    return values
-
-
 @dataclass(frozen=True)
 class Settings:
     odoo_url: str
@@ -62,7 +43,6 @@ class Settings:
     max_age_days: int
     request_timeout: tuple[int, int]
     avatar_field: str | None = None
-    image_permissions: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_env(cls) -> 'Settings':
@@ -91,7 +71,6 @@ class Settings:
             max_age_days=_positive_int('INTEL_MAX_AGE_DAYS', 30, 1, 366),
             request_timeout=_timeout('INTEL_READ_TIMEOUT', 40),
             avatar_field=os.getenv('INTEL_AVATAR_FIELD') or None,
-            image_permissions=_image_permissions(),
         )
 
     def require_odoo(self, write: bool = False) -> None:

@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 from . import images
+from .camara_media import eligible_photo, is_article
 from .classify import classificar, split_terms
 from .odoo import OdooClient, OdooHTTPError, SELECTIONS, normalizar_valor
 from .sources import COLETORES, coletar, rss_publisher
@@ -272,15 +273,12 @@ class Synchronizer:
                         self._image_failed(code, counts, 'write', exc)
 
     def _image_for(self, item, current, code: str, counts: Counter[str]) -> str | None:
-        permissions = getattr(self.cfg, 'image_permissions', {})
-        candidate = item.image_url
+        candidate, credit = item.image_url, item.image_credit
         if candidate:
             counts['images_identified'] += 1
-        if not images.image_allowed(item.url, permissions=permissions):
+        if not is_article(item.url):
             counts['without_available_image'] += 1
             return None
-        if candidate and not images.image_allowed(item.url, candidate, permissions=permissions):
-            candidate = None
         if not self._avatar:
             return None
         stage = 'check'
@@ -288,23 +286,23 @@ class Synchronizer:
             if current and not self.odoo.avatar_missing(current['id'], self._avatar):
                 return None
             if not self.apply:
-                if candidate:
+                if eligible_photo(item.url, candidate, credit):
                     counts['images_available'] += 1
                 return None
             stage = 'download'
-            if not candidate:
-                candidate = images.image_reference(
-                    self.session, item.url, permissions=permissions, timeout=self.cfg.request_timeout,
-                )
-                if not candidate:
+            if not eligible_photo(item.url, candidate, credit):
+                found = images.image_reference(item.url, timeout=self.cfg.request_timeout)
+                if not found:
                     counts['without_available_image'] += 1
                     return None
+                candidate, credit = found
                 if not item.image_url:
                     counts['images_identified'] += 1
+            if not candidate or not credit:
+                return None
             counts['images_available'] += 1
             return images.prepare_image(
-                self.session, candidate, article_url=item.url,
-                permissions=permissions, timeout=self.cfg.request_timeout,
+                candidate, article_url=item.url, credit=credit, timeout=self.cfg.request_timeout,
             )
         except (ValueError, RuntimeError) as exc:
             self._image_failed(code, counts, stage, exc)
@@ -421,4 +419,8 @@ class Synchronizer:
             self._processar_fonte(fonte, assuntos, start, end)
         if self._auditoria is not None:
             self._imprimir_auditoria()
-        return {'collection_date': start.date().isoformat(), **self.stats}
+        coverage = {
+            key: sum(source[key] for source in self.source_audit.values())
+            for key in ('images_identified', 'images_available', 'images_written', 'without_available_image')
+        }
+        return {'collection_date': start.date().isoformat(), **self.stats, **coverage}

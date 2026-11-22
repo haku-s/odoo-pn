@@ -72,6 +72,18 @@ class SharedFeedTest(TestCase):
         item, = collect(data.replace('</channel>', repeated + '</channel>').encode())
         self.assertIsNone(item.data_publicacao)
 
+    def test_camara_pairs_the_photo_with_its_own_credit(self):
+        data = rss(
+            f'<content:encoded><![CDATA[<div class="image-container" data-midia="1">'
+            f'<div class="midia-creditos">Reuters</div><img src="{IMAGE}"></div>'
+            f'<div class="image-container" data-midia="2"><div class="midia-creditos">'
+            f'<em>João Silva / Câmara dos Deputados</em></div><img src="{IMAGE.replace("photo", "credited")}"></div>'
+            ']]></content:encoded>'
+        )
+        item, = collect(data)
+        self.assertEqual(item.image_url, IMAGE.replace('photo', 'credited'))
+        self.assertEqual(item.image_credit, 'João Silva / Câmara dos Deputados')
+
     def test_old_entries_are_filtered(self):
         self.assertEqual(collect(rss(date='Sat, 31 Oct 2026 12:00:00 GMT')), [])
 

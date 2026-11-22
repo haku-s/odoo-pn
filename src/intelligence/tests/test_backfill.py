@@ -7,8 +7,10 @@ from unittest.mock import Mock, patch
 
 from intelligence import backfill as module
 
-ARTICLE = 'https://agenciabrasil.ebc.com.br/saude/noticia/2024-10/example'
-IMAGE = 'https://agenciabrasil.ebc.com.br/sites/default/files/example.jpg'
+ARTICLE = 'https://www.camara.leg.br/noticias/12345-example'
+IMAGE = 'https://www.camara.leg.br/midias/image/example.jpg'
+CREDIT = 'João Silva / Câmara dos Deputados'
+PHOTO = IMAGE, CREDIT
 IBGE_ARTICLE = (
     'http://agenciadenoticias.ibge.gov.br/agencia-noticias/2012-agencia-de-noticias/'
     'noticias/41506-example.html'
@@ -56,7 +58,7 @@ class Odoo:
     def fontes(self, *, include_archived=False):
         assert include_archived
         return [
-            source(1, 'agencia_brasil', 'RSS', 'https://agenciabrasil.ebc.com.br/rss/ultimasnoticias/feed.xml'),
+            source(1, 'camara_saude', 'RSS', 'https://www.camara.leg.br/noticias/rss/dinamico/SAUDE'),
             source(2, 'camara', 'API REST', 'https://dadosabertos.camara.leg.br/api/v2/proposicoes'),
             source(3, 'ibge', 'API REST', 'https://servicodados.ibge.gov.br/api/v3/noticias'),
         ]
@@ -78,7 +80,6 @@ class BackfillTests(TestCase):
     def setUp(self):
         self.cfg = SimpleNamespace(
             request_timeout=(10, 40), max_age_days=30, max_items_per_source=10,
-            image_permissions={ARTICLE: IMAGE, IBGE_ARTICLE.replace('http:', 'https:'): IBGE_IMAGE},
         )
         self.session = object()
         self.old = publication(10, 1, ARTICLE, ARTICLE)
@@ -88,7 +89,7 @@ class BackfillTests(TestCase):
             publication(12, 1, ARTICLE, ARTICLE) | {AVATAR: 'already-filled'},
         ])
         self.collect = self.enterContext(patch.object(module, 'coletar', return_value=[]))
-        self.historic = self.enterContext(patch.object(module, 'image_reference', return_value=IMAGE))
+        self.historic = self.enterContext(patch.object(module, 'image_reference', return_value=PHOTO))
         self.prepare = self.enterContext(patch.object(module, 'prepare_image', return_value='aW1hZ2U='))
 
     def test_preview_counts_old_news_and_skips_legislative_image_and_binary(self):
@@ -120,7 +121,7 @@ class BackfillTests(TestCase):
         result = module.backfill(self.cfg, self.odoo, self.session, apply=True, limit=1, after_id=0)
         self.assertEqual(result['without_image'], 1)
         self.assertEqual(result['updated'], 0)
-        self.historic.return_value = IMAGE
+        self.historic.return_value = PHOTO
         self.odoo.fail_on = 10
         with redirect_stderr(StringIO()):
             result = module.backfill(self.cfg, self.odoo, self.session, apply=True, limit=1, after_id=0)
@@ -143,14 +144,16 @@ class BackfillTests(TestCase):
         }]}).encode()
         with patch.object(module, 'read_public', return_value=(body, endpoint)) as read:
             result = module.backfill(self.cfg, self.odoo, self.session, apply=False, limit=1, after_id=0)
-        self.assertEqual(result['eligible'], 1)
+        self.assertEqual(result['identified'], 1)
+        self.assertEqual(result['eligible'], 0)
+        self.assertEqual(result['permission_unverified'], 1)
         self.assertEqual(read.call_args.args, (endpoint,))
         self.assertEqual(read.call_args.kwargs['allowed_urls'], {endpoint})
         self.historic.assert_not_called()
         self.prepare.assert_not_called()
 
     def test_missing_permission_skips_publisher_requests(self):
-        self.cfg.image_permissions.clear()
+        self.old['x_studio_url'] = 'https://agenciabrasil.ebc.com.br/saude/noticia/2024-10/example'
         result = module.backfill(self.cfg, self.odoo, self.session, apply=True, limit=10, after_id=0)
         self.assertEqual(result['without_image'], 1)
         self.assertEqual(result['permission_unverified'], 1)
@@ -159,8 +162,8 @@ class BackfillTests(TestCase):
         self.historic.assert_not_called()
         self.prepare.assert_not_called()
 
-    def test_preview_identifies_feed_reference_before_permission_is_configured(self):
-        self.cfg.image_permissions.clear()
+    def test_preview_identifies_an_image_without_verified_credit(self):
+        self.historic.return_value = None
         self.collect.return_value = [
             module.Item(ARTICLE, 'Relevant news', ARTICLE, None, None, 'Notícia', IMAGE),
         ]
@@ -169,7 +172,7 @@ class BackfillTests(TestCase):
         self.assertEqual(result['permission_unverified'], 1)
         self.assertEqual(result['eligible'], 0)
         self.assertEqual(result['updated'], 0)
-        self.historic.assert_not_called()
+        self.historic.assert_called_once()
         self.prepare.assert_not_called()
 
     def test_overlapping_feed_cannot_associate_mismatched_url(self):
@@ -192,7 +195,7 @@ class BackfillTests(TestCase):
     def test_avatar_filled_after_listing_avoids_download(self):
         def concurrent_avatar(*args, **kwargs):
             self.old[AVATAR] = 'filled-while-reading-metadata'
-            return IMAGE
+            return PHOTO
 
         self.historic.side_effect = concurrent_avatar
         result = module.backfill(self.cfg, self.odoo, self.session, apply=True, limit=10, after_id=0)

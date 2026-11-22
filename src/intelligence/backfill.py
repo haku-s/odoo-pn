@@ -12,7 +12,8 @@ from typing import Any
 from urllib.parse import urlencode, urlsplit
 from zoneinfo import ZoneInfo
 
-from .images import image_allowed, image_reference, prepare_image
+from .camara_media import eligible_photo, is_article
+from .images import image_reference, prepare_image
 from .network import read_public
 from .odoo import relation_id
 from .sources import Item, coletar, ibge_image_url, rss_publisher
@@ -69,14 +70,13 @@ def _feed_images(source, settings, session, timeout) -> dict[str, Item]:
     return {item.identificador: item for item in items}
 
 
-def _locate(settings, session, timeout, feeds, source, row, article, identifier) -> str | None:
+def _locate(settings, session, timeout, feeds, source, row, article, identifier) -> tuple[str | None, str | None]:
     code = source['x_studio_codigo_da_fonte_1']
-    permissions = settings.image_permissions
-    image = None
+    image = credit = None
     metadata_error = None
     if code == 'ibge':
         if not _ibge_article_matches(article, identifier):
-            return None
+            return None, None
         try:
             image = _historic_ibge_reference(row, article, identifier, timeout)
         except (ValueError, RuntimeError) as exc:
@@ -87,7 +87,7 @@ def _locate(settings, session, timeout, feeds, source, row, article, identifier)
             rss_publisher(source.get('x_studio_url')) != urlsplit(article).hostname
             or (code == 'agencia_brasil' and identifier != article)
         ):
-            return None
+            return None, None
         if source_id not in feeds:
             try:
                 feeds[source_id] = _feed_images(source, settings, session, timeout)
@@ -100,20 +100,17 @@ def _locate(settings, session, timeout, feeds, source, row, article, identifier)
             item = cached.get(identifier)
             if item is not None:
                 if item.url != article:
-                    return None
-                image = item.image_url
+                    return None, None
+                image, credit = item.image_url, item.image_credit
     else:
-        return None
-    if not image_allowed(article, permissions=permissions):
-        if metadata_error:
-            raise metadata_error
-        return image
-    if image and image_allowed(article, image, permissions=permissions):
-        return image
-    fallback = image_reference(session, article, permissions=permissions, timeout=timeout)
-    if not fallback and metadata_error:
+        return None, None
+    if not eligible_photo(article, image, credit) and is_article(article):
+        photo = image_reference(article, timeout=timeout)
+        if photo:
+            return photo
+    if metadata_error:
         raise metadata_error
-    return fallback or image
+    return image, credit
 
 
 def backfill(settings, odoo, session, *, apply: bool, limit: int, after_id: int) -> dict[str, Any]:
@@ -132,7 +129,6 @@ def backfill(settings, odoo, session, *, apply: bool, limit: int, after_id: int)
     ))
     by_source: dict[str, Counter[str]] = {}
     feeds: dict[int, dict[str, Item] | ValueError | RuntimeError] = {}
-    permissions = settings.image_permissions
     connect, read = settings.request_timeout
     timeout = (min(connect, 5), min(read, 15))
     cursor = after_id
@@ -149,24 +145,24 @@ def backfill(settings, odoo, session, *, apply: bool, limit: int, after_id: int)
         scoped['processed'] += 1
         stage = 'metadata'
         try:
-            image = None
+            image = credit = None
             article = row.get('x_studio_url')
             identifier = row.get('x_studio_identificador_externo')
             if (
                 source_id is not None and source and code not in _LEGISLATIVE_SOURCES
                 and isinstance(identifier, str) and isinstance(article, str)
             ):
-                permitted = image_allowed(article, permissions=permissions)
-                if permitted or not apply:
-                    image = _locate(settings, session, timeout, feeds, source, row, article, identifier)
-                if not permitted and not image:
+                supported = is_article(article)
+                if supported or not apply:
+                    image, credit = _locate(settings, session, timeout, feeds, source, row, article, identifier)
+                if not supported and image is None:
                     scoped['permission_unverified'] += 1
                     continue
             if image is None or not isinstance(article, str):
                 scoped['without_image'] += 1
                 continue
             scoped['identified'] += 1
-            if not image_allowed(article, image, permissions=permissions):
+            if credit is None or not eligible_photo(article, image, credit):
                 scoped['permission_unverified'] += 1
                 continue
             if apply:
@@ -176,7 +172,7 @@ def backfill(settings, odoo, session, *, apply: bool, limit: int, after_id: int)
             scoped['eligible'] += 1
             if apply:
                 stage = 'download or processing'
-                encoded = prepare_image(session, image, article_url=article, permissions=permissions, timeout=timeout)
+                encoded = prepare_image(image, article_url=article, credit=credit, timeout=timeout)
                 stage = 'Odoo write or verification'
                 if odoo.write_avatar(row['id'], field, encoded, expected=row):
                     scoped['updated'] += 1
