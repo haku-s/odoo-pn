@@ -5,14 +5,23 @@ from __future__ import annotations
 from collections import Counter
 import json
 from datetime import datetime, timedelta, timezone
+from itertools import batched
 import sys
 from typing import Any
 
 import requests
 
+from . import images
 from .classify import classificar, split_terms
-from .odoo import OdooClient, SELECTIONS, normalizar_valor
-from .sources import COLETORES, coletar
+from .odoo import OdooClient, OdooHTTPError, SELECTIONS, normalizar_valor
+from .sources import COLETORES, coletar, rss_publisher
+
+
+def _publisher(source: dict[str, Any]) -> str | None:
+    code = source['x_studio_codigo_da_fonte_1']
+    if code == 'agencia_brasil' or code not in COLETORES and source.get('x_studio_metodo_de_coleta') == 'RSS':
+        return rss_publisher(source.get('x_studio_url'))
+    return None
 
 
 def _agora() -> str:
@@ -28,13 +37,19 @@ def _mudou(antigo: dict[str, Any], valores: dict[str, Any]) -> dict[str, Any]:
 
 
 class Synchronizer:
-    def __init__(self, cfg, odoo: OdooClient, session: requests.Session, apply: bool = False):
+    def __init__(self, cfg, odoo: OdooClient, session: requests.Session, apply: bool = False,
+                 *, show_classification_details: bool = True):
         self.cfg = cfg
         self.odoo = odoo
         self.session = session
         self.apply = apply
+        self.show_classification_details = show_classification_details
         self.stats = Counter()
         self._auditoria: dict[str, Any] | None = None
+        self.source_audit: dict[str, Counter[str]] = {}
+        self._publishers: dict[str, list[int]] = {}
+        self._seen_urls: dict[str, set[str]] = {}
+        self._avatar: str | None = None
 
     @staticmethod
     def _amostra(item) -> dict[str, str]:
@@ -113,7 +128,7 @@ class Synchronizer:
                 auditoria_fonte['estado'] = 'desabilitada'
             self.stats['fontes_desabilitadas'] += 1
             return
-        if codigo not in COLETORES:
+        if codigo not in COLETORES and _publisher(fonte) is None:
             if auditoria_fonte is not None:
                 auditoria_fonte['estado'] = 'nao_implementada'
             self.stats['fontes_nao_implementadas'] += 1
@@ -124,6 +139,8 @@ class Synchronizer:
             itens = coletar(
                 codigo, self.session, fonte.get('x_studio_url'), desde,
                 self.cfg.max_items_per_source,
+                method=fonte.get('x_studio_metodo_de_coleta'),
+                timeout=getattr(self.cfg, 'request_timeout', (10, 40)),
             )
         except Exception as exc:  # noqa: BLE001 - report and keep other sources running
             if auditoria_fonte is not None:
@@ -137,8 +154,16 @@ class Synchronizer:
 
         self.stats['fontes_coletadas'] += 1
         self.stats['itens_recebidos'] += len(itens)
+        counts: Counter[str] = Counter(dict.fromkeys((
+            'collected', 'classified', 'discarded', 'existing', 'duplicates',
+            'images_identified', 'images_available', 'images_written',
+            'images_enriched', 'without_available_image', 'image_failures',
+        ), 0))
+        self.source_audit[codigo] = counts
+        counts['collected'] = len(itens)
         if auditoria_fonte is not None:
             auditoria_fonte['recebidos'] = len(itens)
+            auditoria_fonte['collection_counts'] = counts
         try:
             self._sincronizar(fonte, itens, assuntos, auditoria_fonte)
         except Exception as exc:  # noqa: BLE001 - isolate the source failure
@@ -174,10 +199,22 @@ class Synchronizer:
     def _sincronizar(self, fonte: dict[str, Any], itens: list[Any], assuntos: list[dict[str, Any]],
                      auditoria_fonte: dict[str, Any] | None = None) -> None:
         identificador_fonte = fonte['id']
+        code = fonte['x_studio_codigo_da_fonte_1']
+        counts = self.source_audit[code]
         identificadores = [item.identificador for item in itens]
         existente = self.odoo.publicacoes_por_identificador(identificador_fonte, identificadores)
+        publisher = _publisher(fonte)
+        other_sources = [source_id for source_id in self._publishers.get(publisher or '', ())
+                         if source_id != identificador_fonte]
+        stored_urls: set[str] = set()
+        seen_urls: set[str] = set()
+        if publisher and other_sources:
+            seen_urls = self._seen_urls.setdefault(publisher, set())
+            for urls in batched(dict.fromkeys(item.url for item in itens), 100, strict=False):
+                stored_urls.update(self.odoo.publicacoes_por_urls(other_sources, list(urls)))
         for item in itens:
             classificacao = classificar(item.titulo, item.resumo, assuntos)
+            counts['classified' if classificacao.assunto_id is not None else 'discarded'] += 1
             if auditoria_fonte is not None:
                 self._auditar_item(auditoria_fonte, item, classificacao)
             if classificacao.ambigua:
@@ -188,6 +225,12 @@ class Synchronizer:
                 self.stats['excluidos'] += 1
 
             atual = existente.get(item.identificador)
+            if atual is not None:
+                counts['existing'] += 1
+            if atual is None and (item.url in stored_urls or item.url in seen_urls):
+                counts['duplicates'] += 1
+                self.stats['duplicates'] += 1
+                continue
             valores = self._valores(item, classificacao.assunto_id)
             valores['x_studio_fontes'] = identificador_fonte
 
@@ -199,25 +242,89 @@ class Synchronizer:
                 # Existing records keep their current subject.
                 valores['x_studio_assunto_1'] = atual.get('x_studio_assunto_1')
 
+            image = self._image_for(item, atual, code, counts)
             if not self.apply:
                 if auditoria_fonte is not None and classificacao.assunto_id is not None and atual is None:
                     auditoria_fonte['novos_elegiveis'] += 1
                 self.stats['existentes'] += atual is not None
                 self.stats['novos'] += atual is None
+                if publisher and other_sources:
+                    seen_urls.add(item.url)
                 continue
             if atual is None:
-                criado = self._criar(item, valores)
+                criado = self._criar(item, valores, image=image, code=code, counts=counts)
                 self.stats['criados'] += 1
                 existente[item.identificador] = criado
             else:
                 self.stats['existentes'] += 1
                 self._atualizar(atual, valores)
                 self.stats['atualizados' if _mudou(atual, valores) else 'inalterados'] += 1
+                if image and self._avatar:
+                    try:
+                        identity = {**atual, 'x_studio_url': item.url}
+                        if self.odoo.write_avatar(atual['id'], self._avatar, image, expected=identity):
+                            counts['images_enriched'] += 1
+                            self.stats['images_enriched'] += 1
+                            self._image_written(counts)
+                    except (ValueError, RuntimeError) as exc:
+                        self._image_failed(code, counts, 'write', exc)
 
-    def _criar(self, item, valores: dict[str, Any]) -> dict[str, Any]:
+    def _image_for(self, item, current, code: str, counts: Counter[str]) -> str | None:
+        permissions = getattr(self.cfg, 'image_permissions', {})
+        candidate = item.image_url
+        if candidate:
+            counts['images_identified'] += 1
+        if not images.image_allowed(item.url, permissions=permissions):
+            counts['without_available_image'] += 1
+            return None
+        if candidate and not images.image_allowed(item.url, candidate, permissions=permissions):
+            candidate = None
+        if not self._avatar:
+            return None
+        stage = 'check'
+        try:
+            if current and not self.odoo.avatar_missing(current['id'], self._avatar):
+                return None
+            if not self.apply:
+                if candidate:
+                    counts['images_available'] += 1
+                return None
+            stage = 'download'
+            if not candidate:
+                candidate = images.image_reference(
+                    self.session, item.url, permissions=permissions, timeout=self.cfg.request_timeout,
+                )
+                if not candidate:
+                    counts['without_available_image'] += 1
+                    return None
+                if not item.image_url:
+                    counts['images_identified'] += 1
+            counts['images_available'] += 1
+            return images.prepare_image(
+                self.session, candidate, article_url=item.url,
+                permissions=permissions, timeout=self.cfg.request_timeout,
+            )
+        except (ValueError, RuntimeError) as exc:
+            self._image_failed(code, counts, stage, exc)
+            return None
+
+    def _image_written(self, counts: Counter[str]) -> None:
+        counts['images_written'] += 1
+        self.stats['images_written'] += 1
+
+    def _image_failed(self, code: str, counts: Counter[str], stage: str, exc: Exception) -> None:
+        counts['image_failures'] += 1
+        self.stats['image_failures'] += 1
+        if counts['image_failures'] <= 3:
+            print(f'Source {code}: image {stage} failed: {exc}', file=sys.stderr)
+
+    def _criar(self, item, valores: dict[str, Any], *, image: str | None,
+               code: str, counts: Counter[str]) -> dict[str, Any]:
         payload = dict(valores)
         payload['x_studio_primeira_coleta'] = _agora()
         payload['x_studio_ultima_atualizacao'] = payload['x_studio_primeira_coleta']
+        if image and self._avatar:
+            payload[self._avatar] = image
         try:
             publicacao_id = self.odoo.create_publicacao(payload)
         except RuntimeError as exc:
@@ -225,13 +332,22 @@ class Synchronizer:
                 valores['x_studio_fontes'], [item.identificador],
             ).get(item.identificador)
             if confirmado is None:
+                if image and self._avatar and isinstance(exc, OdooHTTPError) and exc.validation_rejected:
+                    self._image_failed(code, counts, 'create', exc)
+                    return self._criar(item, valores, image=None, code=code, counts=counts)
                 raise RuntimeError('Publication creation was not confirmed') from exc
-            return confirmado
-        confirmado = self.odoo.publicacoes_por_identificador(
-            valores['x_studio_fontes'], [item.identificador],
-        ).get(item.identificador)
-        if confirmado is None or confirmado['id'] != publicacao_id:
-            raise RuntimeError('Created publication could not be confirmed')
+        else:
+            confirmado = self.odoo.publicacoes_por_identificador(
+                valores['x_studio_fontes'], [item.identificador],
+            ).get(item.identificador)
+            if confirmado is None or confirmado['id'] != publicacao_id:
+                raise RuntimeError('Created publication could not be confirmed')
+        if image and self._avatar:
+            try:
+                self.odoo.confirm_avatar(confirmado['id'], self._avatar, image)
+                self._image_written(counts)
+            except (ValueError, RuntimeError) as exc:
+                self._image_failed(code, counts, 'confirmation', exc)
         return confirmado
 
     def _atualizar(self, atual: dict[str, Any], valores: dict[str, Any]) -> None:
@@ -259,9 +375,19 @@ class Synchronizer:
         self.odoo.check(write=self.apply)
         fontes = self.odoo.fontes()
         assuntos = self.odoo.assuntos()
+        if any(_publisher(source) and source.get('x_studio_coleta_habilitada') for source in fontes):
+            for source in self.odoo.fontes(include_archived=True):
+                if publisher := _publisher(source):
+                    self._publishers.setdefault(publisher, []).append(source['id'])
+        if getattr(self.cfg, 'avatar_field', None):
+            try:
+                self._avatar = self.odoo.avatar_field(write=self.apply)
+            except (ValueError, RuntimeError) as exc:
+                print(f'Avatar preflight blocked: {exc}', file=sys.stderr)
+                self.stats['avatar_preflight_blocked'] += 1
         self.stats['fontes'] = len(fontes)
         self.stats['assuntos'] = len(assuntos)
-        if not self.apply:
+        if not self.apply and self.show_classification_details:
             # Terms come from the live Odoo records, not from test fixtures.
             def contar_termos(value: object) -> int | None:
                 try:
