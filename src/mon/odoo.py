@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any, TypeGuard
+
 import re
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
@@ -67,7 +69,7 @@ MAX_ODOO_ROWS = 1000
 CHECKSUM = re.compile(r'[0-9a-f]{40}')
 
 
-def selection_keys(meta: dict) -> dict:
+def selection_keys(meta: dict[str, Any]) -> dict[str, Any]:
     choices = meta.get('selection')
     if not isinstance(choices, list) or not choices:
         raise ValueError('Missing selection options')
@@ -83,7 +85,7 @@ def selection_keys(meta: dict) -> dict:
     return keys
 
 
-def selection_value(meta: dict, value: str, *, required: bool = True) -> str | None:
+def selection_value(meta: dict[str, Any], value: str, *, required: bool = True) -> str | None:
     keys = [
         key for key, label in selection_keys(meta).items()
         if fold(label.strip()) == fold(value)
@@ -104,7 +106,7 @@ def amount_value(value: float, step: Decimal | None) -> float:
         raise ValueError('Estimated value exceeds the supported Odoo precision') from exc
 
 
-def float_step(meta: dict) -> Decimal | None:
+def float_step(meta: dict[str, Any]) -> Decimal | None:
     digits = meta.get('digits')
     if digits is None or digits is False or digits == 0:
         return None
@@ -117,7 +119,7 @@ def float_step(meta: dict) -> Decimal | None:
     return Decimal(1).scaleb(-digits[1])
 
 
-def positive_id(value) -> bool:
+def positive_id(value: object) -> TypeGuard[int]:
     return type(value) is int and value > 0
 
 
@@ -137,7 +139,7 @@ def _valid(metadata, name, types, *, writable=False, relation=None):
         raise ValueError('Incompatible or inaccessible Odoo field metadata')
 
 
-def field_inventory(task: dict, settings: Settings) -> tuple[list[dict], dict, list[str]]:
+def field_inventory(task: dict[str, Any], settings: Settings) -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
     inventory, mappings, errors = [], {}, []
     configured = {}
     for key, name in settings.field_map.items():
@@ -212,7 +214,7 @@ class OdooClient:
         self.base = settings.odoo_url
         self.mappings = {}
         self.currency_steps: dict[int, Decimal] = {}
-        self._task_currency_defaults: dict | None = None
+        self._task_currency_defaults: dict[str, Any] | None = None
         self._assignable_task_currency: int | None = None
         self.currency_amount_siblings: tuple[str, ...] | None = None
         self.headers = {
@@ -257,7 +259,7 @@ class OdooClient:
         if not isinstance(info, list) or not info or type(info[0]) is not int or info[0] != 20:
             raise ValueError('The attachment write contract requires Odoo 20')
 
-    def fields(self, model: str) -> dict:
+    def fields(self, model: str) -> dict[str, Any]:
         result = self.call(
             model, 'fields_get', context=CONTEXT,
             attributes=['type', 'string', 'readonly', 'selection', 'relation', 'digits', 'currency_field'],
@@ -286,7 +288,7 @@ class OdooClient:
         if self.call(model, 'has_access', ids=list(ids), operation=operation, context=CONTEXT) is not True:
             raise ValueError(f'Odoo access denied: {model}/{operation}')
 
-    def check_fields(self, write=False, *, report=None) -> dict:
+    def check_fields(self, write=False, *, report=None) -> dict[str, Any]:
         task = self.fields(TASK)
         project = self.fields(PROJECT)
         inventory, mappings, errors = field_inventory(task, self.cfg)
@@ -365,7 +367,7 @@ class OdooClient:
         self.mappings = mappings
         return project_row
 
-    def project(self, fields: list[str]) -> dict:
+    def project(self, fields: list[str]) -> dict[str, Any]:
         rows = self.rows(PROJECT, [['id', '=', self.cfg.project_id]], fields, 2)
         if len(rows) != 1 or rows[0]['id'] != self.cfg.project_id:
             raise ValueError('Configured Odoo project is unavailable')
@@ -380,7 +382,7 @@ class OdooClient:
             raise RuntimeError('Invalid unlinked task count')
         return bool(count)
 
-    def tasks(self, ids: list[str]) -> dict[str, dict]:
+    def tasks(self, ids: list[str]) -> dict[str, dict[str, Any]]:
         if not ids:
             return {}
         identifier = self.cfg.pncp_field
@@ -419,7 +421,7 @@ class OdooClient:
             self.currency_steps[currency_id] = step
         return self.currency_steps[currency_id]
 
-    def _task_creation_context(self) -> dict:
+    def _task_creation_context(self) -> dict[str, Any]:
         return {**CONTEXT, 'default_project_id': self.cfg.project_id, 'default_stage_id': self.cfg.stage_id}
 
     def task_currency_default(self) -> int | None:
@@ -436,7 +438,7 @@ class OdooClient:
             self._task_currency_defaults = defaults
         return self._task_currency_defaults.get(field) or None
 
-    def assignable_task_currency(self, task: dict | None = None) -> int:
+    def assignable_task_currency(self, task: dict[str, Any] | None = None) -> int:
         field = self.mappings['estimated_value'][1]['currency_field']
         siblings = self.currency_amount_siblings
         if siblings is None or not field.startswith('x_'):
@@ -466,10 +468,13 @@ class OdooClient:
                         or relation_id(companies[0].get('currency_id')) != brl):
                     raise ValueError('A shared task currency requires BRL in the project company')
             self._assignable_task_currency = brl
-        return self._assignable_task_currency
+        currency_id = self._assignable_task_currency
+        if currency_id is None:
+            raise RuntimeError('BRL currency could not be established')
+        return currency_id
 
-    def create(self, model: str, values: dict) -> int:
-        params = {'vals_list': [values]}
+    def create(self, model: str, values: dict[str, Any]) -> int:
+        params: dict[str, Any] = {'vals_list': [values]}
         if model == TASK:
             params['context'] = self._task_creation_context()
         result = self.call(model, 'create', **params)
@@ -479,15 +484,15 @@ class OdooClient:
             raise RuntimeError('Unexpected Odoo create response')
         return result
 
-    def create_task(self, values: dict) -> int:
+    def create_task(self, values: dict[str, Any]) -> int:
         return self.create(TASK, values)
 
-    def update_task(self, task_id: int, values: dict) -> None:
+    def update_task(self, task_id: int, values: dict[str, Any]) -> None:
         self.require_access(TASK, 'write', [task_id])
         if self.call(TASK, 'write', ids=[task_id], vals=values, context=CONTEXT) is not True:
             raise RuntimeError('Odoo task update was not confirmed')
 
-    def attachments(self, task_id: int) -> list[dict]:
+    def attachments(self, task_id: int) -> list[dict[str, Any]]:
         direct = self.rows(ATTACHMENT, [
             ['res_model', '=', TASK], ['res_id', '=', task_id],
             ['type', '=', 'binary'], ['res_field', '=', False],
@@ -536,7 +541,7 @@ class OdooClient:
             raise RuntimeError('Odoo checkpoint update was not confirmed')
 
 
-def direct_attachment(row: dict, task_id: int) -> bool:
+def direct_attachment(row: dict[str, Any], task_id: int) -> bool:
     return (
         row.get('res_model') == TASK and row.get('res_id') == task_id
         and row.get('type') == 'binary' and row.get('res_field') is False
