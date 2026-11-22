@@ -17,7 +17,17 @@ on:
           - inspect
           - preview
           - apply
+          - images-preview
+          - images-apply
         default: preview
+      image_limit:
+        description: 'Maximum records per image backfill (1 to 500)'
+        type: number
+        default: 100
+      image_after_id:
+        description: 'Resume image backfill after this record ID'
+        type: number
+        default: 0
 
 permissions:
   contents: read
@@ -53,10 +63,16 @@ jobs:
       - name: Run
         env:
           PYTHONPATH: src
-          # `mode` comes from a workflow_dispatch choice input (inspect|preview|apply),
-          # so it is not attacker-controlled free text.  The same Odoo credential
-          # as the procurement integration is reused via the existing secret.
           MODE: ${{ inputs.mode }}
+          IMAGE_LIMIT: ${{ inputs.image_limit }}
+          IMAGE_AFTER_ID: ${{ inputs.image_after_id }}
+          INTEL_AVATAR_FIELD: ${{ secrets.INTEL_AVATAR_FIELD }}
+          INTEL_IMAGE_PERMISSIONS: ${{ secrets.INTEL_IMAGE_PERMISSIONS }}
           ODOO_URL: ${{ secrets.ODOO_URL }}
           ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
-        run: timeout --kill-after=30s 50m uv run --locked python -u -m intelligence "$MODE"
+        run: |
+          args=("$MODE" --summary-only)
+          if [[ "$MODE" == images-* ]]; then
+            args+=(--limit "$IMAGE_LIMIT" --after-id "$IMAGE_AFTER_ID")
+          fi
+          timeout --kill-after=30s 50m uv run --locked python -u -m intelligence "${args[@]}"

@@ -39,7 +39,7 @@ class FakeOdoo:
     def check(self, write=False):
         self.write_check = write
 
-    def fontes(self):
+    def fontes(self, *, include_archived=False):
         return self._fontes
 
     def assuntos(self):
@@ -50,6 +50,13 @@ class FakeOdoo:
             valor['x_studio_identificador_externo']: dict(valor)
             for (fid, _), valor in self._publicacoes.items()
             if fid == fonte_id and valor['x_studio_identificador_externo'] in identificadores
+        }
+
+    def publicacoes_por_urls(self, source_ids, urls):
+        return {
+            row['x_studio_url']
+            for (source_id, _), row in self._publicacoes.items()
+            if source_id in source_ids and row['x_studio_url'] in urls
         }
 
     def create_publicacao(self, valores):
@@ -448,6 +455,7 @@ class CliExitCodeTest(unittest.TestCase):
              patch.object(cli, 'Synchronizer') as sincronizador:
             cliente.return_value = object()
             sincronizador.return_value.run.return_value = stats
+            sincronizador.return_value.source_audit = {}
             return cli.main(['apply'])
 
     def test_cli_returns_0_on_success(self):
@@ -477,3 +485,182 @@ class CliExitCodeTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SyncImagesTest(unittest.TestCase):
+    ARTICLE = 'https://agenciabrasil.ebc.com.br/saude/noticia/2026-11/titulo'
+    PHOTO = 'https://agenciabrasil.ebc.com.br/sites/default/files/photo.png'
+    FIELD = 'x_confirmed_avatar'
+
+    def setUp(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        self.eligible = Item('a', 'Saúde mental', self.ARTICLE, None, None, 'Notícia', self.PHOTO)
+        self.cfg = SimpleNamespace(
+            max_age_days=30, max_items_per_source=100, request_timeout=(2, 3),
+            avatar_field=self.FIELD, image_permissions={self.ARTICLE: self.PHOTO},
+        )
+        self.odoo = FakeOdoo([fonte(1, 'agencia_brasil')], ASSUNTOS)
+        self.odoo.avatar_field = Mock(return_value=self.FIELD)
+        self.odoo.avatar_missing = Mock(return_value=True)
+        self.odoo.confirm_avatar = Mock()
+        self.odoo.write_avatar = Mock(return_value=True)
+
+    def run_sync(self, items, *, apply=True, error=None):
+        with patch.object(sync, 'coletar', return_value=items), patch(
+            'intelligence.images.prepare_image', return_value='YWJj', side_effect=error,
+        ) as download:
+            result = sync.Synchronizer(self.cfg, self.odoo, object(), apply=apply).run()
+        return result, download
+
+    def test_create_with_image_confirms_payload(self):
+        result, download = self.run_sync([self.eligible])
+        self.assertEqual(self.odoo.criadas[0][self.FIELD], 'YWJj')
+        self.odoo.confirm_avatar.assert_called_once_with(100, self.FIELD, 'YWJj')
+        self.assertEqual(result['images_written'], 1)
+        download.assert_called_once()
+
+    def test_preview_and_unclassified_never_download(self):
+        from dataclasses import replace
+        for candidate, apply in ((self.eligible, False), (replace(self.eligible, titulo='Skip'), True)):
+            with self.subTest(apply=apply):
+                _, download = self.run_sync([candidate], apply=apply)
+                download.assert_not_called()
+                self.assertEqual(self.odoo.criadas, [])
+                self.odoo.write_avatar.assert_not_called()
+
+    def test_image_failure_does_not_discard_publication(self):
+        result, _ = self.run_sync([self.eligible], error=ValueError('Invalid image'))
+        self.assertEqual(result['image_failures'], 1)
+        self.assertNotIn(self.FIELD, self.odoo.criadas[0])
+
+    def test_different_feed_reference_can_use_authorized_article_image(self):
+        from dataclasses import replace
+
+        candidate = replace(self.eligible, image_url=self.PHOTO + '?variant=1')
+        with patch('intelligence.images.image_reference', return_value=self.PHOTO) as metadata:
+            result, download = self.run_sync([candidate])
+        metadata.assert_called_once()
+        self.assertEqual(download.call_args.args[1], self.PHOTO)
+        self.assertEqual(result['images_written'], 1)
+
+    def test_existing_avatar_is_preserved_and_empty_avatar_is_enriched(self):
+        from dataclasses import replace
+        existing = replace(self.eligible, data_publicacao='2026-11-20 10:00:00', titulo='Título')
+        self.odoo._publicacoes[(1, 'a')] = registro('a', x_studio_url=self.ARTICLE)
+        self.odoo.avatar_missing.return_value = False
+        _, download = self.run_sync([existing])
+        download.assert_not_called()
+        self.odoo.write_avatar.assert_not_called()
+
+        self.odoo.avatar_missing.return_value = True
+        result, download = self.run_sync([existing])
+        download.assert_called_once()
+        self.assertEqual(result['images_enriched'], 1)
+        self.assertEqual(self.odoo.atualizadas, [])
+        self.assertEqual(self.odoo.write_avatar.call_args.args, (1, self.FIELD, 'YWJj'))
+        self.odoo.avatar_missing.return_value = False
+        _, download = self.run_sync([existing])
+        download.assert_not_called()
+        self.odoo.write_avatar.assert_called_once()
+
+    def test_explicit_image_create_rejection_falls_back_to_text_once(self):
+        from intelligence.odoo import OdooHTTPError, PUBLICACOES
+
+        original = self.odoo.create_publicacao
+
+        def create(values):
+            if self.FIELD in values:
+                raise OdooHTTPError(PUBLICACOES, 'create', 422, validation_rejected=True)
+            return original(values)
+
+        with patch.object(self.odoo, 'create_publicacao', side_effect=create) as write:
+            counts, _ = self.run_sync([self.eligible])
+        self.assertEqual(write.call_count, 2)
+        self.assertEqual(counts['criados'], 1)
+        self.assertEqual(counts['image_failures'], 1)
+        self.assertNotIn(self.FIELD, self.odoo.criadas[0])
+
+    def test_unconfirmed_image_write_does_not_discard_created_publication(self):
+        self.odoo.confirm_avatar.side_effect = RuntimeError('Image readback mismatch')
+        counts, _ = self.run_sync([self.eligible])
+        self.assertEqual(counts['criados'], 1)
+        self.assertEqual(counts['image_failures'], 1)
+        self.assertEqual(counts.get('images_written', 0), 0)
+
+
+class CrossFeedDuplicatesTest(unittest.TestCase):
+    def test_same_publisher_exact_url_matches_even_across_archived_sources(self):
+        feeds = [
+            fonte(1, 'camara_saude', url='https://www.camara.leg.br/noticias/rss/dinamico/SAUDE'),
+            fonte(2, 'camara_educacao', url='https://www.camara.leg.br/noticias/rss/dinamico/EDUCACAO'),
+        ]
+        article = 'https://www.camara.leg.br/noticias/123-title'
+        news = Item('new', 'Saúde mental', article, None, None, 'Notícia')
+        odoo = FakeOdoo(feeds[:1], ASSUNTOS, {(2, 'old'): registro('old', x_studio_fontes=2, x_studio_url=article)})
+        cfg = SyncTest().cfg()
+        with patch.object(odoo, 'fontes', side_effect=lambda include_archived=False: feeds if include_archived else feeds[:1]), \
+             patch.object(sync, 'coletar', return_value=[news]):
+            counts = sync.Synchronizer(cfg, odoo, object(), apply=True).run()
+        self.assertEqual(odoo.criadas, [])
+        self.assertEqual(counts['duplicates'], 1)
+
+    def test_same_publisher_cross_feed_duplicate_in_preview(self):
+        feeds = [
+            fonte(1, 'camara_saude', url='https://www.camara.leg.br/noticias/rss/dinamico/SAUDE'),
+            fonte(2, 'camara_educacao', url='https://www.camara.leg.br/noticias/rss/dinamico/EDUCACAO'),
+        ]
+        article = 'https://www.camara.leg.br/noticias/123-title'
+        first = Item('first', 'Saúde mental', article, None, None, 'Notícia')
+        second = Item('second', 'Saúde mental', article, None, None, 'Notícia')
+        odoo = FakeOdoo(feeds, ASSUNTOS)
+        with patch.object(sync, 'coletar', side_effect=[[first], [second]]):
+            counts = sync.Synchronizer(SyncTest().cfg(), odoo, object()).run()
+        self.assertEqual(counts['novos'], 1)
+        self.assertEqual(counts['duplicates'], 1)
+        self.assertEqual(odoo.criadas + odoo.atualizadas + odoo.status, [])
+
+
+class InspectImagesTest(unittest.TestCase):
+    def test_inspect_lists_source_state_and_avatar_metadata_without_writes(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        import json
+
+        from intelligence import __main__ as cli
+
+        row = {**fonte(1, 'agencia_brasil'), 'x_active': True}
+        output = StringIO()
+        with patch.dict('os.environ', {'ODOO_URL': 'https://example.test', 'ODOO_API_KEY': 'test'}), \
+             patch.object(cli, 'OdooClient') as client, redirect_stdout(output):
+            odoo = client.return_value
+            odoo.fontes.return_value = [row]
+            odoo.assuntos.return_value = []
+            odoo.selection.return_value = ()
+            odoo.avatar_info.return_value = {'field': 'x_verified', 'type': 'binary'}
+            self.assertEqual(cli.main(['inspect']), 0)
+        data = json.loads(output.getvalue())
+        self.assertEqual(data['avatar']['field'], 'x_verified')
+        self.assertEqual(data['sources'][0]['approved_feed'], row['x_studio_url'])
+        self.assertFalse(odoo.create_publicacao.called or odoo.update_publicacao.called or odoo.write_avatar.called)
+
+    def test_public_summary_omits_instance_details(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        import json
+
+        from intelligence import __main__ as cli
+
+        output = StringIO()
+        with patch.dict('os.environ', {'ODOO_URL': 'https://example.test', 'ODOO_API_KEY': 'test'}), \
+             patch.object(cli, 'OdooClient') as client, redirect_stdout(output):
+            odoo = client.return_value
+            odoo.fontes.return_value = [{**fonte(1, 'private_source'), 'x_active': True}]
+            odoo.assuntos.return_value = []
+            odoo.avatar_info.return_value = {'status': 'available', 'field': 'x_private', 'type': 'binary'}
+            self.assertEqual(cli.main(['inspect', '--summary-only']), 0)
+        data = json.loads(output.getvalue())
+        self.assertEqual(data['avatar'], {'status': 'available', 'type': 'binary'})
+        self.assertNotIn('sources', data)
+        self.assertNotIn('x_private', output.getvalue())

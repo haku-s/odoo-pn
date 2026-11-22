@@ -1,4 +1,4 @@
-"""CLI: inspect (read-only), preview and apply."""
+"""Inspect, synchronize or backfill publication images."""
 
 from __future__ import annotations
 
@@ -11,7 +11,9 @@ import sys
 import requests
 
 from .config import Settings
+from .backfill import backfill
 from .odoo import OdooClient
+from .sources import rss_publisher
 from .sync import Synchronizer
 
 USER_AGENT = 'odoo-data-sync/1.0'
@@ -42,8 +44,12 @@ def _todas_as_fontes_falharam(stats: dict[str, int]) -> bool:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description='Odoo data sync')
     parser.add_argument(
-        'command', choices=['inspect', 'preview', 'apply'], nargs='?', default='preview',
+        'command', choices=['inspect', 'preview', 'apply', 'images-preview', 'images-apply'],
+        nargs='?', default='preview',
     )
+    parser.add_argument('--limit', type=int, default=100, help='Maximum records per image backfill')
+    parser.add_argument('--after-id', type=int, default=0, help='Resume image backfill after this record ID')
+    parser.add_argument('--summary-only', action='store_true', help='Omit instance details from output')
     args = parser.parse_args(argv)
     stage = 'settings'
     try:
@@ -51,23 +57,61 @@ def main(argv=None) -> int:
         stage = 'Odoo metadata'
         odoo = OdooClient(cfg)
         if args.command == 'inspect':
-            odoo.check(write=True)
-            metadata = {
-                'fontes': len(odoo.fontes()),
+            odoo.check()
+            sources = odoo.fontes(include_archived=True)
+            avatar = odoo.avatar_info()
+            metadata: dict[str, object] = {
+                'fontes': sum(source['x_active'] for source in sources),
                 'assuntos': len(odoo.assuntos()),
-                'metodos': list(odoo.selection('x_fontes', 'x_studio_metodo_de_coleta')),
-                'tipos': list(odoo.selection('x_publicacoes', 'x_studio_tipo_de_publicacao')),
-                'areas': list(odoo.selection('x_assuntos', 'x_studio_area')),
+                'avatar': {
+                    key: avatar[key]
+                    for key in ('status', 'type', 'widget', 'writable',
+                                'empty_representation', 'populated_representation')
+                    if key in avatar
+                },
             }
+            if not args.summary_only:
+                metadata.update({
+                    'metodos': list(odoo.selection('x_fontes', 'x_studio_metodo_de_coleta')),
+                    'tipos': list(odoo.selection('x_publicacoes', 'x_studio_tipo_de_publicacao')),
+                    'areas': list(odoo.selection('x_assuntos', 'x_studio_area')),
+                    'avatar': avatar,
+                    'sources': [
+                        {
+                            'code': source['x_studio_codigo_da_fonte_1'],
+                            'active': source['x_active'],
+                            'enabled': source['x_studio_coleta_habilitada'],
+                            'method': source['x_studio_metodo_de_coleta'],
+                            'approved_feed': url if rss_publisher(url) else None,
+                        }
+                        for source in sources
+                        for url in [source['x_studio_url']]
+                    ],
+                })
             print(json.dumps({'mode': 'inspect', 'status': 'passed', **metadata}, ensure_ascii=False, sort_keys=True))
             return 0
 
+        if args.command in ('images-preview', 'images-apply'):
+            stage = 'image backfill'
+            result = backfill(
+                cfg, odoo, _session(cfg), apply=args.command == 'images-apply',
+                limit=args.limit, after_id=args.after_id,
+            )
+            if args.summary_only:
+                result.pop('sources', None)
+            print(json.dumps({'mode': args.command, **result}, ensure_ascii=False, sort_keys=True))
+            return int(result['failed'] > 0)
+
         stage = 'collection'
-        stats = Synchronizer(cfg, odoo, _session(cfg), apply=(args.command == 'apply')).run()
-        print(json.dumps(
-            {'mode': args.command, 'counts': stats},
-            ensure_ascii=False, sort_keys=True,
-        ))
+        synchronizer = Synchronizer(
+            cfg, odoo, _session(cfg), apply=(args.command == 'apply'),
+            show_classification_details=not args.summary_only,
+        )
+        stats = synchronizer.run()
+        output: dict[str, object] = {'mode': args.command, 'counts': stats}
+        if not args.summary_only:
+            output['sources'] = synchronizer.source_audit
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
         if _todas_as_fontes_falharam(stats) or stats.get('status_erros', 0) > 0:
             print('Every attempted source failed or the status update failed', file=sys.stderr)
             return 1
