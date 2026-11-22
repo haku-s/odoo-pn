@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 import os
 import sys
 from time import monotonic
+from typing import Any, cast
 
 from .checkpoint import days_to_process, parse_checkpoint, serialize_checkpoint
 from .config import NOTICE_FIELDS, OPTIONAL_OFFICIAL_FIELDS
@@ -18,7 +19,7 @@ from .relevance import fold, is_relevant
 MIN_PROPOSAL_WINDOW = timedelta(days=7)
 
 
-def changed_values(old: dict, official: dict) -> dict:
+def changed_values(old: dict[str, Any], official: dict[str, Any]) -> dict[str, Any]:
     # Odoo can return integers for numeric fields, but False is an unset value.
     return {
         name: value for name, value in official.items()
@@ -26,7 +27,7 @@ def changed_values(old: dict, official: dict) -> dict:
     }
 
 
-def official_task_name(record: dict) -> str | None:
+def official_task_name(record: dict[str, Any]) -> str | None:
     municipality, _, state = (record.get('municipality_state') or '').rpartition(' / ')
     process, organization = record.get('process_number'), record.get('organization')
     if process and organization and municipality and state:
@@ -42,8 +43,9 @@ class Synchronizer:
         self.odoo = odoo
         self.apply = apply
         self.stats = Counter()
+        self.next_progress = 0.0
 
-    def _has_minimum_proposal_window(self, record: dict) -> bool:
+    def _has_minimum_proposal_window(self, record: dict[str, Any]) -> bool:
         deadline = record.get('deadline')
         if deadline is None:
             self.stats['skipped_missing_deadline'] += 1
@@ -57,7 +59,9 @@ class Synchronizer:
             return False
         return True
 
-    def _values(self, record: dict, task: dict | None = None) -> dict:
+    def _values(self, record: dict[str, Any], task: dict[str, Any] | None = None) -> dict[str, Any]:
+        if self.odoo is None:
+            raise RuntimeError('Odoo client is required for field mapping')
         values = {}
         for source, (destination, meta) in self.odoo.mappings.items():
             if source in OPTIONAL_OFFICIAL_FIELDS and task and task.get(destination):
@@ -85,7 +89,7 @@ class Synchronizer:
                     step = float_step(meta)
                 value = amount_value(value, step)
             if meta['type'] == 'selection':
-                value = selection_value(meta, value, required=source not in OPTIONAL_OFFICIAL_FIELDS)
+                value = selection_value(meta, cast(str, value), required=source not in OPTIONAL_OFFICIAL_FIELDS)
                 if value is None:
                     self.stats[f'unavailable_{source}'] += 1
                     continue
@@ -93,6 +97,8 @@ class Synchronizer:
         return values
 
     def _confirmed_values(self, row, values):
+        if self.odoo is None:
+            raise RuntimeError('Odoo client is required for confirmation')
         amount = self.odoo.mappings.get('estimated_value')
         if amount and amount[1]['type'] == 'monetary':
             field = amount[1]['currency_field']
@@ -101,6 +107,8 @@ class Synchronizer:
         return not changed_values(row, values)
 
     def _create_task(self, identifier, official):
+        if self.odoo is None:
+            raise RuntimeError('Odoo client is required for task creation')
         new = {
             'project_id': self.cfg.project_id,
             'stage_id': self.cfg.stage_id,
@@ -128,6 +136,8 @@ class Synchronizer:
         return row
 
     def _update_task(self, identifier, old, changes):
+        if self.odoo is None:
+            raise RuntimeError('Odoo client is required for task update')
         amount = self.odoo.mappings.get('estimated_value')
         if amount and amount[1]['type'] == 'monetary' and amount[1]['currency_field'] in changes:
             field = amount[1]['currency_field']
@@ -145,7 +155,7 @@ class Synchronizer:
         if row is None or row['id'] != old['id'] or not self._confirmed_values(row, changes):
             raise RuntimeError('Unconfirmed task update; checkpoint withheld') from failure
 
-    def _sync_batch(self, records: dict[str, dict], progress) -> None:
+    def _sync_batch(self, records: dict[str, dict[str, Any]], progress) -> None:
         if not records:
             return
         present = self.odoo.tasks(list(records)) if self.odoo else {}
@@ -303,7 +313,10 @@ class Synchronizer:
                         self._sync_batch(records, progress)
                         completed += 1
                         progress(force=True)
-            if self.apply and day < self.cfg.today and (last_done is None or day > last_done):
+            if (
+                self.apply and self.odoo is not None and day < self.cfg.today
+                and (last_done is None or day > last_done)
+            ):
                 self.odoo.write_checkpoint(serialize_checkpoint(day))
                 last_done = day
             if day < self.cfg.today and (last_complete is None or day > last_complete):
