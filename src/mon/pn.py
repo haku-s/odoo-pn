@@ -249,9 +249,17 @@ class PNCPClient:
             if total_pages > max_pages:
                 raise RuntimeError('Page limit exceeded; state not advanced')
             if expected_pages is None:
-                expected_pages, expected_records = total_pages, total_records
+                expected_pages, expected_records = total_pages, total_records       
             elif (total_pages, total_records) != (expected_pages, expected_records):
-                raise RuntimeError('Pagination metadata changed; state not advanced')
+                raise RuntimeError(
+                    f'Pagination metadata changed: '
+                    f'kind={kind} day={day} modality={modality} '
+                    f'page={page} uf={uf or "ALL"} '
+                    f'expected_pages={expected_pages} actual_pages={total_pages} '
+                    f'expected_records={expected_records} actual_records={total_records}; '
+                    'state not advanced'
+                )
+
             received += len(records)
             if expected_records is not None and (
                 received > expected_records or (page == total_pages and received != expected_records)
