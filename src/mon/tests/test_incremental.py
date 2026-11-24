@@ -120,6 +120,33 @@ class IncrementalTests(unittest.TestCase):
         self.assertEqual(len(self.db.created), 4)
         self.assertEqual(self.db.checkpoints, [serialize_checkpoint(DAY)])
 
+    def test_pagination_drift_retries_overlap_without_skipping_unfinished_days(self):
+        self.config.page_size = 2
+        self.config.max_days = 3
+        self.config.overlap_days = 2
+        completed = DAY + timedelta(days=1)
+        first = FakeResponse(data=page(THREE[:2], 2, 4))
+        second = FakeResponse(data=page(THREE[2:], 2, 3))
+        stable_first = FakeResponse(data=page(THREE[:2], 2, 3))
+        empty = FakeResponse(204)
+
+        for stable in (True, False):
+            with self.subTest(stable=stable):
+                self.db = FakeOdoo()
+                self.db.checkpoints.append(serialize_checkpoint(completed))
+                source = self.source(first, second, stable_first if stable else first, second,
+                                     empty, empty, empty, empty, empty)
+                if stable:
+                    self.run_sync(source)
+                    self.assertEqual(len(self.db.created), 3)
+                    self.assertEqual(parse_checkpoint(self.db.checkpoints[-1]), completed + timedelta(days=1))
+                else:
+                    with self.assertRaisesRegex(RuntimeError, 'Pagination metadata changed'):
+                        self.run_sync(source)
+                    self.assertEqual(self.db.checkpoints, [serialize_checkpoint(completed)])
+                    self.assertEqual(len(self.db.created), 2)
+                self.assertEqual([params['pagina'] for _, params in source.session.requests[:4]], [1, 2, 1, 2])
+
     def test_second_invalid_identifier_blocks_entire_page(self):
         invalid = {**RECORD, 'sequencialCompra': 456}
         with self.assertRaisesRegex(ValueError, 'identity'):
