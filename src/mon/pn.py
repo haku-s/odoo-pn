@@ -155,6 +155,10 @@ class Document:
     kind: str | None = None
 
 
+class PaginationChangedError(RuntimeError):
+    """The consultation kept changing after a complete restart."""
+
+
 class PNCPClient:
     def __init__(self, session: requests.Session | None = None):
         self.session = session if session is not None else PNCPSession()
@@ -200,6 +204,7 @@ class PNCPClient:
         expected_pages = expected_records = None
         received = 0
         identifiers = set()
+        can_restart = True
         while True:
             params['pagina'] = page
             try:
@@ -249,16 +254,23 @@ class PNCPClient:
             if total_pages > max_pages:
                 raise RuntimeError('Page limit exceeded; state not advanced')
             if expected_pages is None:
-                expected_pages, expected_records = total_pages, total_records       
+                expected_pages, expected_records = total_pages, total_records
             elif (total_pages, total_records) != (expected_pages, expected_records):
-                raise RuntimeError(
+                detail = (
                     f'Pagination metadata changed: '
                     f'kind={kind} day={day} modality={modality} '
                     f'page={page} uf={uf or "ALL"} '
                     f'expected_pages={expected_pages} actual_pages={total_pages} '
-                    f'expected_records={expected_records} actual_records={total_records}; '
-                    'state not advanced'
+                    f'expected_records={expected_records} actual_records={total_records}'
                 )
+                if not can_restart:
+                    raise PaginationChangedError(detail)
+                logging.getLogger(__name__).warning('%s; restarting query from page 1', detail)
+                can_restart = False
+                page, received = 1, 0
+                expected_pages = expected_records = None
+                identifiers.clear()
+                continue
 
             received += len(records)
             if expected_records is not None and (

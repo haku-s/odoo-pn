@@ -120,6 +120,73 @@ class IncrementalTests(unittest.TestCase):
         self.assertEqual(len(self.db.created), 4)
         self.assertEqual(self.db.checkpoints, [serialize_checkpoint(DAY)])
 
+    def test_pagination_drift_retries_overlap_without_skipping_unfinished_days(self):
+        self.config.page_size = 2
+        self.config.max_days = 3
+        self.config.overlap_days = 2
+        completed = DAY + timedelta(days=1)
+        first = FakeResponse(data=page(THREE[:2], 2, 4))
+        second = FakeResponse(data=page(THREE[2:], 2, 3))
+        stable_first = FakeResponse(data=page(THREE[:2], 2, 3))
+        empty = FakeResponse(204)
+
+        for stable in (True, False):
+            with self.subTest(stable=stable):
+                self.db = FakeOdoo()
+                self.db.checkpoints.append(serialize_checkpoint(completed))
+                source = self.source(first, second, stable_first if stable else first, second,
+                                     empty, empty, empty, empty, empty)
+                if stable:
+                    self.run_sync(source)
+                    self.assertEqual(len(self.db.created), 3)
+                    self.assertEqual(parse_checkpoint(self.db.checkpoints[-1]), completed + timedelta(days=1))
+                else:
+                    stats = self.run_sync(source)
+                    self.assertEqual(stats['pending_days'], 1)
+                    self.assertEqual(parse_checkpoint(self.db.checkpoints[-1]), completed)
+                    self.assertEqual(len(self.db.created), 2)
+                self.assertEqual([params['pagina'] for _, params in source.session.requests[:4]], [1, 2, 1, 2])
+
+    def test_pending_day_survives_runs_and_recovers_after_leaving_overlap(self):
+        self.config.initial_date = DAY
+        self.config.max_days = 2
+        self.config.overlap_days = 1
+        next_day = DAY + timedelta(days=1)
+        later_day = DAY + timedelta(days=2)
+        first = FakeResponse(data=page(THREE[:1], 2, 3))
+        changed = FakeResponse(data=page(THREE[1:2], 2, 2))
+        empty = FakeResponse(204)
+        later = FakeResponse(data=page(THREE[2:], 1, 1))
+        unstable = (first, changed, first, changed)
+
+        self.config.page_size = 1
+        self.config.today = later_day
+        source = self.source(*unstable, later, empty)
+        stats = self.run_sync(source)
+        self.assertEqual((stats['days'], stats['pending_days']), (1, 1))
+        self.assertEqual(source.session.requests[-1][1]['dataInicial'], next_day.strftime('%Y%m%d'))
+        self.assertEqual(set(self.db.records), {IDENTIFIER, THREE[2]['numeroControlePNCP']})
+        self.assertIsNone(parse_checkpoint(self.db.checkpoints[-1]))
+        saved = list(self.db.checkpoints)
+
+        self.config.today += timedelta(days=1)
+        source = self.source(*unstable, empty, empty)
+        self.run_sync(source, apply=False)
+        self.assertEqual(self.db.checkpoints, saved)
+        self.assertEqual(len(self.db.created), 2)
+
+        source = self.source(*unstable, empty, empty)
+        self.run_sync(source)
+        self.assertEqual([params['dataInicial'] for _, params in source.session.requests],
+                         [DAY.strftime('%Y%m%d')] * 4 + [later_day.strftime('%Y%m%d')] * 2)
+        self.assertIsNone(parse_checkpoint(self.db.checkpoints[-1]))
+
+        stable = FakeResponse(data=page(THREE[:1], 2, 2))
+        stats = self.run_sync(self.source(stable, changed, empty, empty, empty))
+        self.assertEqual(stats.get('pending_days', 0), 0)
+        self.assertEqual(len(self.db.created), 3)
+        self.assertEqual(self.db.checkpoints[-1], serialize_checkpoint(later_day))
+
     def test_second_invalid_identifier_blocks_entire_page(self):
         invalid = {**RECORD, 'sequencialCompra': 456}
         with self.assertRaisesRegex(ValueError, 'identity'):

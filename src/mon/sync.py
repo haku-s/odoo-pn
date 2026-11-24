@@ -9,11 +9,12 @@ import sys
 from time import monotonic
 from typing import Any, cast
 
-from .checkpoint import days_to_process, parse_checkpoint, serialize_checkpoint
+from .checkpoint import Checkpoint
 from .config import NOTICE_FIELDS, OPTIONAL_OFFICIAL_FIELDS
 from .documents import attach, download, pending_documents, read_notice
 from .normalizer import normalize
 from .odoo import TASK, amount_value, float_step, relation_id, selection_value
+from .pn import PaginationChangedError
 from .relevance import fold, is_relevant
 
 MIN_PROPOSAL_WINDOW = timedelta(days=7)
@@ -231,9 +232,62 @@ class Synchronizer:
                     else:
                         self.stats['documents_present'] += 1
 
+    def _sync_day(self, day, started, last_complete):
+        updated_identifiers = set()
+        # Apply the preferred update snapshot first so replay cannot overwrite it with publication data.
+        for kind in ('atualizacao', 'publicacao'):
+            for modality in self.filters.modalities:
+                server_uf = self.filters.ufs[0] if len(self.filters.ufs) == 1 else None
+                completed = 0
+
+                # This callback is consumed synchronously within this iteration.
+                # Keep live counters instead of freezing them in defaults.
+                def progress(force=False):
+                    now = monotonic()
+                    if force or now >= self.next_progress:
+                        print(
+                            f'Progress day={day} query={kind} modality={modality} '  # noqa: B023
+                            f'pages_completed={completed} received={self.stats["seen"]} '  # noqa: B023
+                            f'relevant={self.stats["matched"]} '
+                            f'skipped_expired={self.stats["skipped_expired"]} '
+                            f'skipped_short_deadline={self.stats["skipped_short_deadline"]} '
+                            f'skipped_missing_deadline={self.stats["skipped_missing_deadline"]} '
+                            f'tasks_created={self.stats["created"]} tasks_updated={self.stats["updated"]} '
+                            f'attachments_uploaded={self.stats["documents_uploaded"]} '
+                            f'attachments_present={self.stats["documents_present"]} '
+                            f'elapsed_seconds={now - started:.0f} last_complete_day={last_complete}',  # noqa: B023
+                            file=sys.stderr, flush=True,
+                        )
+                        self.next_progress = now + 30
+
+                progress(force=True)
+                for page in self.pncp.list_day_pages(
+                    kind, day, modality, self.cfg.page_size, self.cfg.max_pages,
+                    uf=server_uf,
+                ):
+                    records = {}
+                    self.stats['seen'] += len(page)
+                    for item in page:
+                        if not is_relevant(item, self.filters):
+                            self.stats['filtered'] += 1
+                            continue
+                        record = normalize(item)
+                        identifier = record['pncp_id']
+                        if kind == 'atualizacao':
+                            updated_identifiers.add(identifier)
+                        elif identifier in updated_identifiers:
+                            continue
+                        if not self._has_minimum_proposal_window(record):
+                            continue
+                        self.stats['matched'] += 1
+                        records[identifier] = record
+                    self._sync_batch(records, progress)
+                    completed += 1
+                    progress(force=True)
+
     def run(self):
         started = self.next_progress = monotonic()
-        last_done = None
+        checkpoint = Checkpoint()
         if self.apply and self.odoo is None:
             raise ValueError('Odoo client is required for apply mode')
         if self.odoo:
@@ -247,9 +301,7 @@ class Synchronizer:
                     'ODOO_ALLOW_UNLINKED_TASKS.'
                 )
             if self.cfg.checkpoint_field:
-                last_done = parse_checkpoint(project[self.cfg.checkpoint_field])
-            if last_done and last_done > self.cfg.today:
-                raise ValueError('Stored checkpoint exceeds the current date')
+                checkpoint = Checkpoint.load(project[self.cfg.checkpoint_field])
 
         if not self.apply:
             self.stats.update({
@@ -257,71 +309,29 @@ class Synchronizer:
                 **({'requires_create': 0, 'requires_update': 0} if self.odoo
                    else {'updates_unverified': 0}),
             })
-        last_complete = last_done
-        for day in days_to_process(
-            self.cfg.initial_date, last_done, self.cfg.today,
-            self.cfg.overlap_days, self.cfg.max_days,
+        for day in checkpoint.planned_days(
+            self.cfg.initial_date, self.cfg.today, self.cfg.overlap_days, self.cfg.max_days,
         ):
-            updated_identifiers = set()
-            # Apply the preferred update snapshot first so replay cannot overwrite it with publication data.
-            for kind in ('atualizacao', 'publicacao'):
-                for modality in self.filters.modalities:
-                    server_uf = self.filters.ufs[0] if len(self.filters.ufs) == 1 else None
-                    completed = 0
+            deferred = False
+            try:
+                self._sync_day(day, started, checkpoint.last_complete_day)
+            except PaginationChangedError as exc:
+                deferred = True
+                self.stats['days_deferred'] += 1
+                print(f'Batch {day.isoformat()}: deferred for automatic retry; {exc}',
+                      file=sys.stderr, flush=True)
 
-                    # This callback is consumed synchronously within this iteration.
-                    # Keep live counters instead of freezing them in defaults.
-                    def progress(force=False):
-                        now = monotonic()
-                        if force or now >= self.next_progress:
-                            print(
-                                f'Progress day={day} query={kind} modality={modality} '  # noqa: B023
-                                f'pages_completed={completed} received={self.stats["seen"]} '  # noqa: B023
-                                f'relevant={self.stats["matched"]} '
-                                f'skipped_expired={self.stats["skipped_expired"]} '
-                                f'skipped_short_deadline={self.stats["skipped_short_deadline"]} '
-                                f'skipped_missing_deadline={self.stats["skipped_missing_deadline"]} '
-                                f'tasks_created={self.stats["created"]} tasks_updated={self.stats["updated"]} '
-                                f'attachments_uploaded={self.stats["documents_uploaded"]} '
-                                f'attachments_present={self.stats["documents_present"]} '
-                                f'elapsed_seconds={now - started:.0f} last_complete_day={last_complete}',  # noqa: B023
-                                file=sys.stderr, flush=True,
-                            )
-                            self.next_progress = now + 30
+            if day < self.cfg.today:
+                updated = checkpoint.record(day, deferred=deferred)
+                if self.apply and self.odoo is not None and updated != checkpoint:
+                    self.odoo.write_checkpoint(updated.serialize())
+                checkpoint = updated
 
-                    progress(force=True)
-                    for page in self.pncp.list_day_pages(
-                        kind, day, modality, self.cfg.page_size, self.cfg.max_pages,
-                        uf=server_uf,
-                    ):
-                        records = {}
-                        self.stats['seen'] += len(page)
-                        for item in page:
-                            if not is_relevant(item, self.filters):
-                                self.stats['filtered'] += 1
-                                continue
-                            record = normalize(item)
-                            identifier = record['pncp_id']
-                            if kind == 'atualizacao':
-                                updated_identifiers.add(identifier)
-                            elif identifier in updated_identifiers:
-                                continue
-                            if not self._has_minimum_proposal_window(record):
-                                continue
-                            self.stats['matched'] += 1
-                            records[identifier] = record
-                        self._sync_batch(records, progress)
-                        completed += 1
-                        progress(force=True)
-            if (
-                self.apply and self.odoo is not None and day < self.cfg.today
-                and (last_done is None or day > last_done)
-            ):
-                self.odoo.write_checkpoint(serialize_checkpoint(day))
-                last_done = day
-            if day < self.cfg.today and (last_complete is None or day > last_complete):
-                last_complete = day
-            self.stats['days'] += 1
-            print(f'Batch {day.isoformat()}: completed, mode={"apply" if self.apply else "preview"}, '
-                  f'last_complete_day={last_complete}', flush=True)
+            if not deferred:
+                self.stats['days'] += 1
+                print(f'Batch {day.isoformat()}: completed, mode={"apply" if self.apply else "preview"}, '
+                      f'last_complete_day={checkpoint.last_complete_day}, '
+                      f'scanned_through={checkpoint.scanned_through}', flush=True)
+
+        self.stats['pending_days'] = len(checkpoint.pending)
         return dict(self.stats)
