@@ -155,6 +155,10 @@ class Document:
     kind: str | None = None
 
 
+class PaginationChangedError(RuntimeError):
+    """The consultation kept changing after a complete restart."""
+
+
 class PNCPClient:
     def __init__(self, session: requests.Session | None = None):
         self.session = session if session is not None else PNCPSession()
@@ -260,7 +264,7 @@ class PNCPClient:
                     f'expected_records={expected_records} actual_records={total_records}'
                 )
                 if not can_restart:
-                    raise RuntimeError(f'{detail}; state not advanced')
+                    raise PaginationChangedError(detail)
                 logging.getLogger(__name__).warning('%s; restarting query from page 1', detail)
                 can_restart = False
                 page, received = 1, 0
