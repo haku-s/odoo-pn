@@ -631,6 +631,11 @@ FAPERJ = 'https://www.faperj.br/?id=28.5.7'
 TECNOVA_PE = 'https://tecnova.pe.gov.br/'
 SENAI = ('https://www.portaldaindustria.com.br/canais/plataforma-inovacao-para-industria/'
          'categoria/chamada-regional-senai/')
+SENAI_REGULATION = ('https://static.portaldaindustria.com.br/media/filer_public/cb/b8/'
+                    'cbb8dabd-b7cd-4bab-868e-406ebbc50d70/'
+                    'plataforma_inovacao_2026_30032026_-_atualizacao_03112026.pdf')
+CENTELHA_SP_RULES = ('https://fapesp.br/18109/'
+                     'programa-nacional-de-apoio-a-geracao-de-empreendimentos-inovadores-programa-centelha-3-sao-paulo')
 PPSUS = 'https://www.gov.br/saude/pt-br/composicao/sectics/ppsus'
 RHAE = 'https://www.gov.br/cnpq/pt-br/acesso-a-informacao/acoes-e-programas/programas/rhae'
 
@@ -711,6 +716,32 @@ def _tecnova(today: date, tracked: set[str]) -> tuple[list[Opportunity], dict[st
 
 
 def _centelha(today: date, tracked: set[str], *, state: str) -> tuple[list[Opportunity], dict[str, Any]]:
+    if state == 'sp':
+        content = _html(CENTELHA_SP_RULES).first('.page-body')
+        if content is None:
+            raise ValueError('Centelha SP regulation not recognized')
+        lines = list(_lines(content))
+        phase = next((line for line in lines if fold(line).startswith('fase 1. submissao das ideias')
+                      and len(_dates(line)) == 2), '')
+        if not phase:
+            raise ValueError('Centelha SP first-stage schedule not recognized')
+        item = Opportunity('centelha:sp:2026', 'FAPESP', 'Programa Centelha 3 — São Paulo', 'subsidy',
+                           CENTELHA_SP_RULES)
+        start, deadline = _dates(phase)
+        item.record('official_identifier', '18109', CENTELHA_SP_RULES, 'Regulation')
+        item.record('program', 'Centelha', CENTELHA_SP_RULES, 'Regulation')
+        item.record('applications_start', start.isoformat(), CENTELHA_SP_RULES, 'Cronograma / Fase 1')
+        item.record('deadline', deadline.isoformat(), CENTELHA_SP_RULES, 'Cronograma / Fase 1')
+        item.record('schedule', phase, CENTELHA_SP_RULES, 'Cronograma / Fase 1')
+        for key, marker in (('global_amount', '2.1.'), ('max_per_proposal', '2.2.')):
+            evidence = next((line for line in lines if line.startswith(marker) and 'R$' in line), '')
+            amount = re.search(r'R\$\s*[\d.]+,\d{2}', evidence)
+            if amount:
+                item.record(key, amount[0], CENTELHA_SP_RULES, f'Regulation / {marker}')
+                item.record('currency', 'BRL', CENTELHA_SP_RULES, f'Regulation / {marker}')
+        _documents(item, content)
+        _status(item, today)
+        return [item], {'pages': 1, 'scope': 'state regulation and schedule'}
     url = f'https://programacentelha.com.br/{state}/'
     document = _html(url)
     launch = [(link, a.text()) for a in document.select('a')
@@ -745,6 +776,23 @@ def _programme(today: date, tracked: set[str], *, code: str, title: str, institu
     return [item], {'pages': 1, 'scope': 'programme rules only'}
 
 
+def _senai(today: date, tracked: set[str]) -> tuple[list[Opportunity], dict[str, Any]]:
+    item = Opportunity('senai:platform:2026', 'SENAI', 'Plataforma Inovação para a Indústria — 2026',
+                       'unverified', SENAI)
+    _pdf(item, SENAI_REGULATION)
+    if item.issues or SENAI_REGULATION not in item.documents:
+        raise ValueError('SENAI official regulation could not be verified')
+    item.record('program', item.title, SENAI_REGULATION, 'Regulamento geral e categorias', 1)
+    try:
+        rows = list(_lines(_html(SENAI)))
+        terms = next((line for line in rows if 'departamento regional e responsavel pela chamada regional' in
+                      fold(line)), None)
+        item.record('programme_rules', terms, SENAI, 'Chamada Regional SENAI')
+    except (ValueError, RuntimeError):
+        item.issues.append('regional_listing_unavailable')
+    return [item], {'pages': 1, 'scope': '2026 programme regulation only'}
+
+
 FUNDING_ADAPTERS: dict[str, tuple[str, Callable[..., tuple[list[Opportunity], dict[str, Any]]]]] = {
     'finep_mcti_fndct': (FINEP_API, _finep),
     'finep_inovacred': (INOVACRED, _credit),
@@ -759,7 +807,7 @@ FUNDING_ADAPTERS: dict[str, tuple[str, Callable[..., tuple[list[Opportunity], di
     'fiocruz_inova': (INOVA, _fiocruz),
     'faperj': (FAPERJ, _faperj),
     'tecnova_pe': (TECNOVA_PE, _tecnova),
-    'centelha_sp': ('https://programacentelha.com.br/sp/', partial(_centelha, state='sp')),
+    'centelha_sp': (CENTELHA_SP_RULES, partial(_centelha, state='sp')),
     'centelha_rj': ('https://programacentelha.com.br/rj/', partial(_centelha, state='rj')),
     'cnpq_rhae': (RHAE, partial(_programme, code='cnpq:rhae', title='RHAE', institution='CNPq', url=RHAE,
                                 marker='programa de formacao de recursos humanos em areas estrategicas',
@@ -767,10 +815,7 @@ FUNDING_ADAPTERS: dict[str, tuple[str, Callable[..., tuple[list[Opportunity], di
     'decit_ppsus': (PPSUS, partial(_programme, code='decit:ppsus', title='Programa Pesquisa para o SUS',
                                  institution='Ministério da Saúde / DECIT', url=PPSUS,
                                  marker='programa pesquisa para o sus', modality='research_grant')),
-    'senai_regional': (SENAI, partial(_programme, code='senai:regional', title='Plataforma Inovação para a Indústria',
-                                     institution='SENAI', url=SENAI,
-                                     marker='departamento regional e responsavel pela chamada regional',
-                                     modality='unverified')),
+    'senai_regional': (SENAI, _senai),
 }
 
 
