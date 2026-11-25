@@ -7,6 +7,7 @@ import argparse
 import json
 import logging
 import sys
+from datetime import date
 
 import requests
 
@@ -35,7 +36,7 @@ def _todas_as_fontes_falharam(stats: dict[str, int]) -> bool:
     synchronisation finished successfully; a download that later fails is not
     a completed source.
     """
-    concluidas = stats.get('fontes_concluidas', 0)
+    concluidas = stats.get('fontes_concluidas', 0) + stats.get('fontes_parciais', 0)
     falhas = stats.get('fontes_com_erro', 0)
     tentadas = concluidas + falhas
     return tentadas > 0 and concluidas == 0 and falhas > 0
@@ -51,9 +52,16 @@ def main(argv=None) -> int:
     parser.add_argument('--after-id', type=int, default=0, help='Resume image backfill after this record ID')
     parser.add_argument('--summary-only', action='store_true', help='Omit instance details from output')
     parser.add_argument('--preview-source', help='Test one registered source without changing its status')
+    parser.add_argument('--from-date', type=date.fromisoformat, help='First news replay date (YYYY-MM-DD, Brasília)')
+    parser.add_argument('--through-date', type=date.fromisoformat, help='Last news replay date (YYYY-MM-DD, inclusive)')
     args = parser.parse_args(argv)
     if args.preview_source and args.command != 'preview':
         parser.error('--preview-source requires preview mode')
+    period = None
+    if args.from_date or args.through_date:
+        if not args.from_date or not args.through_date or args.command not in ('preview', 'apply'):
+            parser.error('Both replay dates are required in preview or apply mode')
+        period = (args.from_date, args.through_date)
     stage = 'settings'
     try:
         cfg = Settings.from_env()
@@ -114,15 +122,20 @@ def main(argv=None) -> int:
             cfg, odoo, _session(cfg), apply=(args.command == 'apply'),
             show_classification_details=not args.summary_only,
         )
-        stats = synchronizer.run(preview_source=args.preview_source)
-        output: dict[str, object] = {'mode': args.command, 'counts': stats}
-        if not args.summary_only:
-            output['sources'] = synchronizer.source_audit
+        stats = synchronizer.run(preview_source=args.preview_source, period=period)
+        fatal = _todas_as_fontes_falharam(stats) or stats.get('status_erros', 0) > 0
+        targeted = stats.get('fontes_concluidas', 0) + stats.get('fontes_parciais', 0)
+        partial = any(stats.get(key, 0) for key in ('fontes_com_erro', 'fontes_parciais', 'fontes_nao_implementadas'))
+        status = 'failed' if fatal or (args.preview_source and targeted != 1) else 'partial' if partial else 'success'
+        output: dict[str, object] = {
+            'mode': args.command, 'status': status, 'counts': stats, 'sources': synchronizer.source_audit,
+            'source_states': synchronizer.source_states, 'source_errors': synchronizer.source_errors,
+        }
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
-        if args.preview_source and stats.get('fontes_concluidas') != 1:
+        if args.preview_source and targeted != 1:
             print('Requested source did not complete the preview', file=sys.stderr)
             return 1
-        if _todas_as_fontes_falharam(stats) or stats.get('status_erros', 0) > 0:
+        if fatal:
             print('Every attempted source failed or the status update failed', file=sys.stderr)
             return 1
         return 0

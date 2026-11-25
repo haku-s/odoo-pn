@@ -1,6 +1,7 @@
 """Feed parsing and publisher-specific image references."""
 
 from datetime import UTC, datetime, timedelta
+from collections import Counter
 from zoneinfo import ZoneInfo
 from unittest import TestCase
 from unittest.mock import patch
@@ -29,6 +30,26 @@ def collect(data, url=URL):
 
 
 class SharedFeedTest(TestCase):
+    def test_invalid_entry_does_not_hide_a_valid_entry_and_audits_capacity(self):
+        body = rss().replace(b'<item>', b'<item><title>Broken</title></item><item>', 1)
+        body = body.replace(b'<channel>', b'<channel><atom:link xmlns:atom="http://www.w3.org/2005/Atom" rel="next" href="https://127.0.0.1/page"/>', 1)
+        audit = Counter()
+        with patch.object(sources, 'read_public', return_value=(body, URL)) as read:
+            items = sources.collect_feed(URL, SINCE, 20, (2, 3), audit=audit)
+        self.assertEqual([item.identificador for item in items], ['one'])
+        self.assertEqual((audit['raw_entries'], audit['valid_items'], audit['invalid_items'],
+                          audit['feed_next_unavailable']), (2, 1, 1, 1))
+        read.assert_called_once()
+
+    def test_feed_retries_one_transient_error_and_marks_an_unverified_window(self):
+        audit = Counter()
+        with (patch.object(sources, 'read_public', side_effect=[network.status_error(503, None), (rss(), URL)]) as read,
+              patch.object(sources, 'sleep') as wait):
+            items = sources.collect_feed(URL, SINCE, 20, (2, 3), audit=audit)
+        self.assertEqual((len(items), read.call_count, audit['request_retries'], audit['feed_window_unverified']),
+                         (1, 2, 1, 1))
+        wait.assert_called_once_with(1)
+
     def test_rss_no_image(self):
         item, = collect(rss())
         self.assertEqual((item.identificador, item.url, item.resumo), ('one', ARTICLE, 'Summary'))

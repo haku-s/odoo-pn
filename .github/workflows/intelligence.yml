@@ -23,6 +23,12 @@ on:
       preview_source:
         description: 'Optional source code to test in preview, including a disabled source'
         type: string
+      from_date:
+        description: 'First news replay date in Brasília (YYYY-MM-DD)'
+        type: string
+      through_date:
+        description: 'Last news replay date in Brasília, inclusive (YYYY-MM-DD)'
+        type: string
       image_limit:
         description: 'Maximum records per image backfill (1 to 500)'
         type: number
@@ -67,6 +73,8 @@ jobs:
           PYTHONPATH: src
           MODE: ${{ github.event_name == 'schedule' && 'apply' || inputs.mode }}
           PREVIEW_SOURCE: ${{ inputs.preview_source }}
+          FROM_DATE: ${{ inputs.from_date }}
+          THROUGH_DATE: ${{ inputs.through_date }}
           IMAGE_LIMIT: ${{ inputs.image_limit }}
           IMAGE_AFTER_ID: ${{ inputs.image_after_id }}
           INTEL_AVATAR_FIELD: ${{ secrets.INTEL_AVATAR_FIELD }}
@@ -76,6 +84,9 @@ jobs:
           args=("$MODE" --summary-only)
           if [[ -n "$PREVIEW_SOURCE" ]]; then
             args+=(--preview-source "$PREVIEW_SOURCE")
+          fi
+          if [[ -n "$FROM_DATE" || -n "$THROUGH_DATE" ]]; then
+            args+=(--from-date "$FROM_DATE" --through-date "$THROUGH_DATE")
           fi
           if [[ "$MODE" == images-* ]]; then
             args+=(--limit "$IMAGE_LIMIT" --after-id "$IMAGE_AFTER_ID")
