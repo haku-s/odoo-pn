@@ -1219,7 +1219,7 @@ def coletar_cgu(
     for code in codes:
         for path, date_key, label, kind, query_start, query_end in (
             ('licitacoes', 'dataPublicacao', 'Licitação', 'Ato oficial',
-             tender_start, reference_end + timedelta(days=60)),
+             tender_start, reference_end),
             ('contratos', 'dataPublicacaoDOU', 'Contrato', 'Contrato público',
              contract_start, reference_end + timedelta(days=300)),
         ):
@@ -1266,6 +1266,8 @@ def coletar_cgu(
                         audit['invalid_dates'] += 1
                         continue
                     audit['valid_items'] += 1
+                    latest_key = f'cgu_{path}_latest_publication_yyyymmdd'
+                    audit[latest_key] = max(audit[latest_key], int(published[:10].replace('-', '')))
                     if not _date_in_window(published, start, end):
                         audit['outside_window'] += 1
                         continue
