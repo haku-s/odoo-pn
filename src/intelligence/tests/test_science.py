@@ -46,6 +46,23 @@ class ScienceTests(unittest.TestCase):
         self.assertEqual(rows[0]['kind'], 'observational_study')
         self.assertEqual(stats['missing_records'], 1)
 
+    def test_pubmed_overflow_splits_calendar_without_fetching_parent(self):
+        def search(count, ids):
+            return json.dumps({'esearchresult': {'count': str(count), 'retstart': '0',
+                                                'idlist': ids}}).encode()
+
+        first = b'<PubmedArticleSet><PubmedArticle><MedlineCitation><PMID>123</PMID><Article><ArticleTitle>Sample</ArticleTitle></Article></MedlineCitation></PubmedArticle></PubmedArticleSet>'
+        query = Search('sample', 'psychometrics[MeSH Terms]', ('psychometric',), ())
+        with patch('intelligence.science.read', side_effect=[
+            search(151, ['123']), search(1, ['123']), first, search(0, []),
+        ]) as fetch:
+            stats = Counter()
+            rows = list(pubmed(query, date(2026, 11, 1), date(2026, 11, 2), stats))
+        self.assertEqual([row['pmid'] for row in rows], ['123'])
+        self.assertEqual(stats['window_splits'], 1)
+        self.assertEqual(stats['page_caps'], 0)
+        self.assertIn('2026/11/02:2026/11/02', fetch.call_args.args[1]['term'])
+
     def test_xml_rejects_custom_dtd_and_unknown_root(self):
         with self.assertRaises(ValueError):
             xml_records(b'<!DOCTYPE PubmedArticleSet [<!ENTITY x "abc">]><PubmedArticleSet/>')
@@ -181,3 +198,44 @@ class ScienceTests(unittest.TestCase):
             self.assertNotIn('x_example', stdout.getvalue())
             self.assertNotIn('Sample', stdout.getvalue())
             self.assertEqual([call[0] for call in odoo.method_calls], ['assuntos', 'fields', 'selection'])
+
+    def test_science_persistence_merges_identifiers_and_keeps_notices_on_lost_response(self):
+        from intelligence.config import Settings
+        from intelligence.odoo import OdooClient, SCIENCE_TYPE
+        from intelligence.science_odoo import ScienceStore, scientific_values
+
+        primary = {'pmid': '12', 'title': 'Test', 'kind': 'article', 'url': 'https://pubmed.ncbi.nlm.nih.gov/12/',
+                   'dates': {'published': '2019-03', 'pubmed_created': '2026-11-01'},
+                   'notices': [{'type': 'ErratumIn', 'pmid': '13'}]}
+        updated = primary | {'doi': '10.9999/example'}
+        old = scientific_values({'pubmed': primary})
+        new = scientific_values({'pubmed': updated})
+        previous = old | {'id': 20, 'x_studio_identificador_externo': 'science:test'}
+        confirmed = new | {'id': 20, 'x_studio_identificador_externo': 'science:test'}
+        client = OdooClient(Settings('https://odoo.example', '', 'key', 50, 3, (1, 1)))
+        store = ScienceStore(client)
+        store.source_id = 7
+        with patch.object(client, 'call', side_effect=[[previous], RuntimeError('response lost'), [confirmed]]) as call:
+            self.assertEqual(store.put({'observations': {'pubmed': updated}}), 'updated')
+        fields = call.call_args_list[1].kwargs['vals']
+        self.assertEqual(fields['x_science_doi'], '10.9999/example')
+        self.assertEqual(new['x_science_published'], '2019-03')
+        self.assertEqual(new['x_science_indexed'], '2026-11-01')
+        self.assertIn('ErratumIn', new['x_science_links'])
+        self.assertNotIn('x_studio_resumo', fields)
+        self.assertIn(['x_studio_tipo_de_publicacao', '=', SCIENCE_TYPE], call.call_args.kwargs['domain'])
+
+    def test_science_refuses_to_merge_two_persisted_rows_automatically(self):
+        from intelligence.config import Settings
+        from intelligence.odoo import OdooClient
+        from intelligence.science_odoo import ScienceStore, scientific_values
+
+        metadata = {'title': 'Sample', 'url': 'https://doi.org/10.9999/example', 'kind': 'article', 'dates': {}}
+        a = metadata | {'doi': '10.9999/example'}
+        b = metadata | {'pmid': '2'}
+        store = ScienceStore(OdooClient(Settings('https://odoo.example', '', 'key', 50, 3, (1, 1))))
+        existing = [scientific_values({'crossref': a}) | {'id': 3}, scientific_values({'pubmed': b}) | {'id': 4}]
+        with patch.object(store.client, 'call', return_value=existing) as call:
+            with self.assertRaisesRegex(ValueError, 'identities require manual reconciliation'):
+                store.put({'observations': {'pubmed': a | b}})
+        self.assertEqual(call.call_count, 1)

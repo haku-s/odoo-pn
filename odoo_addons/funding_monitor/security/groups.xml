@@ -1,8 +1,0 @@
-<odoo>
-    <record id="group_collector" model="res.groups">
-        <field name="name">Funding Monitor Collector</field>
-    </record>
-    <record id="group_editor" model="res.groups">
-        <field name="name">Funding Monitor Editor</field>
-    </record>
-</odoo>
