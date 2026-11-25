@@ -103,6 +103,7 @@ DIAGNOSTIC_CHANNELS = {
     **FEED_CHANNELS, **{code: listing.url for code, listing in HTML_CHANNELS.items()}, **NEWS_APIS,
     'agencia_brasil': f'https://{EBC_HOST}/rss/ultimasnoticias/feed.xml',
     'fiocruz': FIOCRUZ_FEED,
+    'ministerio_saude': HEALTH_FEED,
     'camara_educacao': 'https://www.camara.leg.br/noticias/rss/dinamico/EDUCACAO',
     'camara_saude': 'https://www.camara.leg.br/noticias/rss/dinamico/SAUDE',
     'camara_trabalho': 'https://www.camara.leg.br/noticias/rss/dinamico/TRABALHO',
@@ -498,8 +499,13 @@ def collect_feed(
                     break
         if link and url in (HEALTH_RSS, HEALTH_FEED) and not urlsplit(link).path.startswith('/saude/pt-br/'):
             link = None
-        if link and url == FEED_CHANNELS['senado_noticias'] and not urlsplit(link).path.startswith('/noticias/materias/'):
-            link = None
+        if link and url == FEED_CHANNELS['senado_noticias']:
+            path = urlsplit(link).path
+            if path.startswith('/noticias/audios/'):
+                counts['non_news_entries'] += 1
+                continue
+            if not path.startswith('/noticias/materias/'):
+                link = None
         if not link and address and url == FEED_CHANNELS['uol_noticias']:
             counts['syndicated_entries'] += 1
             continue

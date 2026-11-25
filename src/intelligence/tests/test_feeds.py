@@ -97,6 +97,14 @@ class SharedFeedTest(TestCase):
         self.assertEqual(audit['archive_window_unverified'], 1)
         read.assert_called_once()
 
+    def test_senate_news_feed_counts_radio_entries_separately(self):
+        url = sources.FEED_CHANNELS['senado_noticias']
+        body = rss(link='https://www12.senado.leg.br/noticias/audios/2026/11/radio')
+        audit = Counter()
+        with patch.object(sources, 'read_public', return_value=(body, url)):
+            self.assertEqual(sources.collect_feed(url, SINCE, 20, (2, 3), audit=audit), [])
+        self.assertEqual((audit['raw_entries'], audit['non_news_entries'], audit['invalid_items']), (1, 1, 0))
+
     def test_news_api_reconstructs_pagination_from_the_approved_route(self):
         url = sources.SENAI_API
         rows = [
