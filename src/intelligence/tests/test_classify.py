@@ -102,6 +102,39 @@ class ClassifyTest(unittest.TestCase):
         resultado = classificar('desaprendizagem', '', [assunto(1, 'A', 'aprendizagem')])
         self.assertTrue(resultado.sem_correspondencia)
 
+    def test_dash_and_spacing_variants_preserve_one_match(self):
+        result = classificar('Measures for rule AB‑1', 'The rule is AB   1.',
+                             [assunto(1, 'A', 'AB-1\nAB 1')])
+        self.assertEqual((result.assunto_id, result.pontuacao), (1, 1))
+
+    def test_phrase_cannot_span_fields_or_sentence_boundary(self):
+        for title, summary in (('Community health', 'Services were audited.'),
+                               ('Community health. Services were audited.', '')):
+            with self.subTest(title=title, summary=summary):
+                result = classificar(title, summary, [assunto(1, 'A', 'health services')])
+                self.assertTrue(result.sem_correspondencia)
+
+    def test_nested_evidence_favors_specific_match_but_keeps_independent_ties(self):
+        subjects = [assunto(1, 'A', 'learning'), assunto(2, 'B', 'learning assessment')]
+        result = classificar('New learning assessment', '', subjects)
+        self.assertEqual(result.assunto_id, 2)
+        self.assertTrue(classificar('New learning assessment', 'News on learning', subjects).ambigua)
+
+    def test_exclusion_without_positive_evidence_does_not_change_rejection_reason(self):
+        subject = assunto(1, 'A', 'early learning', 'promotional campaign')
+        result = classificar('A promotional campaign', '', [subject])
+        self.assertTrue(result.sem_correspondencia)
+        excluded = classificar('Early learning', 'A promotional campaign', [subject])
+        self.assertTrue(excluded.excluido)
+        self.assertEqual(excluded.exclusion_matches, {1: ('promotional campaign',)})
+
+    def test_regular_two_word_portuguese_plural_matches_singular_without_double_scoring(self):
+        subjects = [assunto(1, 'A', 'testes específicos\nteste específico')]
+        result = classificar('Um teste específico', 'Outros testes específicos', subjects)
+        self.assertEqual((result.assunto_id, result.pontuacao), (1, 1))
+        self.assertEqual(classificar('Um teste específico', '', [assunto(1, 'A', 'testes específicos')]).assunto_id, 1)
+        self.assertTrue(classificar('Testes específico', '', [assunto(1, 'A', 'testes específicos')]).sem_correspondencia)
+
 
 class CenariosReaisTest(unittest.TestCase):
     """Regression cases using the terms registered in the live Odoo instance."""

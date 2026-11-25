@@ -8,6 +8,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from itertools import batched
 import sys
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import requests
@@ -59,7 +60,7 @@ def _mudou(antigo: dict[str, Any], valores: dict[str, Any]) -> dict[str, Any]:
 
 class Synchronizer:
     def __init__(self, cfg, odoo: OdooClient, session: requests.Session, apply: bool = False,
-                 *, show_classification_details: bool = True):
+                 *, show_classification_details: bool = True, capture_news_audit: bool = False):
         self.cfg = cfg
         self.odoo = odoo
         self.session = session
@@ -71,6 +72,8 @@ class Synchronizer:
         self.source_states: dict[str, str] = {}
         self.source_errors: dict[str, str] = {}
         self.source_registration: dict[str, str] = {}
+        self.news_rejections: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        self.capture_news_audit = capture_news_audit
         self._publishers: dict[str, list[int]] = {}
         self._seen_urls: dict[str, set[str]] = {}
         self._avatar: str | None = None
@@ -209,6 +212,21 @@ class Synchronizer:
                     result = classificar(item.titulo, item.resumo, assuntos)
                     counts['classified' if result.assunto_id is not None else 'discarded'] += 1
                     counts['images_identified'] += item.image_url is not None
+                    if not item.resumo or len(item.resumo.split()) < 12:
+                        counts['short_summary'] += 1
+                    if result.assunto_id is not None:
+                        continue
+                    reason = 'ambiguous' if result.ambigua else 'excluded' if result.excluido else 'no_subject'
+                    counts[reason] += 1
+                    if self.capture_news_audit:
+                        samples = self.news_rejections.setdefault(codigo, {}).setdefault(reason, [])
+                        if len(samples) < 3:
+                            url = urlsplit(item.url)
+                            samples.append({
+                                'url': urlunsplit((url.scheme, url.netloc, url.path, '', '')),
+                                'summary_words': len((item.resumo or '').split()),
+                                'inclusions': result.inclusion_matches, 'exclusions': result.exclusion_matches,
+                            })
             else:
                 self._sincronizar(fonte, itens, assuntos, auditoria_fonte)
         except Exception as exc:  # noqa: BLE001 - isolate the source failure

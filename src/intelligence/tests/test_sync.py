@@ -233,6 +233,24 @@ class SyncTest(unittest.TestCase):
         self.assertFalse(odoo.write_check)
         self.assertEqual((odoo.criadas, odoo.atualizadas, odoo.status, odoo.falhas), ([], [], [], []))
 
+    def test_news_rejection_audit_bounds_samples_and_omits_tracking_and_article_text(self):
+        url = 'https://jornal.usp.br/feed/'
+        rejected = Item('source-id', 'Saúde mental e alfabetização',
+                        'https://jornal.usp.br/news?token=secret', '2026-11-20 10:00:00', 'Test summary', 'Notícia')
+        odoo = FakeOdoo([], ASSUNTOS)
+        with (patch.object(sync, 'DIAGNOSTIC_CHANNELS', {'absent': url}),
+              patch.object(sync, 'coletar', return_value=[rejected] * 5)):
+            runner = sync.Synchronizer(self.cfg(), odoo, object(), capture_news_audit=True)
+            runner.run(diagnose_news=True)
+        self.assertEqual(runner.source_audit['absent']['ambiguous'], 5)
+        self.assertEqual(runner.source_audit['absent']['short_summary'], 5)
+        samples = runner.news_rejections['absent']['ambiguous']
+        self.assertEqual(len(samples), 3)
+        self.assertEqual(samples[0], {
+            'url': 'https://jornal.usp.br/news', 'summary_words': 2,
+            'inclusions': {5: ('saude mental',), 6: ('alfabetizacao',)}, 'exclusions': {},
+        })
+
     def test_archive_identity_does_not_duplicate_an_existing_feed_guid(self):
         source = fonte(1, 'fiocruz', url='https://agencia.fiocruz.br/rss.xml')
         url = 'https://agencia.fiocruz.br/article'
