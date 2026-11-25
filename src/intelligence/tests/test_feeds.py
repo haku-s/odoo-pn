@@ -267,6 +267,26 @@ class SharedFeedTest(TestCase):
         item, = collect(rss('<media:thumbnail url="https://127.0.0.1/image.jpg"/>'))
         self.assertIsNone(item.image_url)
 
+    def test_cgu_credentials_are_confined_to_the_first_approved_request(self):
+        allowed = 'https://api.portaldatransparencia.gov.br/api-de-dados/licitacoes?pagina=1'
+        other = 'https://example.org/unapproved'
+        with (
+            patch.object(network, '_public_addresses', return_value=['8.8.8.8']),
+            patch.object(network, 'HTTPSConnectionPool') as pool,
+        ):
+            response = pool.return_value.urlopen.return_value
+            response.status = 302
+            response.headers = {'Location': other}
+            with self.assertRaisesRegex(ValueError, 'CGU API redirects'):
+                network.read_public_response(allowed, allowed_urls={allowed}, max_bytes=100,
+                                             timeout=(1, 2), cgu_token='test-key')
+            pool.return_value.urlopen.assert_called_once()
+            self.assertEqual(pool.return_value.urlopen.call_args.kwargs['headers']['chave-api-dados'], 'test-key')
+            with self.assertRaises(ValueError):
+                network.read_public_response(other, allowed_urls={other}, max_bytes=100,
+                                             timeout=(1, 2), cgu_token='test-key')
+            pool.assert_called_once()
+
 
 class ExistingPhotoTest(TestCase):
     def test_ebc_extracts_signed_image_and_preserves_link_identifier(self):
