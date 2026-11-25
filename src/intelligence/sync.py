@@ -19,10 +19,12 @@ from .classify import classificar, split_terms
 from .odoo import OdooClient, OdooHTTPError, SELECTIONS, normalizar_valor
 from .network import FetchError
 from .sources import (
-    ALTERNATE_IDENTITY_URLS, COLETORES, DIAGNOSTIC_CHANNELS, NEWS_APIS, RespostaInvalida, coletar, news_publisher,
+    ALTERNATE_IDENTITY_URLS, COLETORES, DIAGNOSTIC_CHANNELS, EBC_HOST, NEWS_APIS, RespostaInvalida, coletar,
+    ebc_article_summary, news_publisher,
 )
 
 NEWS_LOOKBACK = timedelta(hours=72)
+MAX_SUMMARY_REQUESTS = 12
 BRASILIA = ZoneInfo('America/Sao_Paulo')
 INCOMPLETE_COUNTS = ('invalid_items', 'invalid_dates', 'feed_errors', 'archive_errors',
                      'feed_next_unavailable', 'pagination_incomplete',
@@ -78,6 +80,7 @@ class Synchronizer:
         self._publishers: dict[str, list[int]] = {}
         self._seen_urls: dict[str, set[str]] = {}
         self._avatar: str | None = None
+        self._summary_requests = 0
 
     @staticmethod
     def _amostra(item) -> dict[str, str]:
@@ -127,9 +130,10 @@ class Synchronizer:
             'x_studio_fontes': None,
             'x_studio_identificador_externo': item.identificador,
             'x_studio_url': item.url,
-            'x_studio_resumo': item.resumo or None,
             'x_studio_assunto_1': assunto_id or False,
         }
+        if item.resumo and item.resumo.strip():
+            valores['x_studio_resumo'] = item.resumo
         if item.tipo is not None:
             if item.tipo not in SELECTIONS['x_studio_tipo_de_publicacao']:
                 raise ValueError(f'Unsupported publication type: {item.tipo}')
@@ -348,6 +352,18 @@ class Synchronizer:
                 if publisher and other_sources:
                     seen_urls.add(item.url)
                 continue
+            if (publisher == EBC_HOST and 'x_studio_resumo' not in valores
+                    and not (atual or {}).get('x_studio_resumo') and self._summary_requests < MAX_SUMMARY_REQUESTS):
+                self._summary_requests += 1
+                counts['summary_metadata_requests'] += 1
+                try:
+                    summary = ebc_article_summary(item.url, (5, 10))
+                except (RuntimeError, ValueError):
+                    counts['summary_metadata_errors'] += 1
+                else:
+                    if summary:
+                        valores['x_studio_resumo'] = summary
+                        counts['summaries_recovered'] += 1
             if atual is None:
                 criado = self._criar(item, valores, image=image, code=code, counts=counts)
                 self.stats['criados'] += 1
@@ -470,6 +486,7 @@ class Synchronizer:
             period: tuple[date, date] | None = None, diagnose_news: bool = False) -> dict[str, Any]:
         if (preview_source or diagnose_news) and self.apply:
             raise ValueError('Testing one source is only available in preview mode')
+        self._summary_requests = 0
         now = datetime.now(BRASILIA)
         day_start = datetime.combine(now.date(), time.min, BRASILIA)
         daily_window = (day_start, day_start + timedelta(days=1))

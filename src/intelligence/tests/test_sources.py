@@ -144,6 +144,18 @@ class DateTest(unittest.TestCase):
 
 
 class AgenciaBrasilTest(unittest.TestCase):
+    def test_article_summary_uses_only_metadata_for_matching_canonical_url(self):
+        url = 'https://agenciabrasil.ebc.com.br/educacao/noticia/2026-11/example'
+        body = f'''<head><link rel="canonical" href="{url}">
+            <meta property="og:description" content="Publisher summary &amp; context">
+            </head><body>Full article body</body>'''.encode()
+        with patch.object(sources, 'read_public', return_value=(body, url)) as read:
+            self.assertEqual(sources.ebc_article_summary(url, (5, 10)), 'Publisher summary & context')
+            self.assertIsNone(sources.ebc_article_summary(url + '-other', (5, 10)))
+            with self.assertRaises(ValueError):
+                sources.ebc_article_summary('https://example.com/educacao/noticia/2026-11/a', (5, 10))
+            self.assertEqual(read.call_count, 2)
+
     def test_parse(self):
         itens = agency_feed(RSS)
         self.assertEqual(len(itens), 1)
