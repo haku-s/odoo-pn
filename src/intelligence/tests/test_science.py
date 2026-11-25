@@ -52,6 +52,15 @@ class ScienceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             xml_records(b'<html>Access denied</html>')
 
+    def test_pubmed_empty_results_do_not_count_as_search_warnings(self):
+        response = {'esearchresult': {'count': '0', 'retstart': '0', 'idlist': [],
+                                      'warninglist': {'phrasesignored': [], 'outputmessages': ['No items found.']}}}
+        search = Search('sample', 'psychometrics[MeSH Terms]', ('psychometric',), ())
+        with patch('intelligence.science.read', return_value=json.dumps(response).encode()):
+            stats = Counter()
+            self.assertEqual(list(pubmed(search, date(2026, 11, 13), date(2026, 11, 13), stats)), [])
+        self.assertEqual(stats['query_warnings'], 0)
+
     def test_partial_publication_date_retains_precision(self):
         row = pubmed_record(ET.fromstring('''<PubmedArticle><MedlineCitation><PMID>456</PMID>
 <Article><ArticleTitle>Assessment</ArticleTitle><Journal><JournalIssue><PubDate><Year>2020</Year>
