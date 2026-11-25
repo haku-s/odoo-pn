@@ -50,6 +50,19 @@ class SharedFeedTest(TestCase):
                          (1, 2, 1, 1))
         wait.assert_called_once_with(1)
 
+    def test_out_of_range_timestamp_and_malformed_optional_photo_do_not_fail_feed(self):
+        body = rss('<content:encoded><![CDATA[<div class="image-container" data-midia="1">'
+                   '<span class="midia-creditos">Author / Câmara dos Deputados</span>'
+                   '<img src="https://["></div>]]></content:encoded>').decode()
+        item = body[body.index('<item>'):body.index('</item>') + len('</item>')]
+        invalid = item.replace('Thu, 19 Nov 2026 10:00:00 GMT', '0001-01-01T00:00:00+14:00')
+        body = body.replace(item, invalid + item).encode()
+        audit = Counter()
+        with patch.object(sources, 'read_public', return_value=(body, URL)):
+            received, = sources.collect_feed(URL, SINCE, 20, (2, 3), until=SINCE + timedelta(days=30), audit=audit)
+        self.assertEqual((received.identificador, audit['invalid_dates']), ('one', 1))
+        self.assertIsNone(received.image_url)
+
     def test_rss_no_image(self):
         item, = collect(rss())
         self.assertEqual((item.identificador, item.url, item.resumo), ('one', ARTICLE, 'Summary'))

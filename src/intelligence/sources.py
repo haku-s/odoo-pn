@@ -150,9 +150,10 @@ def _data_hora(value: object) -> str | None:
                 candidato = candidato.replace(tzinfo=brt)
             else:
                 continue
-        return candidato.astimezone().astimezone(
-            __import__('datetime').timezone.utc
-        ).replace(tzinfo=None).strftime('%Y-%m-%d %H:%M:%S')
+        try:
+            return candidato.astimezone(UTC).replace(tzinfo=None).strftime('%Y-%m-%d %H:%M:%S')
+        except (OverflowError, ValueError):
+            continue
     raise RespostaInvalida('Unsupported publication date')
 
 
@@ -431,7 +432,11 @@ def collect_feed(
             continue
         photo = None
         if host == CAMARA_MEDIA_HOST:
-            photo = credited_photo(link, content or '') or credited_photo(link, summary or '')
+            try:
+                photo = credited_photo(link, content or '') or credited_photo(link, summary or '')
+            except ValueError:
+                # A malformed optional photograph URL must not discard the article.
+                pass
         items.append(Item(
             identificador=identifier, titulo=title, url=link, data_publicacao=published,
             resumo=_html_para_texto(summary if host == EBC_HOST else summary or content), tipo='Notícia',
