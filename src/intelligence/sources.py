@@ -174,6 +174,21 @@ def _html_para_texto(value: object) -> str | None:
     return texto[:4000] or None
 
 
+def ebc_article_summary(url: str, timeout: tuple[int, int]) -> str | None:
+    """Read the publisher's description when the news listing omits it."""
+    validate_url(url, {EBC_HOST})
+    if not in_article_scope(EBC_ARCHIVE, url):
+        return None
+    body, _ = read_public(url, allowed_urls={url}, max_bytes=512 * 1024, timeout=timeout)
+    document = parse_listing(body)
+    canonical = [el.attrs.get('href') for el in document.select('link') if el.attrs.get('rel') == 'canonical']
+    if canonical != [url]:
+        return None
+    descriptions = [el.attrs.get('content') for el in document.select('meta')
+                    if el.attrs.get('property') == 'og:description']
+    return _texto(descriptions[0], 400) if len(descriptions) == 1 else None
+
+
 def _data_hora(value: object) -> str | None:
     """Normalise source timestamps to UTC-naive Odoo datetimes."""
     if not isinstance(value, str) or not value.strip():

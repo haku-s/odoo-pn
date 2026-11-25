@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from intelligence import sync
 from intelligence.__main__ import _todas_as_fontes_falharam
-from intelligence.sources import Item
+from intelligence.sources import DIAGNOSTIC_CHANNELS, Item
 
 
 def registro(identificador, **extras):
@@ -305,6 +305,27 @@ class SyncTest(unittest.TestCase):
         stats = self.run_sync(odoo, [item('a', titulo='Título')], apply=True)
         self.assertEqual(odoo.atualizadas, [])
         self.assertEqual(stats['inalterados'], 1)
+
+    def test_missing_source_summary_preserves_existing_summary(self):
+        odoo = FakeOdoo([fonte(1, 'agencia_brasil')], ASSUNTOS,
+                        {(1, 'a'): registro('a', x_studio_resumo='Previous summary')})
+        stats = self.run_sync(odoo, [item('a', titulo='Título')], apply=True)
+        self.assertEqual(odoo._publicacoes[(1, 'a')]['x_studio_resumo'], 'Previous summary')
+        self.assertEqual(odoo.atualizadas, [])
+        self.assertEqual(stats['inalterados'], 1)
+
+    def test_empty_agency_summary_is_recovered_only_for_an_eligible_write(self):
+        source = {**fonte(1, 'agencia_brasil'), 'x_studio_url': DIAGNOSTIC_CHANNELS['agencia_brasil']}
+        url = 'https://agenciabrasil.ebc.com.br/educacao/noticia/2026-11/example'
+        stored = registro(url, x_studio_url=url)
+        odoo = FakeOdoo([source], ASSUNTOS, {(1, url): stored})
+        existing = Item(url, 'Título', url, '2026-11-20 10:00:00', None, 'Notícia')
+        with patch.object(sync, 'ebc_article_summary', return_value='Publisher summary') as summary:
+            self.run_sync(odoo, [existing, item('unclassified', titulo='Other')], apply=False)
+            summary.assert_not_called()
+            self.run_sync(odoo, [existing, item('unclassified', titulo='Other')], apply=True)
+            self.assertEqual(summary.call_count, 1)
+            self.assertEqual(odoo._publicacoes[(1, url)]['x_studio_resumo'], 'Publisher summary')
 
     def test_update_preserves_first_collection(self):
         odoo = FakeOdoo([fonte(1, 'agencia_brasil')], ASSUNTOS)
