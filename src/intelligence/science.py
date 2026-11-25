@@ -229,7 +229,12 @@ def pubmed(search: Search, start: date, end: date, audit: Counter[str]) -> Itera
         if not isinstance(ids, list) or len(ids) > 50 or not count.isascii() or not count.isdecimal():
             raise ValueError('Invalid PubMed pagination')
         audit['search_pages'] += 1
-        if result.get('warninglist') or result.get('errorlist'):
+        warnings = result.get('warninglist')
+        if isinstance(warnings, dict):
+            warnings = {key: values for key, values in warnings.items() if values}
+        if result.get('errorlist') or (
+            warnings and not (count == '0' and warnings == {'outputmessages': ['No items found.']})
+        ):
             audit['query_warnings'] += 1
         total = int(count)
         if offset > total or (offset < total and not ids):
