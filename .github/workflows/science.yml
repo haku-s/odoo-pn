@@ -1,0 +1,30 @@
+name: Scientific Metadata Preview
+
+on:
+  schedule:
+    - cron: '25 9 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: science-preview
+  cancel-in-progress: false
+
+jobs:
+  preview:
+    if: vars.SCIENCE_PREVIEW_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: '0.13.8'
+          python-version: '3.15.2'
+      - name: Preview scientific metadata
+        env:
+          PYTHONPATH: src
+        run: uv run --locked python -u -m intelligence science-preview --summary-only
