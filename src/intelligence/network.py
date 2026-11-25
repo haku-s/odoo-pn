@@ -61,7 +61,10 @@ def _public_addresses(host: str) -> list[str]:
     return list(dict.fromkeys(addresses))
 
 
-def _open_https(hostname: str, target: str, deadline: float, timeout: tuple[int, int]):
+def _open_https(
+    hostname: str, target: str, deadline: float, timeout: tuple[int, int], *,
+    search_form: tuple[bytes, str] | None = None,
+):
     failures = []
     for address in _public_addresses(hostname)[:4]:
         remaining = deadline - monotonic()
@@ -72,10 +75,12 @@ def _open_https(hostname: str, target: str, deadline: float, timeout: tuple[int,
             cert_reqs='CERT_REQUIRED', ca_certs=where(),
         )
         try:
+            headers = {'Host': hostname, 'Accept-Encoding': 'identity', 'User-Agent': 'odoo-data-sync/1.0'}
+            if search_form:
+                headers['Content-Type'] = search_form[1]
             response = pool.urlopen(
-                'GET', target,
-                headers={'Host': hostname, 'Accept-Encoding': 'identity',
-                         'User-Agent': 'odoo-data-sync/1.0'},
+                'POST' if search_form else 'GET', target, body=search_form[0] if search_form else None,
+                headers=headers,
                 timeout=Timeout(total=remaining, connect=timeout[0], read=timeout[1]),
                 preload_content=False, decode_content=False, retries=False, redirect=False,
             )
@@ -109,7 +114,13 @@ def read_public_response(
     url: str, *, allowed_urls: set[str] | frozenset[str] | None = None,
     allowed_hosts: set[str] | frozenset[str] | None = None, max_bytes: int,
     timeout: tuple[int, int], accepted_statuses: tuple[int, ...] = (200,),
+    search_form: tuple[bytes, str] | None = None,
 ) -> tuple[bytes, str, int]:
+    if search_form and (
+        allowed_urls != {url} or len(search_form[0]) > 16384
+        or not search_form[1].startswith('multipart/form-data; boundary=')
+    ):
+        raise ValueError('Invalid public HTTPS search request')
     if allowed_hosts is None:
         allowed_hosts = {urlsplit(value).hostname or '' for value in allowed_urls or ()}
     deadline = monotonic() + sum(timeout)
@@ -124,9 +135,14 @@ def read_public_response(
         if parts.query:
             target += '?' + parts.query
         try:
-            pool, response = _open_https(hostname, target, deadline, timeout)
+            if search_form:
+                pool, response = _open_https(hostname, target, deadline, timeout, search_form=search_form)
+            else:
+                pool, response = _open_https(hostname, target, deadline, timeout)
             try:
                 if response.status in {301, 302, 303, 307, 308}:
+                    if search_form:
+                        raise ValueError('Public HTTPS search redirects are not approved')
                     location = response.headers.get('Location')
                     if not location:
                         raise RuntimeError('Public HTTPS redirect has no destination')

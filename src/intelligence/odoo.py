@@ -17,6 +17,8 @@ FONTES = 'x_fontes'
 ASSUNTOS = 'x_assuntos'
 PUBLICACOES = 'x_publicacoes'
 MODEL_FIELD = 'ir.model.fields'
+FUNDING = 'x_oportunidade_fomento'
+FUNDING_REVISION = 'x_revisao_fomento'
 
 CONTEXT = {'lang': 'pt_BR', 'active_test': False}
 TEXT = {'char', 'text'}
@@ -75,6 +77,8 @@ OPERATIONS = {
     ASSUNTOS: {'fields_get', 'search_read', 'search_count', 'has_access'},
     PUBLICACOES: {'fields_get', 'get_view', 'search_read', 'search_count', 'create', 'write', 'has_access'},
     MODEL_FIELD: {'search_read'},
+    FUNDING: {'fields_get', 'funding_contract', 'funding_page', 'funding_head', 'funding_append'},
+    FUNDING_REVISION: {'fields_get'},
 }
 
 TECHNICAL = re.compile(r'^[a-z][a-z0-9_]*$')
@@ -228,8 +232,9 @@ class OdooClient:
 
     def fields(self, model: str) -> dict[str, Any]:
         if model not in self._metadata:
+            context = {'active_test': False} if model in (FUNDING, FUNDING_REVISION) else CONTEXT
             result = self.call(
-                model, 'fields_get', context=CONTEXT, attributes=FIELD_ATTRIBUTES,
+                model, 'fields_get', context=context, attributes=FIELD_ATTRIBUTES,
             )
             if not isinstance(result, dict) or any(
                 not isinstance(name, str) or not isinstance(meta, dict)
