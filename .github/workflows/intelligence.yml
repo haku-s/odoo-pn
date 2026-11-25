@@ -19,6 +19,7 @@ on:
           - apply
           - images-preview
           - images-apply
+          - diagnose-news
         default: preview
       preview_source:
         description: 'Optional source code to test in preview, including a disabled source'

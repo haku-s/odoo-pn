@@ -14,7 +14,7 @@ import requests
 from .config import Settings
 from .backfill import backfill
 from .odoo import OdooClient
-from .sources import EBC_HOST, rss_publisher
+from .sources import EBC_HOST, news_publisher
 from .sync import Synchronizer
 
 USER_AGENT = 'odoo-data-sync/1.0'
@@ -45,7 +45,7 @@ def _todas_as_fontes_falharam(stats: dict[str, int]) -> bool:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description='Odoo data sync')
     parser.add_argument(
-        'command', choices=['inspect', 'preview', 'apply', 'images-preview', 'images-apply'],
+        'command', choices=['inspect', 'preview', 'apply', 'images-preview', 'images-apply', 'diagnose-news'],
         nargs='?', default='preview',
     )
     parser.add_argument('--limit', type=int, default=100, help='Maximum records per image backfill')
@@ -59,8 +59,8 @@ def main(argv=None) -> int:
         parser.error('--preview-source requires preview mode')
     period = None
     if args.from_date or args.through_date:
-        if not args.from_date or not args.through_date or args.command not in ('preview', 'apply'):
-            parser.error('Both replay dates are required in preview or apply mode')
+        if not args.from_date or not args.through_date or args.command not in ('preview', 'apply', 'diagnose-news'):
+            parser.error('Both replay dates are required in preview, apply or news diagnostic mode')
         period = (args.from_date, args.through_date)
     stage = 'settings'
     try:
@@ -76,7 +76,7 @@ def main(argv=None) -> int:
                 'assuntos': len(odoo.assuntos()),
                 'new_feed_endpoints_present': len({
                     source['x_studio_url'] for source in sources
-                    if rss_publisher(source['x_studio_url']) not in (None, EBC_HOST)
+                    if news_publisher(source['x_studio_url']) not in (None, EBC_HOST)
                 }),
                 'avatar': {
                     key: avatar[key]
@@ -97,7 +97,7 @@ def main(argv=None) -> int:
                             'active': source['x_active'],
                             'enabled': source['x_studio_coleta_habilitada'],
                             'method': source['x_studio_metodo_de_coleta'],
-                            'approved_feed': url if rss_publisher(url) else None,
+                            'approved_feed': url if news_publisher(url) else None,
                         }
                         for source in sources
                         for url in [source['x_studio_url']]
@@ -122,7 +122,11 @@ def main(argv=None) -> int:
             cfg, odoo, _session(cfg), apply=(args.command == 'apply'),
             show_classification_details=not args.summary_only,
         )
-        stats = synchronizer.run(preview_source=args.preview_source, period=period)
+        diagnose = args.command == 'diagnose-news'
+        if diagnose:
+            stats = synchronizer.run(period=period, diagnose_news=True)
+        else:
+            stats = synchronizer.run(preview_source=args.preview_source, period=period)
         fatal = _todas_as_fontes_falharam(stats) or stats.get('status_erros', 0) > 0
         targeted = stats.get('fontes_concluidas', 0) + stats.get('fontes_parciais', 0)
         partial = any(stats.get(key, 0) for key in ('fontes_com_erro', 'fontes_parciais', 'fontes_nao_implementadas'))
@@ -131,6 +135,8 @@ def main(argv=None) -> int:
             'mode': args.command, 'status': status, 'counts': stats, 'sources': synchronizer.source_audit,
             'source_states': synchronizer.source_states, 'source_errors': synchronizer.source_errors,
         }
+        if diagnose:
+            output['source_registration'] = synchronizer.source_registration
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
         if args.preview_source and targeted != 1:
             print('Requested source did not complete the preview', file=sys.stderr)
