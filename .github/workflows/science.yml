@@ -1,21 +1,30 @@
-name: Scientific Metadata Preview
+name: Scientific Intelligence
 
 on:
   schedule:
     - cron: '25 9 * * *'
+  workflow_dispatch:
+    inputs:
+      from_date:
+        description: 'First UTC replay date (optional)'
+        type: string
+      through_date:
+        description: 'Last UTC replay date, inclusive (optional)'
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: science-preview
+  group: science-odoo
   cancel-in-progress: false
 
 jobs:
-  preview:
-    if: vars.SCIENCE_PREVIEW_ENABLED == 'true'
+  science:
+    if: github.ref_name == github.event.repository.default_branch && vars.SCIENCE_SYNC_ENABLED == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 25
+    environment: science-production
     steps:
       - uses: actions/checkout@v7
         with:
@@ -24,7 +33,17 @@ jobs:
         with:
           version: '0.13.8'
           python-version: '3.15.2'
-      - name: Preview scientific metadata
+      - name: Synchronize scientific metadata
         env:
           PYTHONPATH: src
-        run: uv run --locked python -u -m intelligence science-preview --summary-only
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_API_KEY: ${{ secrets.SCIENCE_ODOO_API_KEY }}
+          ODOO_DATABASE: ${{ secrets.ODOO_DATABASE }}
+          FROM_DATE: ${{ inputs.from_date }}
+          THROUGH_DATE: ${{ inputs.through_date }}
+        run: |
+          args=(science-sync --summary-only)
+          if [[ -n "$FROM_DATE" || -n "$THROUGH_DATE" ]]; then
+            args+=(--from-date "$FROM_DATE" --through-date "$THROUGH_DATE")
+          fi
+          timeout --kill-after=10s 20m uv run --locked python -u -m intelligence "${args[@]}"

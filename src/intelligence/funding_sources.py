@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date, datetime, time, timezone
 from functools import partial
 import hashlib
@@ -1324,7 +1324,12 @@ def preview(previous: list[Opportunity]) -> dict[str, Any]:
     timestamp = now.astimezone(timezone.utc).isoformat(timespec='seconds')
     retained, changes = reconcile(previous, items, timestamp)
     for item in retained:
-        if item.verification != 'not_reverified':
+        if item.verification == 'not_reverified':
+            # Calendar status can expire while its last official observation remains unchanged.
+            calendar_only = replace(item, issues=list(item.issues))
+            _status(calendar_only, now.date())
+            item.calendar_status = calendar_only.calendar_status
+        else:
             _status(item, now.date())
     return {
         'mode': 'funding-preview', 'checked_at': timestamp, 'observed_count': len(items),

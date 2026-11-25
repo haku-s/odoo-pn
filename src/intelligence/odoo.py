@@ -23,7 +23,8 @@ FUNDING_REVISION = 'x_revisao_fomento'
 CONTEXT = {'lang': 'pt_BR', 'active_test': False}
 TEXT = {'char', 'text'}
 # Every property consumed by the validation logic must be requested explicitly.
-FIELD_ATTRIBUTES = ['type', 'string', 'readonly', 'selection', 'relation', 'related', 'store']
+FIELD_ATTRIBUTES = ['type', 'string', 'readonly', 'selection', 'relation', 'related', 'store', 'required', 'relation_field']
+SCIENCE_TYPE = 'scientific_publication'
 SELECTIONS = {
     'x_studio_metodo_de_coleta': ('RSS', 'API REST', 'XML'),
     'x_studio_tipo_de_publicacao': (
@@ -77,8 +78,8 @@ OPERATIONS = {
     ASSUNTOS: {'fields_get', 'search_read', 'search_count', 'has_access'},
     PUBLICACOES: {'fields_get', 'get_view', 'search_read', 'search_count', 'create', 'write', 'has_access'},
     MODEL_FIELD: {'search_read'},
-    FUNDING: {'fields_get', 'funding_contract', 'funding_page', 'funding_head', 'funding_append'},
-    FUNDING_REVISION: {'fields_get'},
+    FUNDING: {'fields_get', 'search_read', 'has_access', 'create', 'write'},
+    FUNDING_REVISION: {'fields_get', 'search_read', 'has_access'},
 }
 
 TECHNICAL = re.compile(r'^[a-z][a-z0-9_]*$')
@@ -250,6 +251,36 @@ class OdooClient:
             self._selections[key] = selection_keys(self.fields(model)[name])
         return self._selections[key]
 
+    def check_fields(self, model: str, fields: dict[str, str], *, write: bool, access: tuple[str, ...],
+                     relations: dict[str, str] | None = None) -> None:
+        metadata = self.fields(model)
+        for name, kind in fields.items():
+            field = _valid(metadata, name, {kind}, relation=(relations or {}).get(name))
+            if write and (field.get('readonly') is True or field.get('related') or field.get('store') is not True):
+                raise ValueError(f'Odoo field is not writable: {model}.{name}')
+        for operation in access:
+            if self.call(model, 'has_access', ids=[], operation=operation) is not True:
+                raise ValueError(f'Odoo access denied: {model}/{operation}')
+
+    def storage_rows(self, model: str, domain: list[Any], fields: list[str], limit: int) -> list[dict[str, Any]]:
+        result = self.call(model, 'search_read', domain=domain, fields=sorted(fields), limit=limit, order='id asc',
+                           context={'active_test': False}, response_limit=8 * 1024 * 1024)
+        if not isinstance(result, list) or len(result) > limit or any(
+            not isinstance(row, dict) or not positive_id(row.get('id')) for row in result
+        ):
+            raise RuntimeError(f'Invalid Odoo storage page: {model}')
+        return result
+
+    def storage_write(self, model: str, record_id: int | None, values: dict[str, Any]) -> None:
+        try:
+            if record_id is None:
+                self.call(model, 'create', vals_list=[values], response_limit=256 * 1024)
+            else:
+                self.call(model, 'write', ids=[record_id], vals=values, response_limit=256 * 1024)
+        except RuntimeError:
+            # A lost response can follow a commit. The caller reads back before deciding the outcome.
+            pass
+
     # ------------------------------------------------------- metadata checking
     def check(self, write: bool = False) -> None:
         """Validate the live metadata for the three data sync models."""
@@ -266,7 +297,10 @@ class OdooClient:
             for name, keys in SELECTIONS.items():
                 if name in expected:
                     actual = selection_keys(meta[name])
-                    if set(actual) != set(keys):
+                    accepted = set(keys)
+                    if name == 'x_studio_tipo_de_publicacao' and SCIENCE_TYPE in actual:
+                        accepted.add(SCIENCE_TYPE)
+                    if set(actual) != accepted:
                         raise ValueError(f'Unexpected selection keys: {model}.{name}')
         # The related Area must exist and must not be writable.
         public = self.fields(PUBLICACOES)
