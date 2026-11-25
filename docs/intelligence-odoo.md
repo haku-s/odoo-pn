@@ -64,7 +64,7 @@ read/create on revisions, and no delete on either. Grant staff read-only
 access to both official models. Keep internal notes and eligibility decisions
 in a separately permissioned existing evaluation model when available. If
 needed, use Studio to create `x_fomento_avaliacao` with `x_opportunity_id`
-(required Many2one to `x_oportunidade_fomento`), `x_name` (Char),
+(required Many2one to `x_oportunidade_fomento`, restrict deletion), `x_name` (Char),
 `x_notes` (Text), `x_assessment` (Selection), and `x_company_id` (Many2one
 to `res.company`). Add an **Internal assessments** menu for staff and grant
 the integration account no rights on this model. A read-only view alone does
@@ -100,7 +100,9 @@ or month is never converted into a fabricated day. Keep mandatory news form
 behavior in its existing view. Scientific observations hold licensed or
 bibliographic provider data, exact dates and typed links to corrections,
 retractions and versions. The stable publication ID is created once and
-remains unchanged when a provider later supplies additional identifiers.
+remains unchanged when a provider later supplies additional identifiers. Use
+the existing `x_active` flag; new scientific publications are created active
+and existing archived publications stay archived.
 
 Add a **Scientific publications** list/form window action on `x_publicacoes`
 with domain `[('x_studio_tipo_de_publicacao','=','scientific_publication')]`.
