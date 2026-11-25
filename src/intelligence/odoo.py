@@ -232,8 +232,9 @@ class OdooClient:
 
     def fields(self, model: str) -> dict[str, Any]:
         if model not in self._metadata:
+            context = {'active_test': False} if model in (FUNDING, FUNDING_REVISION) else CONTEXT
             result = self.call(
-                model, 'fields_get', context=CONTEXT, attributes=FIELD_ATTRIBUTES,
+                model, 'fields_get', context=context, attributes=FIELD_ATTRIBUTES,
             )
             if not isinstance(result, dict) or any(
                 not isinstance(name, str) or not isinstance(meta, dict)
