@@ -196,7 +196,8 @@ class SyncTest(unittest.TestCase):
                 '<pubDate>2026-11-19T23:40:00-03:00</pubDate></item></channel></rss>').encode()
         with (patch.object(sync, 'datetime', wraps=datetime) as clock,
               patch.object(sources, 'read_public', side_effect=[RuntimeError('unavailable'),
-                           (feed, source['x_studio_url'])])):
+                           RuntimeError('archive unavailable'), (feed, source['x_studio_url']),
+                           RuntimeError('archive unavailable')])):
             clock.now.side_effect = [datetime(2026, 11, 19, 23, 55, tzinfo=sync.BRASILIA),
                                      datetime(2026, 11, 20, 0, 50, tzinfo=sync.BRASILIA)]
             failed = sync.Synchronizer(self.cfg(), odoo, object(), show_classification_details=False).run()
@@ -213,6 +214,34 @@ class SyncTest(unittest.TestCase):
         collect.assert_called_once()
         self.assertEqual(collect.call_args.args[0], 'bcb_sgs')
         self.assertFalse(odoo._fontes[1]['x_studio_coleta_habilitada'])
+
+    def test_news_diagnostic_classifies_uncatalogued_channels_without_publication_reads_or_writes(self):
+        channels = {
+            'known': 'https://www.camara.leg.br/noticias/rss/dinamico/SAUDE',
+            'absent': 'https://jornal.usp.br/feed/',
+        }
+        registered = {**fonte(1, 'known', False, channels['known']), 'x_active': True}
+        odoo = FakeOdoo([registered], ASSUNTOS)
+        with (patch.object(sync, 'DIAGNOSTIC_CHANNELS', channels),
+              patch.object(sync, 'coletar', return_value=[item('sample')]),
+              patch.object(odoo, 'publicacoes_por_identificador') as reads):
+            runner = sync.Synchronizer(self.cfg(), odoo, object())
+            runner.run(diagnose_news=True)
+        reads.assert_not_called()
+        self.assertEqual(runner.source_registration, {'known': 'disabled', 'absent': 'absent'})
+        self.assertEqual(runner.source_audit['absent']['classified'], 1)
+        self.assertFalse(odoo.write_check)
+        self.assertEqual((odoo.criadas, odoo.atualizadas, odoo.status, odoo.falhas), ([], [], [], []))
+
+    def test_archive_identity_does_not_duplicate_an_existing_feed_guid(self):
+        source = fonte(1, 'fiocruz', url='https://agencia.fiocruz.br/rss.xml')
+        url = 'https://agencia.fiocruz.br/article'
+        article = Item(url, 'Saúde mental', url, '2026-11-20 10:00:00', None, 'Notícia')
+        previous = registro('42 at https://agencia.fiocruz.br', x_studio_url=url)
+        odoo = FakeOdoo([source], ASSUNTOS, {(1, previous['x_studio_identificador_externo']): previous})
+        stats = self.run_sync(odoo, [article], apply=False)
+        self.assertEqual(stats['duplicates'], 1)
+        self.assertEqual(stats.get('novos', 0), 0)
         self.assertEqual(odoo.criadas + odoo.atualizadas + odoo.status, [])
         with self.assertRaises(ValueError):
             sync.Synchronizer(self.cfg(), odoo, object(), apply=True).run(preview_source='bcb_sgs')

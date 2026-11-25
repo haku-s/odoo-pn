@@ -30,6 +30,55 @@ def collect(data, url=URL):
 
 
 class SharedFeedTest(TestCase):
+    def test_ebc_thematic_channel_preserves_general_feed_identity(self):
+        url = 'https://agenciabrasil.ebc.com.br/rss/saude/feed.xml'
+        article = 'https://agenciabrasil.ebc.com.br/saude/noticia/2026-11/health'
+        item, = collect(rss(link=article), url)
+        self.assertEqual((sources.rss_publisher(url), item.identificador, item.url),
+                         ('agenciabrasil.ebc.com.br', article, article))
+
+    def test_feed_with_distinct_article_host_does_not_allow_that_host_as_a_redirect(self):
+        url = 'https://feeds.bbci.co.uk/portuguese/rss.xml'
+        address = 'https://www.bbc.com/portuguese/articles/test'
+        body = rss(link=address)
+        with patch.object(sources, 'read_public', return_value=(body, url)) as read:
+            item, = sources.collect_feed(url, SINCE, 20, (2, 3))
+        self.assertEqual(item.url, address)
+        self.assertEqual(read.call_args.kwargs['allowed_urls'], {url})
+
+    def test_fiocruz_recovers_an_older_article_through_approved_pagination(self):
+        feed = 'https://agencia.fiocruz.br/rss.xml'
+        archive = 'https://agencia.fiocruz.br/noticias'
+        newer = 'https://agencia.fiocruz.br/new'
+        markup = ('<div class="afn-noticias"><h3><a href="/old">Older article</a></h3>'
+                  '<time datetime="2026-11-01T00:00:00Z"></time></div>').encode()
+        audit = Counter()
+        with patch.object(sources, 'read_public',
+                          side_effect=[(rss(link=newer), feed), (markup, archive)]):
+            items = sources.collect_news(feed, SINCE, 20, (2, 3), until=SINCE + timedelta(days=30), audit=audit)
+        self.assertEqual([item.url for item in items], [newer, 'https://agencia.fiocruz.br/old'])
+        self.assertEqual((audit['feed_window_unverified'], audit['archive_window_covered']), (1, 1))
+
+    def test_archive_follows_only_expected_pagination_and_preserves_first_page_on_failure(self):
+        url = 'https://agencia.fiocruz.br/noticias'
+        markup = ('<div class="afn-noticias"><h3><a href="/news">Article</a></h3>'
+                  '<time datetime="2026-11-19T10:00:00Z"></time></div>'
+                  '<a href="https://127.0.0.1/news?page=1">Unapproved</a><a href="?page=1">Next</a>').encode()
+        audit = Counter()
+        with patch.object(sources, 'read_public', side_effect=[(markup, url), RuntimeError('unavailable')]) as read:
+            items = sources.collect_news(url, SINCE, 20, (2, 3), audit=audit)
+        self.assertEqual(len(items), 1)
+        self.assertEqual([call.args[0] for call in read.call_args_list], [url, url + '?page=1'])
+        self.assertEqual((audit['pagination_incomplete'], audit['archive_window_unverified']), (1, 1))
+
+    def test_published_health_rss_uses_official_permalink_guid(self):
+        url = sources.HEALTH_RSS
+        article = 'https://www.gov.br/saude/pt-br/assuntos/noticias/2026/novembro/health'
+        payload = rss(link=article).replace(f'<link>{article}</link><guid>one</guid>'.encode(),
+                                            f'<guid>{article}</guid>'.encode())
+        item, = collect(payload, url)
+        self.assertEqual((item.url, item.identificador), (article, article))
+
     def test_invalid_entry_does_not_hide_a_valid_entry_and_audits_capacity(self):
         body = rss().replace(b'<item>', b'<item><title>Broken</title></item><item>', 1)
         body = body.replace(b'<channel>', b'<channel><atom:link xmlns:atom="http://www.w3.org/2005/Atom" rel="next" href="https://127.0.0.1/page"/>', 1)

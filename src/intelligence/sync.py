@@ -17,11 +17,14 @@ from .camara_media import eligible_photo, is_article
 from .classify import classificar, split_terms
 from .odoo import OdooClient, OdooHTTPError, SELECTIONS, normalizar_valor
 from .network import FetchError
-from .sources import COLETORES, RespostaInvalida, coletar, rss_publisher
+from .sources import (
+    ALTERNATE_IDENTITY_URLS, COLETORES, DIAGNOSTIC_CHANNELS, NEWS_APIS, RespostaInvalida, coletar, news_publisher,
+)
 
 NEWS_LOOKBACK = timedelta(hours=72)
 BRASILIA = ZoneInfo('America/Sao_Paulo')
-INCOMPLETE_COUNTS = ('invalid_items', 'invalid_dates', 'feed_next_unavailable', 'pagination_incomplete',
+INCOMPLETE_COUNTS = ('invalid_items', 'invalid_dates', 'feed_errors', 'archive_errors',
+                     'feed_next_unavailable', 'pagination_incomplete',
                      'item_limit_dropped', 'item_limit_reached')
 SOURCE_COUNTS = ('raw_entries', 'valid_items', 'outside_window', 'invalid_items', 'invalid_dates',
                  'source_duplicates', 'duplicates', 'collected', 'classified', 'discarded',
@@ -33,8 +36,12 @@ SOURCE_COUNTS = ('raw_entries', 'valid_items', 'outside_window', 'invalid_items'
 
 def _publisher(source: dict[str, Any]) -> str | None:
     code = source['x_studio_codigo_da_fonte_1']
-    if code == 'agencia_brasil' or code not in COLETORES and source.get('x_studio_metodo_de_coleta') == 'RSS':
-        return rss_publisher(source.get('x_studio_url'))
+    method = source.get('x_studio_metodo_de_coleta')
+    address = source.get('x_studio_url')
+    if code == 'agencia_brasil' or code not in COLETORES and method == 'RSS' or (
+        method == 'API REST' and NEWS_APIS.get(code) == address
+    ):
+        return news_publisher(address)
     return None
 
 
@@ -63,6 +70,7 @@ class Synchronizer:
         self.source_audit: dict[str, Counter[str]] = {}
         self.source_states: dict[str, str] = {}
         self.source_errors: dict[str, str] = {}
+        self.source_registration: dict[str, str] = {}
         self._publishers: dict[str, list[int]] = {}
         self._seen_urls: dict[str, set[str]] = {}
         self._avatar: str | None = None
@@ -128,7 +136,7 @@ class Synchronizer:
 
     def _processar_fonte(
         self, fonte: dict[str, Any], assuntos: list[dict[str, Any]], start: datetime, end: datetime,
-        daily_window: tuple[datetime, datetime], *, replay: bool,
+        daily_window: tuple[datetime, datetime], *, replay: bool, diagnostic: bool = False,
     ) -> None:
         identificador_fonte = fonte['id']
         codigo = fonte['x_studio_codigo_da_fonte_1']
@@ -196,7 +204,13 @@ class Synchronizer:
             auditoria_fonte['recebidos'] = len(itens)
             auditoria_fonte['collection_counts'] = counts
         try:
-            self._sincronizar(fonte, itens, assuntos, auditoria_fonte)
+            if diagnostic:
+                for item in itens:
+                    result = classificar(item.titulo, item.resumo, assuntos)
+                    counts['classified' if result.assunto_id is not None else 'discarded'] += 1
+                    counts['images_identified'] += item.image_url is not None
+            else:
+                self._sincronizar(fonte, itens, assuntos, auditoria_fonte)
         except Exception as exc:  # noqa: BLE001 - isolate the source failure
             if auditoria_fonte is not None:
                 auditoria_fonte['estado'] = 'falha_na_sincronizacao'
@@ -214,12 +228,22 @@ class Synchronizer:
         if incomplete:
             self.stats['fontes_parciais'] += 1
             self.source_states[codigo] = 'partial'
+            self.source_errors[codigo] = ', '.join(incomplete)
             if auditoria_fonte is not None:
                 auditoria_fonte['estado'] = 'parcial'
             if self.apply:
                 self._registrar_falha(identificador_fonte, codigo, 'Partial collection: ' + ', '.join(incomplete))
             return
-        self.source_states[codigo] = 'completed'
+        state = 'completed'
+        if diagnostic:
+            limited = not counts['archive_window_covered'] and (
+                counts['archive_window_unverified'] or counts['feed_window_unverified']
+            )
+            if limited:
+                state = 'limited_history' if itens else 'empty_unverified'
+            elif not itens:
+                state = 'no_publications_in_window'
+        self.source_states[codigo] = state
         self.stats['fontes_concluidas'] += 1
         if auditoria_fonte is not None:
             auditoria_fonte['estado'] = 'concluida'
@@ -257,6 +281,9 @@ class Synchronizer:
         seen_urls: set[str] = set()
         if publisher and other_sources:
             seen_urls = self._seen_urls.setdefault(publisher, set())
+        if fonte.get('x_studio_url') in ALTERNATE_IDENTITY_URLS:
+            other_sources.append(identificador_fonte)
+        if other_sources:
             for urls in batched(dict.fromkeys(item.url for item in itens), 100, strict=False):
                 stored_urls.update(self.odoo.publicacoes_por_urls(other_sources, list(urls)))
         for item in itens:
@@ -421,8 +448,8 @@ class Synchronizer:
             raise RuntimeError('Publication update values were not confirmed')
 
     def run(self, *, preview_source: str | None = None,
-            period: tuple[date, date] | None = None) -> dict[str, Any]:
-        if preview_source and self.apply:
+            period: tuple[date, date] | None = None, diagnose_news: bool = False) -> dict[str, Any]:
+        if (preview_source or diagnose_news) and self.apply:
             raise ValueError('Testing one source is only available in preview mode')
         now = datetime.now(BRASILIA)
         day_start = datetime.combine(now.date(), time.min, BRASILIA)
@@ -437,18 +464,38 @@ class Synchronizer:
             start = datetime.combine(first, time.min, BRASILIA)
             end = min(datetime.combine(last + timedelta(days=1), time.min, BRASILIA), now)
         self.odoo.check(write=self.apply)
-        fontes = self.odoo.fontes()
+        fontes = self.odoo.fontes(include_archived=True) if diagnose_news else self.odoo.fontes()
+        if diagnose_news:
+            registered = {source['x_studio_codigo_da_fonte_1']: source for source in fontes}
+            fontes = []
+            for code, url in DIAGNOSTIC_CHANNELS.items():
+                existing = registered.get(code)
+                method = 'API REST' if code in NEWS_APIS else 'RSS'
+                if existing is None:
+                    duplicate = any(source['x_studio_url'] == url for source in registered.values())
+                    registration = 'endpoint_under_another_code' if duplicate else 'absent'
+                elif not existing['x_active']:
+                    registration = 'archived'
+                elif existing['x_studio_metodo_de_coleta'] != method or _publisher(existing) != news_publisher(url):
+                    registration = 'incompatible'
+                elif existing['x_studio_url'] != url and code != 'ministerio_saude':
+                    registration = 'different_endpoint'
+                else:
+                    registration = 'enabled' if existing['x_studio_coleta_habilitada'] else 'disabled'
+                self.source_registration[code] = registration
+                fontes.append({'id': None, 'x_studio_codigo_da_fonte_1': code, 'x_studio_url': url,
+                               'x_studio_metodo_de_coleta': method, 'x_studio_coleta_habilitada': True})
         if preview_source:
             selected = next((source for source in fontes if source['x_studio_codigo_da_fonte_1'] == preview_source), None)
             if selected is None:
                 raise ValueError('Requested preview source was not found among active sources')
             fontes = [{**selected, 'x_studio_coleta_habilitada': True}]
         assuntos = self.odoo.assuntos()
-        if any(_publisher(source) and source.get('x_studio_coleta_habilitada') for source in fontes):
+        if not diagnose_news and any(_publisher(source) and source.get('x_studio_coleta_habilitada') for source in fontes):
             for source in self.odoo.fontes(include_archived=True):
                 if publisher := _publisher(source):
                     self._publishers.setdefault(publisher, []).append(source['id'])
-        if getattr(self.cfg, 'avatar_field', None):
+        if not diagnose_news and getattr(self.cfg, 'avatar_field', None):
             try:
                 self._avatar = self.odoo.avatar_field(write=self.apply)
             except (ValueError, RuntimeError) as exc:
@@ -456,7 +503,7 @@ class Synchronizer:
                 self.stats['avatar_preflight_blocked'] += 1
         self.stats['fontes'] = len(fontes)
         self.stats['assuntos'] = len(assuntos)
-        if not self.apply and self.show_classification_details:
+        if not diagnose_news and not self.apply and self.show_classification_details:
             # Terms come from the live Odoo records, not from test fixtures.
             def contar_termos(value: object) -> int | None:
                 try:
@@ -476,7 +523,8 @@ class Synchronizer:
                 'fontes': [],
             }
         for fonte in fontes:
-            self._processar_fonte(fonte, assuntos, start, end, daily_window, replay=period is not None)
+            self._processar_fonte(fonte, assuntos, start, end, daily_window, replay=period is not None,
+                                 diagnostic=diagnose_news)
         if self._auditoria is not None:
             self._imprimir_auditoria()
         coverage = {
