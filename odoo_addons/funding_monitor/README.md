@@ -81,6 +81,6 @@ any production setup.
    backup and restore plan.
 
 The public **Data Sync** `funding-preview` requires no Odoo credentials and
-can use an artifact from a preceding preview through `funding_baseline_run`.
-Artifacts are retained for 14 days for diagnosis. The scheduled writer builds
-on the state read from Odoo.
+can use a snapshot from the logs of a preceding run through
+`funding_baseline_run`, while those logs remain available. The scheduled
+writer builds on the state read from Odoo.
