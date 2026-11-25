@@ -1,8 +1,12 @@
 # Strategic intelligence on Odoo Online 20
 
-Use Odoo Studio and standard JSON-2 operations. Test the schema and integration
-accounts on a neutralized duplicate before applying the approved configuration
-to production. Use developer mode to inspect actual model and field keys.
+Use Odoo Studio and standard JSON-2 operations. All collectors use the
+existing `ODOO_URL`, `ODOO_API_KEY` and optional `ODOO_DATABASE` configuration.
+In GitHub Actions the URL and API key come from the existing repository
+secrets, and the database comes from the existing repository variable.
+Use the neutralized test database URL and its own valid authentication
+settings for all staging collectors. Use developer mode to inspect actual
+model and field keys.
 The names below specify the contract for additions. Verify related fields,
 required fields, access domains and selection keys against the target database
 before a writer can run.
@@ -18,8 +22,9 @@ and `RSS` for the other channels. Preserve existing codes and avoid a second
 registration for the same endpoint. Keep the current editorial terms until
 their changes are approved.
 
-The news writer requires read access to Subjects, read/write access to Sources
-and read/create/write access scoped to non-scientific Publications, with no delete.
+News requires read on Subjects, read/write on Sources, and read/create/write
+on Publications. News lookups and Avatar backfill exclude scientific
+Publications in code.
 Keep the current Avatar field and existing views. Add a category exclusion to
 the news menu if it also displays scientific records, without changing its
 existing date policy.
@@ -58,17 +63,17 @@ URL reuse with new official evidence creates a new version. The initial,
 pre-proposal and restricted deadlines retain their distinct meanings; the
 searchable deadline represents entry for a new applicant.
 
-In Odoo 20 use the Access records (`ir.access`) and verify the grants on the
-target version. Grant the funding integration account read/create/write on opportunities,
-read/create on revisions, and no delete on either. Grant staff read-only
-access to both official models. Keep internal notes and eligibility decisions
+Verify existing permissions on the target version with the read-only
+`inspect --summary-only` command. Funding requires read/create/write on
+opportunities and read/create on revisions. Keep staff access to the
+official models read-only. Keep internal notes and eligibility decisions
 in a separately permissioned existing evaluation model when available. If
 needed, use Studio to create `x_fomento_avaliacao` with `x_opportunity_id`
 (required Many2one to `x_oportunidade_fomento`, restrict deletion), `x_name` (Char),
 `x_notes` (Text), `x_assessment` (Selection), and `x_company_id` (Many2one
-to `res.company`). Add an **Internal assessments** menu for staff and grant
-the integration account no rights on this model. A read-only view alone does
-not enforce write permissions.
+to `res.company`). Add an **Internal assessments** menu for staff. The funding collector
+does not access this model. A read-only view alone does not enforce write
+permissions.
 
 The head and new revision are written in one standard ORM call through the
 One2many. Each opportunity is confirmed by a subsequent read. Independent
@@ -108,40 +113,38 @@ Add a **Scientific publications** list/form window action on `x_publicacoes`
 with domain `[('x_studio_tipo_de_publicacao','=','scientific_publication')]`.
 Expose title, DOI, PMID, provider, type and publication/index dates in the
 list and search views. Show the original link and typed relationships in the
-form. Give the scientific account read access to Sources, read/create/write
-access to scientific Publications through an access domain on the selection,
-and no delete. Ensure additive permissions from other groups do not widen
-either collector's write scope. Readers can have access to both categories.
+form. Science requires read on Sources and read/create/write on Publications.
+It looks up records by scientific category and source before updating them.
+The collectors share one Odoo identity and enforce category and field scope
+in code. Their permissions at the Odoo account level are shared.
 
 ## Activation and reversal
 
-1. On a neutralized Odoo Online duplicate, provision the fields, access domains
-   and views. Test both a positive and a negative action with each account,
-   including a write to the other publication category. Confirm visible
-   dates, filters, manual fields, revisions and related identifiers.
-2. Run the read-only previews and preflights. Example from the repository:
-   `funding-check --summary-only` checks the writable contract and reads the
-   baseline without sending writes. Run `science-preview --science-odoo
+1. On a neutralized Odoo Online duplicate, provision the fields and views.
+   Use one valid test identity for the collectors. Check that each collector
+   respects its record and field scope. Confirm visible dates, filters,
+   manual fields, revisions and related identifiers.
+2. Run the read-only previews and preflights. `inspect --summary-only`
+   reports required model permissions that are missing or could not be
+   verified. Model-level checks do not replace the staging record tests.
+   `funding-check --summary-only` verifies the writable contract and reads
+   the baseline without writing. Run `science-preview --science-odoo
    --summary-only` to inspect the current publication contract. Run each
    staging writer twice, including a replay and a simulated unavailable
    provider, and compare identities, revisions and manually owned records.
-3. After the owner authorizes the production deployment, confirm a restorable
-   backup, create the approved Studio configuration and dedicated integration
-   accounts, and repeat preflight. Keep GitHub enable variables unset during
-   setup. Configure the existing read preview credentials and
-   `NEWS_ODOO_API_KEY` as a secret. Configure `ODOO_URL`,
-   `FUNDING_ODOO_API_KEY` and optional `ODOO_DATABASE` in the
-   `funding-production` environment, with analogous settings using
-   `SCIENCE_ODOO_API_KEY` in `science-production`. Keep credentials private.
+3. After the owner authorizes deployment, confirm a restorable backup,
+   apply the approved Studio configuration and repeat preflight with the
+   existing Odoo configuration. Keep GitHub enable variables unset during
+   setup. Approve any missing Odoo permission separately.
 4. Enable the approved workflows individually using `NEWS_SYNC_ENABLED`,
    `FUNDING_SYNC_ENABLED` and `SCIENCE_SYNC_ENABLED`, setting each chosen
    variable to `true`. Check confirmation counts plus the corresponding
    menus and search views after the first runs. Read public Actions logs for
    incomplete coverage and retry the affected window where appropriate.
-5. To halt a writer, unset its variable, cancel any active or queued run and,
-   if necessary, revoke its dedicated API key. Keep existing records and
-   revisions. Stopping the writer does not revert committed data. Restoring
-   data or removing fields requires separate authorization.
+5. To halt a writer, unset its variable and cancel any active or queued run.
+   Keep existing records and revisions. The shared key also serves procurement.
+   Stopping a writer does not revert committed data. Restoring data or removing
+   fields requires separate authorization.
 
 References
 [Odoo 20 JSON-2 API](https://www.odoo.com/documentation/20.0/developer/reference/external_api.html),

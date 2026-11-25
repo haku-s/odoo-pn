@@ -114,6 +114,18 @@ class ClientTest(unittest.TestCase):
         )
         return client, session
 
+    def test_shared_permission_inspection_reports_only_missing_and_unverified_access(self):
+        not_exposed = FakeResponse({})
+        not_exposed.status_code = 404
+        client, session = self.cliente([True, False, True, True, True, True, not_exposed, True, False])
+        self.assertEqual(client.missing_permissions(), {
+            'missing': {'x_fontes': ['write'], 'x_revisao_fomento': ['create']},
+            'unverified': {'x_oportunidade_fomento': 'HTTP 404'},
+        })
+        self.assertTrue(all(call['url'].endswith('/has_access') for call in session.chamadas))
+        self.assertTrue(all(call['json']['ids'] == [] for call in session.chamadas))
+        self.assertNotIn('unlink', {call['json']['operation'] for call in session.chamadas})
+
     def test_fields_get_requests_related_and_store(self):
         client, session = self.cliente([metadata_fontes(), metadata_assuntos(),
                                         metadata_publicacoes()])
@@ -225,6 +237,16 @@ class LeituraPublicacoesTest(unittest.TestCase):
         }])
         with self.assertRaises(RuntimeError):
             client.publicacoes_por_identificador(1, ['a'])
+
+    def test_scientific_publication_is_rejected_in_news_lookup(self):
+        client, session = self.cliente([{
+            'id': 7, 'x_studio_fontes': [1, 'Source'], 'x_studio_identificador_externo': 'a',
+            'x_studio_tipo_de_publicacao': 'scientific_publication',
+        }])
+        with self.assertRaisesRegex(RuntimeError, 'scientific publication'):
+            client.publicacoes_por_identificador(1, ['a'])
+        self.assertIn(['x_studio_tipo_de_publicacao', '!=', 'scientific_publication'],
+                      session.chamadas[0]['json']['domain'])
 
     def test_read_requests_all_fields(self):
         session = FakeSession([[]])
@@ -413,6 +435,7 @@ class AvatarTest(unittest.TestCase):
         params = session.chamadas[-1]['json']
         self.assertIn(['x_active', '=', True], params['domain'])
         self.assertIn([AVATAR, '=', False], params['domain'])
+        self.assertIn(['x_studio_tipo_de_publicacao', '!=', 'scientific_publication'], params['domain'])
         self.assertIn(['id', '>', 4], params['domain'])
         self.assertEqual(params['order'], 'id asc')
         self.assertEqual(params['limit'], 2)

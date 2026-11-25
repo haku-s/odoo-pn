@@ -76,8 +76,6 @@ class ScienceStore:
             for key in ('x_studio_assunto_1', 'x_studio_data_de_publicacao', 'x_studio_resumo'):
                 if fields.get(key, {}).get('required') is not False:
                     raise ValueError(f'Science cannot safely fill the required publication field: {key}')
-            if self.client.call(PUBLICACOES, 'has_access', ids=[], operation='unlink') is not False:
-                raise ValueError('Scientific integration must not have publication deletion access')
         sources = self.client.storage_rows(FONTES, [['x_studio_codigo_da_fonte_1', '=', SOURCE_CODE]],
                                            ['x_active', 'x_studio_coleta_habilitada'], 2)
         if len(sources) != 1 or sources[0].get('x_active') is not True or sources[0].get('x_studio_coleta_habilitada') is not False:

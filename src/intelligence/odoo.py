@@ -25,6 +25,7 @@ TEXT = {'char', 'text'}
 # Every property consumed by the validation logic must be requested explicitly.
 FIELD_ATTRIBUTES = ['type', 'string', 'readonly', 'selection', 'relation', 'related', 'store', 'required', 'relation_field']
 SCIENCE_TYPE = 'scientific_publication'
+NEWS_PUBLICATION = ['x_studio_tipo_de_publicacao', '!=', SCIENCE_TYPE]
 SELECTIONS = {
     'x_studio_metodo_de_coleta': ('RSS', 'API REST', 'XML'),
     'x_studio_tipo_de_publicacao': (
@@ -262,6 +263,30 @@ class OdooClient:
             if self.call(model, 'has_access', ids=[], operation=operation) is not True:
                 raise ValueError(f'Odoo access denied: {model}/{operation}')
 
+    def missing_permissions(self) -> dict[str, dict[str, Any]]:
+        """Check the shared identity using model-level, read-only access probes."""
+        missing: dict[str, list[str]] = {}
+        unverified: dict[str, str] = {}
+        for model, operations in (
+            (FONTES, ('read', 'write')),
+            (ASSUNTOS, ('read',)),
+            (PUBLICACOES, ('read', 'create', 'write')),
+            (FUNDING, ('read', 'create', 'write')),
+            (FUNDING_REVISION, ('read', 'create')),
+        ):
+            try:
+                for operation in operations:
+                    allowed = self.call(model, 'has_access', ids=[], operation=operation)
+                    if type(allowed) is not bool:
+                        raise RuntimeError('Invalid Odoo access response')
+                    if not allowed:
+                        missing.setdefault(model, []).append(operation)
+            except OdooHTTPError as exc:
+                unverified[model] = f'HTTP {exc.status_code}'
+            except RuntimeError:
+                unverified[model] = 'No valid access response'
+        return {'missing': missing, 'unverified': unverified}
+
     def storage_rows(self, model: str, domain: list[Any], fields: list[str], limit: int) -> list[dict[str, Any]]:
         result = self.call(model, 'search_read', domain=domain, fields=sorted(fields), limit=limit, order='id asc',
                            context={'active_test': False}, response_limit=8 * 1024 * 1024)
@@ -388,7 +413,7 @@ class OdooClient:
             return {}
         rows = self.call(
             PUBLICACOES, 'search_read',
-            domain=[['x_studio_fontes', '=', fonte_id],
+            domain=[NEWS_PUBLICATION, ['x_studio_fontes', '=', fonte_id],
                      ['x_studio_identificador_externo', 'in', identificadores]],
             limit=len(identificadores) + 1, context=CONTEXT,
             fields=['id', *PUBLICACOES_LEITURA],
@@ -399,6 +424,8 @@ class OdooClient:
         for row in rows:
             if not isinstance(row, dict) or not positive_id(row.get('id')):
                 raise RuntimeError('Invalid Odoo publication record')
+            if row.get('x_studio_tipo_de_publicacao') == SCIENCE_TYPE:
+                raise RuntimeError('Unexpected scientific publication in news lookup')
             if relation_id(row.get('x_studio_fontes')) != fonte_id:
                 raise RuntimeError('Odoo publication belongs to another source')
             key = row.get('x_studio_identificador_externo')
@@ -420,7 +447,7 @@ class OdooClient:
         source_set, url_set = set(source_ids), set(urls)
         rows = self._registros(
             PUBLICACOES,
-            [['x_studio_fontes', 'in', sorted(source_set)], ['x_studio_url', 'in', sorted(url_set)]],
+            [NEWS_PUBLICATION, ['x_studio_fontes', 'in', sorted(source_set)], ['x_studio_url', 'in', sorted(url_set)]],
             ['x_studio_fontes', 'x_studio_url'], 1000, 'publication URLs',
         )
         found = set()
@@ -503,7 +530,7 @@ class OdooClient:
                   if metadata.get(name, {}).get('type') == 'boolean']
         if not active:
             raise ValueError('Odoo publication archive flag could not be verified')
-        return [*active, [field, '!=' if filled else '=', False]]
+        return [NEWS_PUBLICATION, *active, [field, '!=' if filled else '=', False]]
 
     def _avatar_count(self, domain: list[list[Any]]) -> int:
         count = self.call(PUBLICACOES, 'search_count', domain=domain, context=CONTEXT)

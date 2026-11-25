@@ -191,6 +191,7 @@ def main(argv=None) -> int:
             metadata: dict[str, object] = {
                 'fontes': sum(source['x_active'] for source in sources),
                 'assuntos': len(odoo.assuntos()),
+                'permissions': odoo.missing_permissions(),
                 'new_feed_endpoints_present': len({
                     source['x_studio_url'] for source in sources
                     if news_publisher(source['x_studio_url']) not in (None, EBC_HOST)

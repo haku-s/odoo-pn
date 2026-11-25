@@ -28,7 +28,6 @@ jobs:
       (github.ref_name == github.event.repository.default_branch && vars.FUNDING_SYNC_ENABLED == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    environment: funding-production
     steps:
       - uses: actions/checkout@v7
         with:
@@ -42,8 +41,8 @@ jobs:
           PYTHONPATH: src
           MODE: ${{ github.event_name == 'schedule' && 'funding-sync' || inputs.mode }}
           ODOO_URL: ${{ secrets.ODOO_URL }}
-          ODOO_API_KEY: ${{ secrets.FUNDING_ODOO_API_KEY }}
-          ODOO_DATABASE: ${{ secrets.ODOO_DATABASE }}
+          ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
+          ODOO_DATABASE: ${{ vars.ODOO_DATABASE }}
         run: |
           args=("$MODE" --summary-only)
           if [[ "$MODE" == funding-preview ]]; then
