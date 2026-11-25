@@ -222,6 +222,17 @@ class FundingOdooTest(unittest.TestCase):
         self.item = Opportunity('id', 'Agency', 'Example', 'grant', 'https://example.org',
                                 last_attempt_at='2026-11-25T00:00:00+00:00', verification='partial')
 
+    def test_funding_metadata_does_not_require_an_installed_localization(self):
+        from intelligence.config import Settings
+        from intelligence.odoo import FUNDING, OdooClient
+
+        client = OdooClient(Settings('https://odoo.example', '', 'key', 50, 3, (1, 1)))
+        with patch.object(client, 'call', return_value={}) as call:
+            client.fields(FUNDING)
+            client.fields('x_publicacoes')
+        self.assertEqual(call.call_args_list[0].kwargs['context'], {'active_test': False})
+        self.assertEqual(call.call_args_list[1].kwargs['context']['lang'], 'pt_BR')
+
     def test_committed_write_after_connection_failure_is_confirmed(self):
         from dataclasses import asdict
 
