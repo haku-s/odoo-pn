@@ -156,7 +156,7 @@ class Document:
 
 
 class PaginationChangedError(RuntimeError):
-    """The consultation kept changing after a complete restart."""
+    """The consultation could not provide a consistent page sequence."""
 
 
 class PNCPClient:
@@ -200,11 +200,22 @@ class PNCPClient:
         if uf:
             params['uf'] = uf
 
+        for attempt in range(2):
+            try:
+                yield from self._consultation_pages(kind, params, page_size, max_pages)
+            except PaginationChangedError as exc:
+                detail = f'{exc}; kind={kind} day={day} modality={modality} uf={uf or "ALL"}'
+                if attempt:
+                    raise PaginationChangedError(detail) from exc
+                logging.getLogger(__name__).warning('%s; restarting query from page 1', detail)
+            else:
+                return
+
+    def _consultation_pages(self, kind, params, page_size, max_pages):
         page = 1
         expected_pages = expected_records = None
         received = 0
         identifiers = set()
-        can_restart = True
         while True:
             params['pagina'] = page
             try:
@@ -220,7 +231,7 @@ class PNCPClient:
             if resp.status_code == 204:
                 if page == 1:
                     return
-                raise RuntimeError('Unexpected empty page; state not advanced')
+                raise PaginationChangedError(f'Unexpected empty page: page={page}')
             if resp.status_code != 200:
                 raise RuntimeError(
                     f'PNCP consultation page {page}: HTTP {resp.status_code}'
@@ -248,37 +259,29 @@ class PNCPClient:
             if page == 1 and type(total_pages) is int and total_pages == 0 and not records:
                 if total_records in (None, 0):
                     return
-                raise RuntimeError('Missing records in empty PNCP result')
-            if type(total_pages) is not int or total_pages < page:
+                raise PaginationChangedError('Missing records in empty PNCP result: page=1')
+            if type(total_pages) is not int or total_pages < 0:
                 raise RuntimeError('Invalid pagination metadata')
             if total_pages > max_pages:
                 raise RuntimeError('Page limit exceeded; state not advanced')
             if expected_pages is None:
                 expected_pages, expected_records = total_pages, total_records
             elif (total_pages, total_records) != (expected_pages, expected_records):
-                detail = (
-                    f'Pagination metadata changed: '
-                    f'kind={kind} day={day} modality={modality} '
-                    f'page={page} uf={uf or "ALL"} '
+                raise PaginationChangedError(
+                    f'Pagination metadata changed: page={page} '
                     f'expected_pages={expected_pages} actual_pages={total_pages} '
                     f'expected_records={expected_records} actual_records={total_records}'
                 )
-                if not can_restart:
-                    raise PaginationChangedError(detail)
-                logging.getLogger(__name__).warning('%s; restarting query from page 1', detail)
-                can_restart = False
-                page, received = 1, 0
-                expected_pages = expected_records = None
-                identifiers.clear()
-                continue
+            if total_pages < page:
+                raise RuntimeError('Invalid pagination metadata')
 
             received += len(records)
             if expected_records is not None and (
                 received > expected_records or (page == total_pages and received != expected_records)
             ):
-                raise RuntimeError('Incomplete PNCP record count')
+                raise PaginationChangedError(f'Incomplete PNCP record count: page={page}')
             if not records:
-                raise RuntimeError('Unexpected empty page; state not advanced')
+                raise PaginationChangedError(f'Unexpected empty page: page={page}')
 
             for record in records:
                 if not isinstance(record, dict):
@@ -286,7 +289,7 @@ class PNCPClient:
                 identifier = record.get('numeroControlePNCP')
                 purchase_identity(identifier)
                 if identifier in identifiers:
-                    raise RuntimeError('Repeated record in PNCP pagination')
+                    raise PaginationChangedError(f'Repeated record in PNCP pagination: page={page}')
                 identifiers.add(identifier)
             yield records
             if page >= total_pages:

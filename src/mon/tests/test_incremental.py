@@ -187,6 +187,33 @@ class IncrementalTests(unittest.TestCase):
         self.assertEqual(len(self.db.created), 3)
         self.assertEqual(self.db.checkpoints[-1], serialize_checkpoint(later_day))
 
+    def test_repeated_pncp_record_defers_day_even_when_the_totals_match(self):
+        self.config.page_size = 1
+        self.config.max_days = 2
+        self.config.overlap_days = 1
+        self.db.checkpoints.append(serialize_checkpoint(DAY))
+        records = [
+            {**RECORD, 'objetoCompra': 'Fixture', 'numeroControlePNCP': f'12345678000190-1-{i:06}/2026'}
+            for i in range(1, 81)
+        ]
+        complete = [FakeResponse(data=page([row], 80, 80)) for row in records]
+        repeated = [*complete[:-1], complete[-2]]
+        empty = FakeResponse(204)
+        source = self.source(*repeated, *repeated, empty, empty)
+
+        stats = self.run_sync(source)
+
+        self.assertEqual((stats['days'], stats['pending_days']), (1, 1))
+        self.assertEqual(parse_checkpoint(self.db.checkpoints[-1]), DAY)
+        self.assertEqual([params['pagina'] for _, params in source.session.requests[:160]],
+                         list(range(1, 81)) * 2)
+        self.assertEqual(source.session.requests[-1][1]['dataInicial'],
+                         (DAY + timedelta(days=1)).strftime('%Y%m%d'))
+
+        stats = self.run_sync(self.source(*complete, empty, empty, empty))
+        self.assertEqual(stats['pending_days'], 0)
+        self.assertEqual(self.db.checkpoints[-1], serialize_checkpoint(DAY + timedelta(days=2)))
+
     def test_second_invalid_identifier_blocks_entire_page(self):
         invalid = {**RECORD, 'sequencialCompra': 456}
         with self.assertRaisesRegex(ValueError, 'identity'):
