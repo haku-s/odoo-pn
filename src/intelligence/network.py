@@ -2,12 +2,32 @@
 
 from ipaddress import ip_address
 import socket
+import ssl
 from time import monotonic
 from urllib.parse import urljoin, urlsplit
 
 from requests.certs import where
 from urllib3 import HTTPSConnectionPool, Timeout
-from urllib3.exceptions import ConnectTimeoutError, HTTPError, ReadTimeoutError
+from urllib3.exceptions import ConnectTimeoutError, HTTPError, ProtocolError, ReadTimeoutError
+
+TRANSIENT_STATUS = {408, 429, 500, 502, 503, 504}
+
+
+class FetchError(RuntimeError):
+    """A public request failure with safe operational details."""
+
+    def __init__(self, message: str, *, retry: bool = False, delay: float = 1):
+        super().__init__(message)
+        self.retry = retry
+        self.delay = delay
+
+
+def status_error(status: int, retry_after: str | None) -> FetchError:
+    # Defer to the next run for long or unrecognized server-requested waits.
+    wait = retry_after.strip() if retry_after else ''
+    delay = int(wait) if wait.isascii() and wait.isdecimal() and len(wait) < 4 else 60 if wait else 1
+    return FetchError(f'Public HTTPS request returned HTTP {status}',
+                      retry=status in TRANSIENT_STATUS and delay <= 5, delay=max(1, delay))
 
 
 def validate_url(url: str, allowed_hosts: set[str] | frozenset[str]) -> None:
@@ -28,7 +48,7 @@ def _public_addresses(host: str) -> list[str]:
     try:
         answers = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
     except OSError as exc:
-        raise RuntimeError('Public HTTPS DNS lookup failed') from exc
+        raise FetchError('Public HTTPS DNS lookup failed', retry=exc.errno == socket.EAI_AGAIN) from exc
     addresses = []
     for *_, address in answers:
         ip = ip_address(str(address[0]))
@@ -42,7 +62,7 @@ def _public_addresses(host: str) -> list[str]:
 
 
 def _open_https(hostname: str, target: str, deadline: float, timeout: tuple[int, int]):
-    last_error = None
+    failures = []
     for address in _public_addresses(hostname)[:4]:
         remaining = deadline - monotonic()
         if remaining <= 0:
@@ -61,14 +81,17 @@ def _open_https(hostname: str, target: str, deadline: float, timeout: tuple[int,
             )
         except (OSError, HTTPError) as exc:
             pool.close()
-            if not isinstance(exc, (OSError, ConnectTimeoutError, ReadTimeoutError)):
+            if isinstance(exc, ssl.SSLError) or not isinstance(exc, (OSError, ConnectTimeoutError, ReadTimeoutError)):
                 raise
-            last_error = exc
+            family = ip_address(address).version
+            cause = exc.__cause__ or exc
+            errno = getattr(cause, 'errno', None)
+            failures.append(f'IPv{family}:{type(exc).__name__}' + (f'({errno})' if type(errno) is int else ''))
         else:
             return pool, response
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError('Public HTTPS request timed out')
+    if failures:
+        raise FetchError(f'Public HTTPS connection failed ({", ".join(failures)})', retry=True)
+    raise FetchError('Public HTTPS request timed out before response', retry=True)
 
 
 def read_public(
@@ -110,7 +133,7 @@ def read_public_response(
                     url = urljoin(url, location)
                     continue
                 if response.status not in accepted_statuses:
-                    raise RuntimeError(f'Public HTTPS request returned HTTP {response.status}')
+                    raise status_error(response.status, response.headers.get('Retry-After'))
                 if response.headers.get('Content-Encoding', 'identity').lower() != 'identity':
                     raise RuntimeError('Unsupported public HTTPS content encoding')
                 length = response.headers.get('Content-Length')
@@ -120,14 +143,17 @@ def read_public_response(
                 while monotonic() < deadline:
                     chunk = response.read1(min(65536, max_bytes - len(data) + 1), decode_content=False)
                     if not chunk:
+                        if length is not None and len(data) != int(length):
+                            raise FetchError('Public HTTPS response ended before its declared length', retry=True)
                         return bytes(data), url, response.status
                     data.extend(chunk)
                     if len(data) > max_bytes:
                         raise RuntimeError('Public HTTPS response exceeds its size limit')
-                raise RuntimeError('Public HTTPS request timed out')
+                raise FetchError('Public HTTPS response timed out', retry=True)
             finally:
                 response.close()
                 pool.close()
         except (OSError, HTTPError) as exc:
-            raise RuntimeError(f'Public HTTPS request failed ({type(exc).__name__})') from exc
+            retry = not isinstance(exc, ssl.SSLError) and isinstance(exc, (OSError, ReadTimeoutError, ProtocolError))
+            raise FetchError(f'Public HTTPS response failed ({type(exc).__name__})', retry=retry) from exc
     raise RuntimeError('Public HTTPS redirect limit reached')

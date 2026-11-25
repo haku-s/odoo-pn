@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from itertools import batched
 import sys
 from typing import Any
@@ -16,7 +16,19 @@ from . import images
 from .camara_media import eligible_photo, is_article
 from .classify import classificar, split_terms
 from .odoo import OdooClient, OdooHTTPError, SELECTIONS, normalizar_valor
-from .sources import COLETORES, coletar, rss_publisher
+from .network import FetchError
+from .sources import COLETORES, RespostaInvalida, coletar, rss_publisher
+
+NEWS_LOOKBACK = timedelta(hours=72)
+BRASILIA = ZoneInfo('America/Sao_Paulo')
+INCOMPLETE_COUNTS = ('invalid_items', 'invalid_dates', 'feed_next_unavailable', 'pagination_incomplete',
+                     'item_limit_dropped', 'item_limit_reached')
+SOURCE_COUNTS = ('raw_entries', 'valid_items', 'outside_window', 'invalid_items', 'invalid_dates',
+                 'source_duplicates', 'duplicates', 'collected', 'classified', 'discarded',
+                 'no_subject', 'ambiguous', 'excluded', 'existing', 'created', 'would_create',
+                 'pages', 'request_retries', 'collection_errors', 'sync_errors', 'status_errors',
+                 'images_identified', 'images_available', 'images_written', 'images_enriched',
+                 'without_available_image', 'image_failures')
 
 
 def _publisher(source: dict[str, Any]) -> str | None:
@@ -49,6 +61,8 @@ class Synchronizer:
         self.stats = Counter()
         self._auditoria: dict[str, Any] | None = None
         self.source_audit: dict[str, Counter[str]] = {}
+        self.source_states: dict[str, str] = {}
+        self.source_errors: dict[str, str] = {}
         self._publishers: dict[str, list[int]] = {}
         self._seen_urls: dict[str, set[str]] = {}
         self._avatar: str | None = None
@@ -114,9 +128,12 @@ class Synchronizer:
 
     def _processar_fonte(
         self, fonte: dict[str, Any], assuntos: list[dict[str, Any]], start: datetime, end: datetime,
+        daily_window: tuple[datetime, datetime], *, replay: bool,
     ) -> None:
         identificador_fonte = fonte['id']
         codigo = fonte['x_studio_codigo_da_fonte_1']
+        counts: Counter[str] = Counter(dict.fromkeys(SOURCE_COUNTS, 0))
+        self.source_audit[codigo] = counts
         auditoria_fonte = None
         if self._auditoria is not None:
             auditoria_fonte = {
@@ -131,25 +148,42 @@ class Synchronizer:
             if auditoria_fonte is not None:
                 auditoria_fonte['estado'] = 'desabilitada'
             self.stats['fontes_desabilitadas'] += 1
+            self.source_states[codigo] = 'disabled'
             return
-        if codigo not in COLETORES and _publisher(fonte) is None:
+        publisher = _publisher(fonte)
+        if codigo not in COLETORES and publisher is None:
             if auditoria_fonte is not None:
                 auditoria_fonte['estado'] = 'nao_implementada'
             self.stats['fontes_nao_implementadas'] += 1
+            self.source_states[codigo] = 'not_implemented'
             print(f'Source {codigo}: no collector implemented', file=sys.stderr)
             return
+        if codigo not in ('ibge', 'agencia_brasil') and publisher is None:
+            if replay:
+                self.source_states[codigo] = 'outside_replay_scope'
+                self.stats['fontes_fora_do_reprocessamento'] += 1
+                if auditoria_fonte is not None:
+                    auditoria_fonte['estado'] = 'fora_do_reprocessamento'
+                return
+            start, end = daily_window
         try:
             itens = coletar(
                 codigo, self.session, fonte.get('x_studio_url'), start,
                 self.cfg.max_items_per_source,
                 method=fonte.get('x_studio_metodo_de_coleta'),
                 timeout=getattr(self.cfg, 'request_timeout', (10, 40)), until=end,
+                audit=counts, non_news_window=daily_window if codigo == 'ibge' else None, news_only=replay,
             )
         except Exception as exc:  # noqa: BLE001 - report and keep other sources running
             if auditoria_fonte is not None:
                 auditoria_fonte['estado'] = 'falha_na_coleta'
             self.stats['fontes_com_erro'] += 1
-            mensagem = f'{type(exc).__name__}: {exc}'
+            counts['collection_errors'] += 1
+            self.source_states[codigo] = 'collection_failed'
+            mensagem = type(exc).__name__
+            if isinstance(exc, (FetchError, RespostaInvalida)):
+                mensagem += f': {exc}'
+            self.source_errors[codigo] = mensagem
             print(f'Source {codigo}: collection failed: {mensagem}', file=sys.stderr)
             if self.apply:
                 self._registrar_falha(identificador_fonte, codigo, mensagem)
@@ -157,12 +191,6 @@ class Synchronizer:
 
         self.stats['fontes_coletadas'] += 1
         self.stats['itens_recebidos'] += len(itens)
-        counts: Counter[str] = Counter(dict.fromkeys((
-            'collected', 'classified', 'discarded', 'existing', 'duplicates',
-            'images_identified', 'images_available', 'images_written',
-            'images_enriched', 'without_available_image', 'image_failures',
-        ), 0))
-        self.source_audit[codigo] = counts
         counts['collected'] = len(itens)
         if auditoria_fonte is not None:
             auditoria_fonte['recebidos'] = len(itens)
@@ -173,12 +201,25 @@ class Synchronizer:
             if auditoria_fonte is not None:
                 auditoria_fonte['estado'] = 'falha_na_sincronizacao'
             self.stats['fontes_com_erro'] += 1
-            mensagem = f'{type(exc).__name__}: {exc}'
+            counts['sync_errors'] += 1
+            self.source_states[codigo] = 'sync_failed'
+            mensagem = type(exc).__name__
+            self.source_errors[codigo] = mensagem
             print(f'Source {codigo}: synchronisation failed: {mensagem}', file=sys.stderr)
             if self.apply:
                 self._registrar_falha(identificador_fonte, codigo, mensagem)
             return
 
+        incomplete = [key for key in INCOMPLETE_COUNTS if counts[key]]
+        if incomplete:
+            self.stats['fontes_parciais'] += 1
+            self.source_states[codigo] = 'partial'
+            if auditoria_fonte is not None:
+                auditoria_fonte['estado'] = 'parcial'
+            if self.apply:
+                self._registrar_falha(identificador_fonte, codigo, 'Partial collection: ' + ', '.join(incomplete))
+            return
+        self.source_states[codigo] = 'completed'
         self.stats['fontes_concluidas'] += 1
         if auditoria_fonte is not None:
             auditoria_fonte['estado'] = 'concluida'
@@ -187,8 +228,10 @@ class Synchronizer:
                 self.odoo.registrar_sucesso(identificador_fonte)
             except Exception as exc:  # noqa: BLE001 - report and keep other sources running
                 self.stats['status_erros'] += 1
+                counts['status_errors'] += 1
+                self.source_states[codigo] = 'status_failed'
                 print(
-                    f'Source {codigo}: status update failed: {type(exc).__name__}: {exc}',
+                    f'Source {codigo}: status update failed: {type(exc).__name__}',
                     file=sys.stderr,
                 )
 
@@ -197,6 +240,7 @@ class Synchronizer:
             self.odoo.registrar_erro(identificador_fonte, mensagem)
         except Exception:  # noqa: BLE001 - keep the other sources running
             self.stats['status_erros'] += 1
+            self.source_audit[codigo]['status_errors'] += 1
             print(f'Source {codigo}: could not record the failure', file=sys.stderr)
 
     def _sincronizar(self, fonte: dict[str, Any], itens: list[Any], assuntos: list[dict[str, Any]],
@@ -222,10 +266,13 @@ class Synchronizer:
                 self._auditar_item(auditoria_fonte, item, classificacao)
             if classificacao.ambigua:
                 self.stats['ambiguos'] += 1
+                counts['ambiguous'] += 1
             elif classificacao.sem_correspondencia:
                 self.stats['sem_assunto'] += 1
+                counts['no_subject'] += 1
             elif classificacao.excluido:
                 self.stats['excluidos'] += 1
+                counts['excluded'] += 1
 
             atual = existente.get(item.identificador)
             if atual is not None:
@@ -251,12 +298,14 @@ class Synchronizer:
                     auditoria_fonte['novos_elegiveis'] += 1
                 self.stats['existentes'] += atual is not None
                 self.stats['novos'] += atual is None
+                counts['would_create'] += atual is None
                 if publisher and other_sources:
                     seen_urls.add(item.url)
                 continue
             if atual is None:
                 criado = self._criar(item, valores, image=image, code=code, counts=counts)
                 self.stats['criados'] += 1
+                counts['created'] += 1
                 existente[item.identificador] = criado
             else:
                 self.stats['existentes'] += 1
@@ -371,11 +420,22 @@ class Synchronizer:
         ):
             raise RuntimeError('Publication update values were not confirmed')
 
-    def run(self, *, preview_source: str | None = None) -> dict[str, Any]:
+    def run(self, *, preview_source: str | None = None,
+            period: tuple[date, date] | None = None) -> dict[str, Any]:
         if preview_source and self.apply:
             raise ValueError('Testing one source is only available in preview mode')
-        start = datetime.now(ZoneInfo('America/Sao_Paulo')).replace(hour=0, minute=0, second=0, microsecond=0)
-        end = start + timedelta(days=1)
+        now = datetime.now(BRASILIA)
+        day_start = datetime.combine(now.date(), time.min, BRASILIA)
+        daily_window = (day_start, day_start + timedelta(days=1))
+        if period is None:
+            end = now
+            start = (now.astimezone(timezone.utc) - NEWS_LOOKBACK).astimezone(BRASILIA)
+        else:
+            first, last = period
+            if first > last or last > now.date() or (last - first).days >= 366:
+                raise ValueError('News replay requires an ordered period of up to 366 days ending no later than today')
+            start = datetime.combine(first, time.min, BRASILIA)
+            end = min(datetime.combine(last + timedelta(days=1), time.min, BRASILIA), now)
         self.odoo.check(write=self.apply)
         fontes = self.odoo.fontes()
         if preview_source:
@@ -416,11 +476,12 @@ class Synchronizer:
                 'fontes': [],
             }
         for fonte in fontes:
-            self._processar_fonte(fonte, assuntos, start, end)
+            self._processar_fonte(fonte, assuntos, start, end, daily_window, replay=period is not None)
         if self._auditoria is not None:
             self._imprimir_auditoria()
         coverage = {
             key: sum(source[key] for source in self.source_audit.values())
             for key in ('images_identified', 'images_available', 'images_written', 'without_available_image')
         }
-        return {'collection_date': start.date().isoformat(), **self.stats, **coverage}
+        return {'collection_date': now.date().isoformat(), 'news_window_start': start.isoformat(timespec='seconds'),
+                'news_window_end': end.isoformat(timespec='seconds'), **self.stats, **coverage}

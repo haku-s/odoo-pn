@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import io
+import json
 import unittest
-from datetime import UTC, datetime
+from contextlib import redirect_stdout
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import patch
 
 from intelligence import sync
@@ -154,7 +157,7 @@ class SyncTest(unittest.TestCase):
         return Cfg()
 
     # ------------------------------------------------------------ write safety
-    def test_all_enabled_sources_share_the_sao_paulo_run_date(self):
+    def test_news_lookback_crosses_midnight_without_changing_legislative_window(self):
         clock = datetime(2026, 11, 20, 2, 59, 59, tzinfo=UTC)
         odoo = FakeOdoo([fonte(1, 'agencia_brasil'), fonte(2, 'camara')], ASSUNTOS)
         with patch.object(sync, 'datetime', wraps=datetime) as mocked_clock:
@@ -162,10 +165,45 @@ class SyncTest(unittest.TestCase):
             stats = self.run_sync(odoo, [], apply=False)
         self.assertEqual(stats['collection_date'], '2026-11-19')
         self.assertEqual(self.chamadas.call_count, 2)
-        for call in self.chamadas.call_args_list:
-            self.assertEqual(call.args[3].astimezone(UTC), datetime(2026, 11, 19, 3, tzinfo=UTC))
-            self.assertEqual(call.kwargs['until'].astimezone(UTC), datetime(2026, 11, 20, 3, tzinfo=UTC))
+        news, legislative = self.chamadas.call_args_list
+        self.assertEqual(news.args[3].astimezone(UTC), clock - timedelta(hours=72))
+        self.assertEqual(news.kwargs['until'].astimezone(UTC), clock)
+        self.assertEqual(legislative.args[3].astimezone(UTC), datetime(2026, 11, 19, 3, tzinfo=UTC))
+        self.assertEqual(legislative.kwargs['until'].astimezone(UTC), datetime(2026, 11, 20, 3, tzinfo=UTC))
         mocked_clock.now.assert_called_once()
+
+    def test_replay_uses_inclusive_brasilia_dates_and_skips_legislative_sources(self):
+        odoo = FakeOdoo([fonte(1, 'agencia_brasil'), fonte(2, 'camara'), fonte(3, 'ibge')], ASSUNTOS)
+        with (patch.object(sync, 'coletar', return_value=[]) as collect,
+              patch.object(sync, 'datetime', wraps=datetime) as clock):
+            clock.now.side_effect = lambda zone: datetime(2026, 11, 23, 13, tzinfo=zone)
+            runner = sync.Synchronizer(self.cfg(), odoo, object(), show_classification_details=False)
+            runner.run(period=(date(2026, 11, 20), date(2026, 11, 21)))
+        self.assertEqual([call.args[0] for call in collect.call_args_list], ['agencia_brasil', 'ibge'])
+        for call in collect.call_args_list:
+            self.assertEqual(call.args[3].astimezone(UTC), datetime(2026, 11, 20, 3, tzinfo=UTC))
+            self.assertEqual(call.kwargs['until'].astimezone(UTC), datetime(2026, 11, 22, 3, tzinfo=UTC))
+        self.assertEqual(runner.source_states['camara'], 'outside_replay_scope')
+        self.assertEqual(odoo.status, [])
+
+    def test_preview_recovers_previous_day_item_after_an_outage_without_writes(self):
+        from intelligence import sources
+
+        source = fonte(1, 'agencia_brasil')
+        odoo = FakeOdoo([source], ASSUNTOS)
+        feed = ('<rss version="2.0"><channel><item><title>Saúde mental</title>'
+                '<link>https://agenciabrasil.ebc.com.br/saude/noticia/2026-11/example</link>'
+                '<pubDate>2026-11-19T23:40:00-03:00</pubDate></item></channel></rss>').encode()
+        with (patch.object(sync, 'datetime', wraps=datetime) as clock,
+              patch.object(sources, 'read_public', side_effect=[RuntimeError('unavailable'),
+                           (feed, source['x_studio_url'])])):
+            clock.now.side_effect = [datetime(2026, 11, 19, 23, 55, tzinfo=sync.BRASILIA),
+                                     datetime(2026, 11, 20, 0, 50, tzinfo=sync.BRASILIA)]
+            failed = sync.Synchronizer(self.cfg(), odoo, object(), show_classification_details=False).run()
+            recovered = sync.Synchronizer(self.cfg(), odoo, object(), show_classification_details=False).run()
+        self.assertEqual((failed['fontes_com_erro'], recovered['novos']), (1, 1))
+        self.assertEqual(odoo.status, [])
+        self.assertEqual(odoo._publicacoes, {})
 
     def test_targeted_preview_can_read_one_disabled_source_without_writes(self):
         odoo = FakeOdoo([fonte(1, 'agencia_brasil'), fonte(2, 'bcb_sgs', habilitada=False)], ASSUNTOS)
@@ -482,7 +520,12 @@ class CliExitCodeTest(unittest.TestCase):
             cliente.return_value = object()
             sincronizador.return_value.run.return_value = stats
             sincronizador.return_value.source_audit = {}
-            return cli.main(['apply'])
+            sincronizador.return_value.source_states = {}
+            sincronizador.return_value.source_errors = {}
+            with redirect_stdout(io.StringIO()) as stdout:
+                code = cli.main(['apply', '--summary-only'])
+            self.output = json.loads(stdout.getvalue())
+            return code
 
     def test_cli_returns_0_on_success(self):
         self.assertEqual(self._main({'fontes_concluidas': 1, 'fontes_coletadas': 1}), 0)
@@ -499,6 +542,8 @@ class CliExitCodeTest(unittest.TestCase):
         self.assertEqual(self._main(
             {'fontes_concluidas': 1, 'fontes_com_erro': 1, 'fontes_coletadas': 2},
         ), 0)
+        self.assertEqual(self.output['status'], 'partial')
+        self.assertIn('sources', self.output)
 
     def test_cli_returns_1_on_status_failure(self):
         self.assertEqual(self._main(

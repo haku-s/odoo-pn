@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 import json
 from zoneinfo import ZoneInfo
@@ -16,6 +17,7 @@ class FakeResponse:
         self.content = content
         self._payload = payload
         self.status_code = status
+        self.headers = {}
 
     def json(self):
         if self._payload is None:
@@ -431,12 +433,25 @@ class RobustaTest(unittest.TestCase):
                 datetime(2026, 11, 1), 10)
 
     def test_ibge_invalid_record(self):
-        dados = {'items': [{'id': 0, 'titulo': 'x', 'link': 'https://x'}]}
+        dados = ibge_pagina(1)
+        dados['items'].insert(0, {'id': 0, 'titulo': 'x', 'link': 'https://x'})
         session = FakeSession([FakeResponse(payload=dados)])
-        with self.assertRaises(sources.RespostaInvalida):
-            sources.coletar_ibge(
-                session, 'https://servicodados.ibge.gov.br/api/v3/noticias',
-                datetime(2026, 11, 1), 10)
+        counts = Counter()
+        items = sources.coletar_ibge(
+            session, 'https://servicodados.ibge.gov.br/api/v3/noticias', datetime(2026, 11, 1), 10, audit=counts,
+        )
+        self.assertEqual((len(items), counts['invalid_items']), (1, 1))
+
+    def test_ibge_uses_reported_page_count_and_preserves_the_requested_range(self):
+        first = dict(ibge_pagina(1), page=1, count=2, totalPages=2, nextPage=2)
+        second = dict(ibge_pagina(1, inicio=2), page=2, count=2, totalPages=2, nextPage=0)
+        s = FakeSession([FakeResponse(payload=first), FakeResponse(payload=second)])
+        counts = Counter()
+        zone = ZoneInfo('America/Sao_Paulo')
+        items = sources.coletar_ibge(s, PaginacaoDeslocamentoTest.URL_IBGE, datetime(2026, 11, 18, tzinfo=zone), 10,
+                                    until=datetime(2026, 11, 21, tzinfo=zone), audit=counts)
+        self.assertEqual((counts['pages'], counts['raw_entries'], len(items)), (2, 2, 2))
+        self.assertEqual([(c[1]['de'], c[1]['ate']) for c in s.chamadas], [('11/18/2026', '11/20/2026')] * 2)
 
 
 class RegistryTest(unittest.TestCase):
