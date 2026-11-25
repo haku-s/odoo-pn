@@ -7,11 +7,11 @@ from unittest.mock import MagicMock, Mock, patch
 
 import requests
 
-from mon.checkpoint import days_to_process
+from mon.checkpoint import days_to_process, parse_checkpoint
 from mon.documents import attach, download, name_and_mime, notice_fields, source_marker
 from mon.normalizer import clean_money, normalize, odoo_datetime
 from mon.odoo import OdooClient, selection_value
-from mon.pn import Document, PNCPClient, purchase_path
+from mon.pn import Document, PaginationChangedError, PNCPClient, purchase_path
 from mon.sync import Synchronizer
 
 from .test_monitor import (
@@ -617,16 +617,16 @@ class CompletionTests(unittest.TestCase):
         self.assertFalse(self.odoo.created or self.odoo.checkpoints)
 
     def test_short_pagination_cannot_complete_day(self):
-        self.source = PNCPClient(FakePNCPSession([
-            FakeResponse(data={'data': [RECORD], 'totalPaginas': 2, 'totalRegistros': 3}),
-            FakeResponse(data={'data': [RECORD], 'totalPaginas': 2, 'totalRegistros': 3}),
-        ]))
+        first = FakeResponse(data={'data': [RECORD], 'totalPaginas': 2, 'totalRegistros': 3})
+        other = {**RECORD, 'numeroControlePNCP': '12345678000190-1-000124/2026'}
+        second = FakeResponse(data={'data': [other], 'totalPaginas': 2, 'totalRegistros': 3})
+        self.source = PNCPClient(FakePNCPSession([first, second] * 2))
         self.source.documents = Mock(return_value=[])
         self.source.budget_is_public = Mock(return_value=True)
-        with self.assertRaisesRegex(RuntimeError, 'Incomplete PNCP record count'):
-            self.run_sync()
+        stats = self.run_sync()
+        self.assertEqual((stats['days_deferred'], stats['pending_days']), (1, 1))
         self.assertEqual(len(self.odoo.created), 1)
-        self.assertFalse(self.odoo.checkpoints)
+        self.assertIsNone(parse_checkpoint(self.odoo.checkpoints[-1]))
 
     def test_small_day_limit_can_advance_beyond_overlap(self):
         previous = TODAY - timedelta(days=3)
@@ -826,8 +826,8 @@ class NumericAndPaginationTests(unittest.TestCase):
 
     def test_repeated_consultation_page_is_incomplete(self):
         response = FakeResponse(data={'data': [RECORD], 'totalPaginas': 2, 'totalRegistros': 2})
-        source = PNCPClient(FakePNCPSession([response, response]))
-        with self.assertRaisesRegex(RuntimeError, 'Repeated record'):
+        source = PNCPClient(FakePNCPSession([response] * 4))
+        with self.assertRaisesRegex(PaginationChangedError, 'Repeated record'):
             list(source.list_day('publicacao', TODAY, 6, 50, 3))
 
     def test_complete_document_pages_and_explicit_empty_end(self):
