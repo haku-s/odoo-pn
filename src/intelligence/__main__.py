@@ -48,7 +48,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description='Odoo data sync')
     parser.add_argument(
         'command', choices=['inspect', 'preview', 'apply', 'images-preview', 'images-apply', 'diagnose-news',
-                            'funding-preview'],
+                            'funding-preview', 'funding-check', 'funding-sync'],
         nargs='?', default='preview',
     )
     parser.add_argument('--limit', type=int, default=100, help='Maximum records per image backfill')
@@ -57,6 +57,7 @@ def main(argv=None) -> int:
     parser.add_argument('--preview-source', help='Test one registered source without changing its status')
     parser.add_argument('--news-audit-file', help='Write a bounded local rejection sample to a new private file')
     parser.add_argument('--funding-baseline', type=Path, help='Compare a previous funding preview snapshot')
+    parser.add_argument('--funding-odoo', action='store_true', help='Use the Odoo funding baseline in preview')
     parser.add_argument('--from-date', type=date.fromisoformat, help='First news replay date (YYYY-MM-DD, Brasília)')
     parser.add_argument('--through-date', type=date.fromisoformat, help='Last news replay date (YYYY-MM-DD, inclusive)')
     args = parser.parse_args(argv)
@@ -64,8 +65,10 @@ def main(argv=None) -> int:
         parser.error('--preview-source requires preview mode')
     if args.news_audit_file and args.command != 'diagnose-news':
         parser.error('--news-audit-file requires diagnose-news mode')
-    if args.funding_baseline and args.command != 'funding-preview':
-        parser.error('--funding-baseline requires funding-preview mode')
+    if (args.funding_baseline or args.funding_odoo) and args.command != 'funding-preview':
+        parser.error('Funding baseline options require funding-preview mode')
+    if args.funding_baseline and args.funding_odoo:
+        parser.error('Select one funding baseline')
     period = None
     if args.from_date or args.through_date:
         if not args.from_date or not args.through_date or args.command not in ('preview', 'apply', 'diagnose-news'):
@@ -73,14 +76,43 @@ def main(argv=None) -> int:
         period = (args.from_date, args.through_date)
     stage = 'settings'
     try:
-        if args.command == 'funding-preview':
-            from .funding import load_baseline
+        if args.command.startswith('funding-'):
+            from .funding import load_baseline, opportunity_from_dict
+            from .funding_odoo import FundingStore
             from .funding_sources import preview
 
-            stage = 'funding preview'
-            result = preview(load_baseline(args.funding_baseline) if args.funding_baseline else [])
+            stage = 'funding preflight'
+            store = None
+            previous = []
+            if args.command != 'funding-preview' or args.funding_odoo:
+                store = FundingStore(OdooClient(Settings.from_env()))
+                store.check(write=args.command != 'funding-preview')
+                previous = store.load()
+            elif args.funding_baseline:
+                previous = load_baseline(args.funding_baseline)
+            if args.command == 'funding-check':
+                print(json.dumps({'mode': args.command, 'status': 'passed', 'persisted': len(previous)}))
+                return 0
+            stage = 'funding collection'
+            result = preview(previous)
+            if args.command == 'funding-sync':
+                if store is None:
+                    raise RuntimeError('Funding store is unavailable')
+                stage = 'funding persistence'
+                stored = 0
+                failures = 0
+                for row in result['opportunities']:
+                    try:
+                        store.append(opportunity_from_dict(row))
+                        stored += 1
+                    except (RuntimeError, ValueError) as exc:
+                        failures += 1
+                        print(f'Funding revision could not be confirmed: {exc}', file=sys.stderr)
+                result.update(mode=args.command, stored=stored, persistence_errors=failures)
+            if args.summary_only:
+                result.update(opportunity_count=len(result.pop('opportunities')), change_count=len(result.pop('changes')))
             print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
-            return int(all(source['state'] == 'unavailable' for source in result['sources'].values()))
+            return int(result['status'] == 'failed' or bool(result.get('persistence_errors')))
         cfg = Settings.from_env()
         stage = 'Odoo metadata'
         odoo = OdooClient(cfg)

@@ -25,6 +25,9 @@ on:
       preview_source:
         description: 'Optional source code to test in preview, including a disabled source'
         type: string
+      funding_baseline_run:
+        description: 'Optional previous funding preview run ID'
+        type: string
       from_date:
         description: 'First news replay date in Brasília (YYYY-MM-DD)'
         type: string
@@ -42,6 +45,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ${{ github.event_name == 'workflow_dispatch' && (inputs.mode == 'diagnose-news' || inputs.mode == 'funding-preview') && 'data-sync-diagnostics' || 'data-sync-main' }}
@@ -106,4 +110,27 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'funding-preview'
         env:
           PYTHONPATH: src
-        run: timeout --kill-after=10s 15m uv run --locked python -u -m intelligence funding-preview
+          BASELINE_RUN: ${{ inputs.funding_baseline_run }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          args=()
+          if [[ -n "$BASELINE_RUN" ]]; then
+            [[ "$BASELINE_RUN" =~ ^[0-9]+$ ]]
+            gh run view "$BASELINE_RUN" --log | awk -F '\t' '
+              $2 == "Preview official funding opportunities" {
+                sub(/^[^ ]+ /, "", $3)
+                if ($3 == "FUNDING_PREVIEW_END" && active) { complete=1; active=0; next }
+                if (active) print $3
+                if ($3 == "FUNDING_PREVIEW_BEGIN") active=1
+              }
+              END { if (!complete || active) exit 1 }
+            ' > "$RUNNER_TEMP/funding-baseline.json"
+            args+=(--funding-baseline "$RUNNER_TEMP/funding-baseline.json")
+          fi
+          echo "::group::Funding preview snapshot"
+          echo "FUNDING_PREVIEW_BEGIN"
+          status=0
+          timeout --kill-after=10s 15m uv run --locked python -u -m intelligence funding-preview "${args[@]}" || status=$?
+          echo "FUNDING_PREVIEW_END"
+          echo "::endgroup::"
+          exit "$status"
