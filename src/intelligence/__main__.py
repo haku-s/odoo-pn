@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from datetime import date
 
@@ -52,11 +53,14 @@ def main(argv=None) -> int:
     parser.add_argument('--after-id', type=int, default=0, help='Resume image backfill after this record ID')
     parser.add_argument('--summary-only', action='store_true', help='Omit instance details from output')
     parser.add_argument('--preview-source', help='Test one registered source without changing its status')
+    parser.add_argument('--news-audit-file', help='Write a bounded local rejection sample to a new private file')
     parser.add_argument('--from-date', type=date.fromisoformat, help='First news replay date (YYYY-MM-DD, Brasília)')
     parser.add_argument('--through-date', type=date.fromisoformat, help='Last news replay date (YYYY-MM-DD, inclusive)')
     args = parser.parse_args(argv)
     if args.preview_source and args.command != 'preview':
         parser.error('--preview-source requires preview mode')
+    if args.news_audit_file and args.command != 'diagnose-news':
+        parser.error('--news-audit-file requires diagnose-news mode')
     period = None
     if args.from_date or args.through_date:
         if not args.from_date or not args.through_date or args.command not in ('preview', 'apply', 'diagnose-news'):
@@ -121,10 +125,16 @@ def main(argv=None) -> int:
         synchronizer = Synchronizer(
             cfg, odoo, _session(cfg), apply=(args.command == 'apply'),
             show_classification_details=not args.summary_only,
+            capture_news_audit=bool(args.news_audit_file),
         )
         diagnose = args.command == 'diagnose-news'
         if diagnose:
             stats = synchronizer.run(period=period, diagnose_news=True)
+            if args.news_audit_file:
+                stage = 'news audit file'
+                with open(args.news_audit_file, 'x', encoding='utf-8',
+                          opener=lambda path, flags: os.open(path, flags, 0o600)) as report:
+                    json.dump(synchronizer.news_rejections, report, ensure_ascii=False, indent=2)
         else:
             stats = synchronizer.run(preview_source=args.preview_source, period=period)
         fatal = _todas_as_fontes_falharam(stats) or stats.get('status_erros', 0) > 0
