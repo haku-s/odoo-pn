@@ -704,9 +704,9 @@ class SafetyRegressionTests(unittest.TestCase):
                 }
             ),
             FakeResponse(204),
-        ])
+        ] * 2)
 
-        with self.assertRaises(RuntimeError):
+        with self.assertRaisesRegex(RuntimeError, 'Unexpected empty page: page=2'):
             list(
                 PNCPClient(session).list_day(
                     'publicacao', TODAY, 6, 50, 30
