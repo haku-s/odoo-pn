@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime, timedelta
 from collections import Counter
+import json
 from zoneinfo import ZoneInfo
 from unittest import TestCase
 from unittest.mock import patch
@@ -30,6 +31,97 @@ def collect(data, url=URL):
 
 
 class SharedFeedTest(TestCase):
+    def test_ebc_thematic_channel_preserves_general_feed_identity(self):
+        url = 'https://agenciabrasil.ebc.com.br/rss/saude/feed.xml'
+        article = 'https://agenciabrasil.ebc.com.br/saude/noticia/2026-11/health'
+        item, = collect(rss(link=article), url)
+        self.assertEqual((sources.rss_publisher(url), item.identificador, item.url),
+                         ('agenciabrasil.ebc.com.br', article, article))
+
+    def test_feed_with_distinct_article_host_does_not_allow_that_host_as_a_redirect(self):
+        url = 'https://feeds.bbci.co.uk/portuguese/rss.xml'
+        address = 'https://www.bbc.com/portuguese/articles/test'
+        body = rss(link=address)
+        with patch.object(sources, 'read_public', return_value=(body, url)) as read:
+            item, = sources.collect_feed(url, SINCE, 20, (2, 3))
+        self.assertEqual(item.url, address)
+        self.assertEqual(read.call_args.kwargs['allowed_urls'], {url})
+
+    def test_fiocruz_recovers_an_older_article_through_approved_pagination(self):
+        feed = 'https://agencia.fiocruz.br/rss.xml'
+        archive = 'https://agencia.fiocruz.br/noticias'
+        newer = 'https://agencia.fiocruz.br/new'
+        markup = ('<div class="afn-noticias"><h3><a href="/old">Older article</a></h3>'
+                  '<time datetime="2026-11-01T00:00:00Z"></time></div>').encode()
+        audit = Counter()
+        with patch.object(sources, 'read_public',
+                          side_effect=[(rss(link=newer), feed), (markup, archive)]):
+            items = sources.collect_news(feed, SINCE, 20, (2, 3), until=SINCE + timedelta(days=30), audit=audit)
+        self.assertEqual([item.url for item in items], [newer, 'https://agencia.fiocruz.br/old'])
+        self.assertEqual((audit['feed_window_unverified'], audit['archive_window_covered']), (1, 1))
+
+    def test_archive_follows_only_expected_pagination_and_preserves_first_page_on_failure(self):
+        url = 'https://agencia.fiocruz.br/noticias'
+        markup = ('<div class="afn-noticias"><h3><a href="/news">Article</a></h3>'
+                  '<time datetime="2026-11-19T10:00:00Z"></time></div>'
+                  '<a href="https://127.0.0.1/news?page=1">Unapproved</a><a href="?page=1">Next</a>').encode()
+        audit = Counter()
+        with patch.object(sources, 'read_public', side_effect=[(markup, url), RuntimeError('unavailable')]) as read:
+            items = sources.collect_news(url, SINCE, 20, (2, 3), audit=audit)
+        self.assertEqual(len(items), 1)
+        self.assertEqual([call.args[0] for call in read.call_args_list], [url, url + '?page=1'])
+        self.assertEqual((audit['pagination_incomplete'], audit['archive_window_unverified']), (1, 1))
+
+    def test_official_permalink_guid_supplies_the_link_for_health_and_senate(self):
+        for url, article in (
+            (sources.HEALTH_RSS, 'https://www.gov.br/saude/pt-br/assuntos/noticias/2026/novembro/health'),
+            (sources.FEED_CHANNELS['senado_noticias'], 'https://www12.senado.leg.br/noticias/materias/2026/11/19/new'),
+        ):
+            with self.subTest(url=url):
+                payload = rss(link=article).replace(f'<link>{article}</link><guid>one</guid>'.encode(),
+                                                    f'<guid>{article}</guid>'.encode())
+                item, = collect(payload, url)
+                self.assertEqual((item.url, item.identificador), (article, article))
+
+    def test_estadao_snapshot_uses_public_story_metadata_without_reading_article_pages(self):
+        url = 'https://www.estadao.com.br/'
+        body = b'''<script>Fusion.contentCache={"content-api":{"stories":[
+          {"_id":"first","type":"story","canonical_url":"/economia/article-novo/",
+           "headlines":{"basic":"Headline"},"subheadlines":{"basic":"Public summary"},
+           "first_publish_date":"2026-11-19T10:00:00Z"}]}};
+        </script>'''
+        audit = Counter()
+        with patch.object(sources, 'read_public', return_value=(body, url)) as read:
+            item, = sources.collect_news(url, SINCE, 20, (2, 3), audit=audit)
+        self.assertEqual((item.identificador, item.resumo), ('first', 'Public summary'))
+        self.assertEqual(audit['archive_window_unverified'], 1)
+        read.assert_called_once()
+
+    def test_senate_news_feed_counts_radio_entries_separately(self):
+        url = sources.FEED_CHANNELS['senado_noticias']
+        body = rss(link='https://www12.senado.leg.br/noticias/audios/2026/11/radio')
+        audit = Counter()
+        with patch.object(sources, 'read_public', return_value=(body, url)):
+            self.assertEqual(sources.collect_feed(url, SINCE, 20, (2, 3), audit=audit), [])
+        self.assertEqual((audit['raw_entries'], audit['non_news_entries'], audit['invalid_items']), (1, 1, 0))
+
+    def test_news_api_reconstructs_pagination_from_the_approved_route(self):
+        url = sources.SENAI_API
+        rows = [
+            {'url': f'https://noticias.portaldaindustria.com.br/noticias/educacao/article-{number}/',
+             'titulo': 'Headline', 'data_publicacao': '2026-11-19T10:00:00Z'}
+            for number in range(20)
+        ]
+        first = json.dumps({'results': rows, 'count': 21, 'next': 'https://127.0.0.1/private'}).encode()
+        second = json.dumps({'results': [{**rows[0], 'data_publicacao': '2026-11-01T00:00:00Z'}],
+                             'count': 21, 'next': None}).encode()
+        next_page = url.removesuffix('1') + '2'
+        audit = Counter()
+        with patch.object(sources, 'read_public', side_effect=[(first, url), (second, next_page)]) as read:
+            items = sources.coletar('senai', None, url, SINCE, 25, method='API REST', audit=audit)
+        self.assertEqual((len(items), audit['pages'], audit['source_duplicates']), (20, 2, 1))
+        self.assertEqual(read.call_args.kwargs['allowed_urls'], {next_page})
+
     def test_invalid_entry_does_not_hide_a_valid_entry_and_audits_capacity(self):
         body = rss().replace(b'<item>', b'<item><title>Broken</title></item><item>', 1)
         body = body.replace(b'<channel>', b'<channel><atom:link xmlns:atom="http://www.w3.org/2005/Atom" rel="next" href="https://127.0.0.1/page"/>', 1)

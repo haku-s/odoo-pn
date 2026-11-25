@@ -19,6 +19,7 @@ on:
           - apply
           - images-preview
           - images-apply
+          - diagnose-news
         default: preview
       preview_source:
         description: 'Optional source code to test in preview, including a disabled source'
@@ -42,7 +43,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: data-sync-main
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'diagnose-news' && 'data-sync-diagnostics' || 'data-sync-main' }}
   cancel-in-progress: false
 
 jobs:
