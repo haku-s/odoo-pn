@@ -8,10 +8,13 @@ import json
 import re
 from collections.abc import Collection
 from datetime import datetime, timezone
+from time import sleep
 from typing import Any, TypeGuard
 from xml.etree import ElementTree
 
 import requests
+from urllib3.exceptions import InvalidHeader
+from urllib3.util import Retry
 
 FONTES = 'x_fontes'
 ASSUNTOS = 'x_assuntos'
@@ -201,14 +204,28 @@ class OdooClient:
         if method not in OPERATIONS.get(model, ()):
             raise ValueError('Operation not permitted')
         try:
-            response = self.session.post(
-                f'{self.cfg.odoo_url}/json/2/{model}/{method}',
-                headers=self.headers,
-                json=params,
-                timeout=self.cfg.request_timeout,
-                allow_redirects=False,
-                stream=response_limit is not None,
-            )
+            retries = 0
+            while True:
+                response = self.session.post(
+                    f'{self.cfg.odoo_url}/json/2/{model}/{method}',
+                    headers=self.headers,
+                    json=params,
+                    timeout=self.cfg.request_timeout,
+                    allow_redirects=False,
+                    stream=response_limit is not None,
+                )
+                if response.status_code != 429 or retries == 2:
+                    break
+                wait = response.headers.get('Retry-After')
+                try:
+                    delay = max(1, Retry().parse_retry_after(wait)) if wait else 45
+                except InvalidHeader:
+                    break
+                if delay > 60:
+                    break
+                response.close()
+                retries += 1
+                sleep(delay)
             if response_limit:
                 with response:
                     if response.status_code != 200:

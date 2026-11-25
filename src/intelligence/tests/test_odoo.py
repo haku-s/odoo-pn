@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest.mock import patch
 
 from intelligence.odoo import (
     OdooClient,
@@ -71,6 +72,7 @@ class FakeResponse:
     def __init__(self, payload):
         self._payload = payload
         self.status_code = 200
+        self.headers = {}
 
     def json(self):
         return self._payload
@@ -79,6 +81,9 @@ class FakeResponse:
         return self
 
     def __exit__(self, *exc):
+        pass
+
+    def close(self):
         pass
 
     def iter_content(self, chunk_size):
@@ -134,6 +139,37 @@ class ClientTest(unittest.TestCase):
         atributos = primeira['json']['attributes']
         self.assertIn('related', atributos)
         self.assertIn('store', atributos)
+
+    def test_rate_limit_retries_a_rejected_request_after_the_server_delay(self):
+        limited = FakeResponse({})
+        limited.status_code = 429
+        limited.headers = {'Retry-After': '2'}
+        client, session = self.cliente([limited, [7]])
+        with patch('intelligence.odoo.sleep') as pause:
+            result = client.call('x_publicacoes', 'create', vals_list=[{'x_name': 'Test'}], response_limit=256)
+        self.assertEqual(result, [7])
+        pause.assert_called_once_with(2)
+        self.assertEqual(session.chamadas[0], session.chamadas[1])
+
+    def test_rate_limit_does_not_retry_before_a_long_server_delay(self):
+        limited = FakeResponse({})
+        limited.status_code = 429
+        limited.headers = {'Retry-After': '120'}
+        client, session = self.cliente([limited])
+        with patch('intelligence.odoo.sleep') as pause, self.assertRaises(OdooHTTPError) as error:
+            client.fields('x_publicacoes')
+        self.assertEqual(error.exception.status_code, 429)
+        self.assertEqual(len(session.chamadas), 1)
+        pause.assert_not_called()
+
+    def test_rate_limit_fallback_stops_after_two_retries(self):
+        limited = FakeResponse({})
+        limited.status_code = 429
+        client, session = self.cliente([limited, limited, limited])
+        with patch('intelligence.odoo.sleep') as pause, self.assertRaises(OdooHTTPError):
+            client.fields('x_publicacoes')
+        self.assertEqual(len(session.chamadas), 3)
+        self.assertEqual([args.args for args in pause.call_args_list], [(45,), (45,)])
 
     def test_valid_metadata_passes(self):
         client, _ = self.cliente([metadata_fontes(), metadata_assuntos(),
