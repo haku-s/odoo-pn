@@ -6,6 +6,7 @@ import unittest
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 import json
+from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 from unittest.mock import patch
 
@@ -501,8 +502,11 @@ class CguTest(unittest.TestCase):
         self.assertEqual(audit['outside_window'], 1)
         self.assertEqual(audit['invalid_dates'], 1)
         self.assertEqual(audit['feed_window_unverified'], 1)
-        self.assertTrue(all('dataInicial' not in call.args[0] and 'test-key' not in call.args[0]
-                            for call in read.call_args_list))
+        tender_query, _, contract_query, _ = [parse_qs(urlsplit(call.args[0]).query)
+                                               for call in read.call_args_list]
+        self.assertEqual(tender_query['dataInicial'], ['19/11/2026'])
+        self.assertEqual(contract_query['dataInicial'], ['05/11/2026'])
+        self.assertTrue(all('test-key' not in call.args[0] for call in read.call_args_list))
 
     def test_missing_siafi_scope_does_not_contact_the_api(self):
         with (

@@ -1207,19 +1207,26 @@ def coletar_cgu(
     if not 1 <= len(codes) <= 8 or any(not re.fullmatch(r'[0-9]{5}', code) for code in codes):
         raise RespostaInvalida('CGU_SIAFI_CODES must contain one to eight comma-separated SIAFI codes')
     audit = audit if audit is not None else Counter()
-    # The API's range parameters refer to opening or validity and may hide publications in this window.
+    # The search ranges bound opening and validity, so they cannot prove publication-date coverage.
     audit['feed_window_unverified'] += 1
+    reference_end = (until or datetime.now(UTC)).date()
+    tender_start = desde.date()
+    contract_start = tender_start - timedelta(days=14)
     start = _utc_timestamp(desde.replace(hour=0, minute=0, second=0, microsecond=0))
     end = _utc_timestamp(until) if until is not None else None
     items: dict[str, Item] = {}
     failure = None
     for code in codes:
-        for path, date_key, label, kind in (
-            ('licitacoes', 'dataPublicacao', 'Licitação', 'Ato oficial'),
-            ('contratos', 'dataPublicacaoDOU', 'Contrato', 'Contrato público'),
+        for path, date_key, label, kind, query_start, query_end in (
+            ('licitacoes', 'dataPublicacao', 'Licitação', 'Ato oficial',
+             tender_start, reference_end + timedelta(days=60)),
+            ('contratos', 'dataPublicacaoDOU', 'Contrato', 'Contrato público',
+             contract_start, reference_end + timedelta(days=300)),
         ):
             for page in range(1, CGU_MAX_PAGES + 1):
-                query = urlencode({'codigoOrgao': code, 'pagina': page})
+                query = urlencode({'codigoOrgao': code, 'pagina': page,
+                                   'dataInicial': query_start.strftime('%d/%m/%Y'),
+                                   'dataFinal': min(query_end, query_start + timedelta(days=364)).strftime('%d/%m/%Y')})
                 address = f'{CGU_BASE_URL}/api-de-dados/{path}?{query}'
                 try:
                     def read(address: str = address) -> tuple[bytes, str, int]:
@@ -1232,14 +1239,19 @@ def coletar_cgu(
                         raise RespostaInvalida('CGU response is not an array')
                 except (RuntimeError, ValueError) as exc:
                     audit['feed_errors'] += 1
-                    if isinstance(exc, FetchError) and str(exc).endswith(('HTTP 401', 'HTTP 403')):
-                        raise
+                    if isinstance(exc, FetchError):
+                        status = str(exc).removeprefix('Public HTTPS request returned HTTP ')
+                        if len(status) == 3 and status.isascii() and status.isdecimal():
+                            audit[f'cgu_{path}_http_{status}'] += 1
+                            if status in ('401', '403'):
+                                raise
                     failure = exc if isinstance(exc, FetchError) else RespostaInvalida('CGU response could not be read')
                     break
                 audit['pages'] += 1
                 if not rows:
                     break
                 audit['raw_entries'] += len(rows)
+                audit[f'cgu_{path}_raw_entries'] += len(rows)
                 for row in rows:
                     if not isinstance(row, dict) or type(row.get('id')) is not int or row['id'] <= 0:
                         audit['invalid_items'] += 1
