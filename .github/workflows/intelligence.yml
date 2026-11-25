@@ -90,18 +90,11 @@ jobs:
           THROUGH_DATE: ${{ inputs.through_date }}
           IMAGE_LIMIT: ${{ inputs.image_limit }}
           IMAGE_AFTER_ID: ${{ inputs.image_after_id }}
-          NEWS_WRITE_KEY: ${{ (github.event_name == 'schedule' || inputs.mode == 'apply' || inputs.mode == 'images-apply') && secrets.NEWS_ODOO_API_KEY || '' }}
           INTEL_AVATAR_FIELD: ${{ secrets.INTEL_AVATAR_FIELD }}
           ODOO_URL: ${{ secrets.ODOO_URL }}
           ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
+          ODOO_DATABASE: ${{ vars.ODOO_DATABASE }}
         run: |
-          if [[ "$MODE" == apply || "$MODE" == images-apply ]]; then
-            if [[ -z "$NEWS_WRITE_KEY" ]]; then
-              echo "::error::NEWS_ODOO_API_KEY is required for production news writes."
-              exit 1
-            fi
-            export ODOO_API_KEY="$NEWS_WRITE_KEY"
-          fi
           args=("$MODE" --summary-only)
           if [[ -n "$PREVIEW_SOURCE" ]]; then
             args+=(--preview-source "$PREVIEW_SOURCE")

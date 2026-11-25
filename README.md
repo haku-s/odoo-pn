@@ -7,7 +7,8 @@ Data Sync runs news collection at minute 50 of each hour when
 `FUNDING_SYNC_ENABLED=true`. Scientific Intelligence runs daily at 09:25 UTC
 when `SCIENCE_SYNC_ENABLED=true`. Writers run only from the default branch
 and share one concurrency group per subsystem. The procurement workflow has
-its own existing controls.
+its own existing controls. All collectors use the existing `ODOO_URL`,
+`ODOO_API_KEY`, and optional `ODOO_DATABASE`.
 
 Manual Data Sync modes `inspect`, `preview`, `diagnose-news`,
 `funding-preview`, `science-preview` and `images-preview` are read-only.
