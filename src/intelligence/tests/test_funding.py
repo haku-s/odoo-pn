@@ -188,6 +188,36 @@ class FundingReliabilityTest(unittest.TestCase):
         self.assertEqual(dated_status(now.date(), None, end.date(), now=now, end_at=end), 'deadline_elapsed')
         self.assertEqual(dated_status(now.date(), None, end.date(), now=now), 'within_submission_window')
 
+    def test_weaker_current_deadline_cannot_make_an_elapsed_call_appear_open(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        from intelligence.funding import CATALOGUE, REGULATION
+
+        url = 'https://example.org'
+        old = Opportunity('id', 'Agency', 'Example', 'grant', url)
+        old.record('deadline', '2026-11-20', url, 'Official call', authority=REGULATION,
+                   published_at='2026-11-20T18:00:00-03:00')
+        current = Opportunity('id', 'Agency', 'Example', 'grant', url)
+        current.record('deadline', '2027-01-20', url, 'Catalogue', authority=CATALOGUE)
+        now = datetime(2026, 11, 25, 12, tzinfo=ZoneInfo('America/Sao_Paulo'))
+        sources._status(current, now.date())
+        with (patch.object(sources, 'collect_opportunities', return_value=([current], {'source': {'state': 'verified'}})),
+              patch.object(sources, 'datetime', wraps=datetime) as clock):
+            clock.now.return_value = now
+            stored = sources.preview([old])['opportunities'][0]
+        self.assertEqual(stored['facts']['deadline']['value'], '2026-11-20')
+        self.assertEqual(stored['calendar_status'], 'deadline_elapsed')
+        self.assertEqual(stored['status'], 'deadline_elapsed')
+        self.assertEqual(stored['verification'], 'partial')
+
+    def test_duplicate_published_time_preserves_official_timezone(self):
+        url = 'https://example.org'
+        item = Opportunity('id', 'Agency', 'Example', 'grant', url)
+        item.record('deadline', '2026-11-25', url, 'A', published_at='2026-11-25T18:00:00')
+        item.record('deadline', '2026-11-25', url, 'B', published_at='2026-11-25T18:00:00-03:00')
+        self.assertEqual(item.facts['deadline'].published_at, '2026-11-25T18:00:00-03:00')
+
     def test_eu_two_stage_uses_earliest_date_for_new_applicants(self):
         item = sources._horizon_topic({
             'identifier': ['HORIZON-EXAMPLE-2026'], 'title': ['Example research'],

@@ -1323,6 +1323,9 @@ def preview(previous: list[Opportunity]) -> dict[str, Any]:
     _reverify_details(previous, items, sources, now.date())
     timestamp = now.astimezone(timezone.utc).isoformat(timespec='seconds')
     retained, changes = reconcile(previous, items, timestamp)
+    for item in retained:
+        if item.verification != 'not_reverified':
+            _status(item, now.date())
     return {
         'mode': 'funding-preview', 'checked_at': timestamp, 'observed_count': len(items),
         'retained_count': len(retained), 'verification_counts': dict(Counter(item.verification for item in retained)),

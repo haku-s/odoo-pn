@@ -74,12 +74,17 @@ class Opportunity:
             self.facts.pop(key, None)
         else:
             precise = [value for value in highest if value.published_at]
-            self.facts[key] = precise[0] if _agree(highest) and precise else best
+            zoned = [value for value in precise if _evidence_time(value).tzinfo is not None]
+            self.facts[key] = (zoned or precise)[0] if _agree(highest) and precise else best
+
+
+def _evidence_time(evidence: Evidence) -> datetime:
+    return datetime.fromisoformat(evidence.published_at or evidence.value)
 
 
 def _agree(evidence: list[Evidence]) -> bool:
     values = {item.value.casefold().strip(' .') for item in evidence}
-    timestamps = [datetime.fromisoformat(item.published_at) for item in evidence if item.published_at]
+    timestamps = [_evidence_time(item) for item in evidence if item.published_at]
     aware = {stamp for stamp in timestamps if stamp.tzinfo is not None}
     local_times = {stamp.time() for stamp in timestamps if stamp.tzinfo is None}
     if not aware or len(aware) == 1 and next(iter(aware)).time() in local_times:
@@ -123,12 +128,20 @@ def reconcile(
         merged = replace(item, facts=dict(item.facts), documents=dict(item.documents),
                          conflicts={key: list(values) for key, values in item.conflicts.items()},
                          last_attempt_at=attempted_at)
+        unconfirmed = False
         if old:
             merged.checked_at = old.checked_at
             for key, value in old.facts.items():
                 new = item.facts.get(key)
+                lost_precision = bool(
+                    new and value.published_at and _agree([new, value]) and (
+                        new.published_at is None
+                        or (_evidence_time(value).tzinfo is not None and _evidence_time(new).tzinfo is None)
+                    )
+                )
                 if (new is None or new.authority < value.authority
-                        or (value.published_at and new.published_at is None and _agree([new, value]))):
+                        or lost_precision):
+                    unconfirmed = True
                     if new is not None and not _agree([new, value]):
                         merged.conflicts[key] = list(dict.fromkeys([value, *merged.conflicts.get(key, []), new]))
                     if key in merged.conflicts:
@@ -153,7 +166,8 @@ def reconcile(
         missing = bool(old and (old.facts.keys() - item.facts.keys()
                                 or any(digest and not item.documents.get(url)
                                        for url, digest in old.documents.items())))
-        merged.verification = 'partial' if item.verification == 'partial' or unresolved or missing else 'verified'
+        merged.verification = ('partial' if item.verification == 'partial' or unresolved or missing or unconfirmed
+                               else 'verified')
         if merged.verification == 'verified':
             merged.checked_at = attempted_at
         retained.append(merged)
@@ -183,8 +197,8 @@ def compare(previous: list[Opportunity], current: list[Opportunity]) -> list[dic
                 diffs[key] = {'before': asdict(before.facts[key]), 'after': asdict(item.facts[key])}
         for key in sorted(item.facts.keys() - before.facts.keys()):
             diffs[key] = {'after': asdict(item.facts[key])}
-        if item.status != before.status and item.status not in {'unverified', 'deadline_elapsed', 'future',
-                                                                'within_submission_window'}:
+        if item.status != before.status and item.status in {'closed', 'cancelled', 'suspended',
+                                                             'application_route_verified'}:
             diffs['status'] = {'before': before.status, 'after': item.status}
         for key in ('title', 'modality'):
             if getattr(before, key) != getattr(item, key) and getattr(item, key) != 'unverified':
