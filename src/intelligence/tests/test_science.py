@@ -239,3 +239,24 @@ class ScienceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'identities require manual reconciliation'):
                 store.put({'observations': {'pubmed': a | b}})
         self.assertEqual(call.call_count, 1)
+
+    def test_new_science_publication_is_active_and_read_back(self):
+        from intelligence.config import Settings
+        from intelligence.odoo import OdooClient
+        from intelligence.science_odoo import ScienceStore, scientific_values
+
+        observations = {'pubmed': {'pmid': '321', 'title': 'Sample', 'kind': 'article',
+                                   'url': 'https://pubmed.ncbi.nlm.nih.gov/321/', 'dates': {}}}
+        store = ScienceStore(OdooClient(Settings('https://odoo.example', '', 'key', 50, 3, (1, 1))))
+        store.source_id = 7
+        confirmed = scientific_values(observations) | {'id': 8, 'x_active': True}
+
+        def wire(model, method, **kwargs):
+            if method == 'create':
+                confirmed.update(x_studio_identificador_externo=kwargs['vals_list'][0]['x_studio_identificador_externo'])
+                self.assertIs(kwargs['vals_list'][0].get('x_active'), True)
+                return [8]
+            return [confirmed] if 'x_studio_identificador_externo' in confirmed else []
+
+        with patch.object(store.client, 'call', side_effect=wire):
+            self.assertEqual(store.put({'observations': observations}), 'created')

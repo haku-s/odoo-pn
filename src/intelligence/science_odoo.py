@@ -17,7 +17,7 @@ SCIENCE_FIELDS = {
     'x_science_indexed': 'date', 'x_science_kind': 'char', 'x_science_providers': 'char',
     'x_science_links': 'text', 'x_science_observations': 'text',
 }
-HEAD_FIELDS = list(SCIENCE_FIELDS) + ['x_name', 'x_studio_url', 'x_studio_identificador_externo']
+HEAD_FIELDS = list(SCIENCE_FIELDS) + ['x_name', 'x_active', 'x_studio_url', 'x_studio_identificador_externo']
 MAX_OBSERVATION_BYTES = 512 * 1024
 
 
@@ -60,7 +60,7 @@ class ScienceStore:
 
     def check(self, *, write: bool = False) -> None:
         self.client.check_fields(PUBLICACOES, SCIENCE_FIELDS | {
-            'x_name': 'char', 'x_studio_url': 'char', 'x_studio_tipo_de_publicacao': 'selection',
+            'x_name': 'char', 'x_active': 'boolean', 'x_studio_url': 'char', 'x_studio_tipo_de_publicacao': 'selection',
             'x_studio_fontes': 'many2one', 'x_studio_primeira_coleta': 'datetime',
             'x_studio_ultima_atualizacao': 'datetime',
         }, relations={'x_studio_fontes': FONTES}, write=write, access=('read', 'create', 'write') if write else ('read',))
@@ -116,12 +116,13 @@ class ScienceStore:
             keys = sorted(set().union(*(_keys(row) for row in observations.values())))
             identifier = 'science:' + hashlib.sha256(json.dumps(keys).encode()).hexdigest()
             changes.update(x_studio_tipo_de_publicacao=SCIENCE_TYPE, x_studio_fontes=self.source_id,
-                           x_studio_identificador_externo=identifier, x_studio_primeira_coleta=now)
+                           x_studio_identificador_externo=identifier, x_studio_primeira_coleta=now, x_active=True)
         else:
             identifier = current['x_studio_identificador_externo']
         self.client.storage_write(PUBLICACOES, current.get('id'), changes)
         confirmed = self._find(desired)
         if (len(confirmed) != 1 or (current and confirmed[0]['id'] != current['id'])
+                or (not current and confirmed[0].get('x_active') is not True)
                 or confirmed[0].get('x_studio_identificador_externo') != identifier
                 or any(confirmed[0].get(key) != value for key, value in desired.items())):
             raise RuntimeError('Scientific publication write could not be confirmed')
