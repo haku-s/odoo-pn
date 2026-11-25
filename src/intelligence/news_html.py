@@ -56,7 +56,7 @@ HTML_CHANNELS = {
     'inep': gov_listing('/inep/pt-br/centrais-de-conteudo/noticias',
                         r'/inep/pt-br/centrais-de-conteudo/noticias/[^/]+/[^/]+', folder=True),
     'mcti': gov_listing('/mcti/pt-br/acompanhe-o-mcti/noticias',
-                        r'/mcti/pt-br/acompanhe-o-mcti/noticias/\d{4}/[^/]+/[^/]+'),
+                        r'/mcti/pt-br/acompanhe-o-mcti/noticias/\d{4}/(?:[^/]+/)?[^/]+'),
     'inpi': gov_listing('/inpi/pt-br/central-de-conteudo/noticias/ultimas-noticias',
                         r'/inpi/pt-br/central-de-conteudo/noticias/[^/]+'),
     'cnpq': gov_listing('/cnpq/pt-br/assuntos/noticias',
