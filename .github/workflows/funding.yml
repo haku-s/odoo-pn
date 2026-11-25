@@ -1,0 +1,52 @@
+name: Funding Monitor
+
+on:
+  schedule:
+    - cron: '20 2,8,14,20 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Odoo funding operation'
+        type: choice
+        options:
+          - funding-check
+          - funding-preview
+          - funding-sync
+        default: funding-check
+
+permissions:
+  contents: read
+
+concurrency:
+  group: funding-odoo
+  cancel-in-progress: false
+
+jobs:
+  funding:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.mode != 'funding-sync') ||
+      (github.ref_name == github.event.repository.default_branch && vars.FUNDING_SYNC_ENABLED == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: funding-production
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: '0.13.8'
+          python-version: '3.15.2'
+      - name: Run funding operation
+        env:
+          PYTHONPATH: src
+          MODE: ${{ github.event_name == 'schedule' && 'funding-sync' || inputs.mode }}
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_API_KEY: ${{ secrets.FUNDING_ODOO_API_KEY }}
+          ODOO_DATABASE: ${{ secrets.ODOO_DATABASE }}
+        run: |
+          args=("$MODE" --summary-only)
+          if [[ "$MODE" == funding-preview ]]; then
+            args+=(--funding-odoo)
+          fi
+          timeout --kill-after=10s 20m uv run --locked python -u -m intelligence "${args[@]}"
