@@ -48,7 +48,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description='Odoo data sync')
     parser.add_argument(
         'command', choices=['inspect', 'preview', 'apply', 'images-preview', 'images-apply', 'diagnose-news',
-                            'funding-preview', 'funding-check', 'funding-sync'],
+                            'funding-preview', 'funding-check', 'funding-sync', 'science-preview'],
         nargs='?', default='preview',
     )
     parser.add_argument('--limit', type=int, default=100, help='Maximum records per image backfill')
@@ -58,8 +58,11 @@ def main(argv=None) -> int:
     parser.add_argument('--news-audit-file', help='Write a bounded local rejection sample to a new private file')
     parser.add_argument('--funding-baseline', type=Path, help='Compare a previous funding preview snapshot')
     parser.add_argument('--funding-odoo', action='store_true', help='Use the Odoo funding baseline in preview')
-    parser.add_argument('--from-date', type=date.fromisoformat, help='First news replay date (YYYY-MM-DD, Brasília)')
-    parser.add_argument('--through-date', type=date.fromisoformat, help='Last news replay date (YYYY-MM-DD, inclusive)')
+    parser.add_argument('--science-baseline', type=Path, help='Read a previous private science snapshot')
+    parser.add_argument('--science-output', type=Path, help='Save a science snapshot in a new private file')
+    parser.add_argument('--science-odoo', action='store_true', help='Inspect the Odoo publication schema in read-only mode')
+    parser.add_argument('--from-date', type=date.fromisoformat, help='First replay date (YYYY-MM-DD)')
+    parser.add_argument('--through-date', type=date.fromisoformat, help='Last replay date (YYYY-MM-DD, inclusive)')
     args = parser.parse_args(argv)
     if args.preview_source and args.command != 'preview':
         parser.error('--preview-source requires preview mode')
@@ -69,13 +72,56 @@ def main(argv=None) -> int:
         parser.error('Funding baseline options require funding-preview mode')
     if args.funding_baseline and args.funding_odoo:
         parser.error('Select one funding baseline')
+    if (args.science_baseline or args.science_output or args.science_odoo) and args.command != 'science-preview':
+        parser.error('Science options require science-preview mode')
     period = None
     if args.from_date or args.through_date:
-        if not args.from_date or not args.through_date or args.command not in ('preview', 'apply', 'diagnose-news'):
-            parser.error('Both replay dates are required in preview, apply or news diagnostic mode')
+        if not args.from_date or not args.through_date or args.command not in (
+            'preview', 'apply', 'diagnose-news', 'science-preview',
+        ):
+            parser.error('Both replay dates are required in a compatible mode')
         period = (args.from_date, args.through_date)
     stage = 'settings'
     try:
+        if args.command == 'science-preview':
+            from datetime import datetime, timezone
+
+            from .odoo import PUBLICACOES, PUBLICACOES_FIELDS
+            from .science import default_start, load_snapshot, preview
+
+            stage = 'science collection'
+            today = datetime.now(timezone.utc).date()
+            start, end = period or (default_start(today), today)
+            previous = load_snapshot(args.science_baseline) if args.science_baseline else []
+            result = preview(start, end, previous)
+            inspection: dict[str, object] = {}
+            publication_fields: dict[str, object] = {}
+            if args.science_odoo:
+                try:
+                    odoo = OdooClient(Settings.from_env())
+                    subjects = odoo.assuntos()
+                    metadata = odoo.fields(PUBLICACOES)
+                    publication_fields = {name: meta.get('type') for name, meta in metadata.items()
+                                          if isinstance(meta, dict) and name.startswith('x_')
+                                          and name not in PUBLICACOES_FIELDS}
+                    inspection = {
+                        'status': 'read', 'active_subject_count': len(subjects),
+                        'publication_types': list(odoo.selection(PUBLICACOES, 'x_studio_tipo_de_publicacao')),
+                        'additional_publication_fields': len(publication_fields),
+                    }
+                except (ValueError, RuntimeError, requests.RequestException):
+                    inspection = {'status': 'unavailable'}
+                result['odoo'] = inspection
+            if args.science_output:
+                stage = 'science snapshot'
+                with open(args.science_output, 'x', encoding='utf-8',
+                          opener=lambda path, flags: os.open(path, flags, 0o600)) as report:
+                    payload = result | {'odoo': inspection | {'publication_fields': publication_fields}} if inspection else result
+                    json.dump(payload, report, ensure_ascii=False, indent=2)
+            if args.summary_only:
+                result.pop('records')
+            print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+            return int(result['status'] == 'failed')
         if args.command.startswith('funding-'):
             from .funding import load_baseline, opportunity_from_dict
             from .funding_odoo import FundingStore
