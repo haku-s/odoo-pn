@@ -89,10 +89,6 @@ class FundingStore:
             inverse = self.client.fields(FUNDING)['x_revisions'].get('relation_field')
             if inverse != 'x_opportunity_id':
                 raise ValueError('Incompatible funding revision inverse field')
-            for model, denied in ((FUNDING, ('unlink',)), (FUNDING_REVISION, ('write', 'unlink'))):
-                for operation in denied:
-                    if self.client.call(model, 'has_access', ids=[], operation=operation) is not False:
-                        raise ValueError(f'Funding integration has excess access: {model}/{operation}')
 
     @staticmethod
     def _token(row: dict[str, Any]) -> tuple[int, int, str, str | bool]:

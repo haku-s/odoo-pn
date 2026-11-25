@@ -757,6 +757,7 @@ class InspectImagesTest(unittest.TestCase):
             odoo.fontes.return_value = [row]
             odoo.assuntos.return_value = []
             odoo.selection.return_value = ()
+            odoo.missing_permissions.return_value = {'missing': {}, 'unverified': {}}
             odoo.avatar_info.return_value = {'field': 'x_verified', 'type': 'binary'}
             self.assertEqual(cli.main(['inspect']), 0)
         data = json.loads(output.getvalue())
@@ -777,9 +778,11 @@ class InspectImagesTest(unittest.TestCase):
             odoo = client.return_value
             odoo.fontes.return_value = [{**fonte(1, 'private_source'), 'x_active': True}]
             odoo.assuntos.return_value = []
+            odoo.missing_permissions.return_value = {'missing': {'x_fontes': ['write']}, 'unverified': {}}
             odoo.avatar_info.return_value = {'status': 'available', 'field': 'x_private', 'type': 'binary'}
             self.assertEqual(cli.main(['inspect', '--summary-only']), 0)
         data = json.loads(output.getvalue())
         self.assertEqual(data['avatar'], {'status': 'available', 'type': 'binary'})
         self.assertNotIn('sources', data)
+        self.assertEqual(data['permissions']['missing'], {'x_fontes': ['write']})
         self.assertNotIn('x_private', output.getvalue())
