@@ -72,6 +72,7 @@ class Synchronizer:
         self.source_states: dict[str, str] = {}
         self.source_errors: dict[str, str] = {}
         self.source_registration: dict[str, str] = {}
+        self.source_duplicate_endpoints: dict[str, list[str]] = {}
         self.news_rejections: dict[str, dict[str, list[dict[str, Any]]]] = {}
         self.capture_news_audit = capture_news_audit
         self._publishers: dict[str, list[int]] = {}
@@ -489,9 +490,12 @@ class Synchronizer:
             for code, url in DIAGNOSTIC_CHANNELS.items():
                 existing = registered.get(code)
                 method = 'API REST' if code in NEWS_APIS else 'RSS'
+                aliases = sorted(key for key, source in registered.items()
+                                 if key != code and source['x_studio_url'] == url)
+                if aliases:
+                    self.source_duplicate_endpoints[code] = aliases
                 if existing is None:
-                    duplicate = any(source['x_studio_url'] == url for source in registered.values())
-                    registration = 'endpoint_under_another_code' if duplicate else 'absent'
+                    registration = 'endpoint_under_another_code' if aliases else 'absent'
                 elif not existing['x_active']:
                     registration = 'archived'
                 elif existing['x_studio_metodo_de_coleta'] != method or _publisher(existing) != news_publisher(url):

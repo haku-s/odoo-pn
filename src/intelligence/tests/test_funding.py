@@ -220,13 +220,29 @@ class FundingReliabilityTest(unittest.TestCase):
 
     def test_eu_two_stage_uses_earliest_date_for_new_applicants(self):
         item = sources._horizon_topic({
-            'identifier': ['HORIZON-EXAMPLE-2026'], 'title': ['Example research'],
+            'identifier': ['HORIZON-CL5-2027-04-Two-Stage-D2-07'], 'title': ['Example research'],
             'language': ['en'], 'frameworkProgramme': ['43108390'], 'type': ['1'],
             'deadlineModel': ['two-stage'],
             'deadlineDate': ['2026-11-30T17:00:00.000+0000', '2027-03-30T17:00:00.000+0000'],
         }, date(2026, 12, 1), sources.HORIZON_API)
         self.assertEqual(item.status, 'deadline_elapsed')
+        self.assertEqual(item.identity, 'eu:horizon:horizon-cl5-2027-04-two-stage-d2-07')
+        self.assertTrue(item.url.endswith('HORIZON-CL5-2027-04-Two-Stage-D2-07'))
         self.assertEqual(item.facts['full_proposal_deadline'].value, '2027-03-30')
+
+    def test_horizon_reverifies_with_the_original_official_case(self):
+        wire = 'HORIZON-CL5-2027-04-Two-Stage-D2-07'
+        identity = 'eu:horizon:' + wire.lower()
+        metadata = {'identifier': [wire], 'title': ['Example'], 'language': ['en'],
+                    'frameworkProgramme': ['43108390'], 'type': ['1'], 'status': ['31094503']}
+        def response(rows):
+            return json.dumps({'results': rows, 'totalResults': len(rows), 'pageSize': 24, 'pageNumber': 1}).encode(), '', 200
+        with patch.object(sources, 'read_public_response', side_effect=[
+            response([]), response([{'metadata': metadata}]),
+        ]) as fetch:
+            items, _ = sources._horizon(date(2026, 11, 25), {identity}, identifiers={identity: wire})
+        self.assertIn(wire.encode(), fetch.call_args.kwargs['search_form'][0])
+        self.assertEqual([(item.identity, item.status) for item in items], [(identity, 'closed')])
 
     def test_ppsus_support_is_a_partial_alternative_to_primary_site(self):
         with (
@@ -245,9 +261,14 @@ class FundingReliabilityTest(unittest.TestCase):
 class FundingOdooTest(unittest.TestCase):
     def setUp(self):
         from unittest.mock import Mock
+        from intelligence.config import Settings
         from intelligence.funding_odoo import FundingStore
+        from intelligence.odoo import OdooClient
 
-        self.client = Mock()
+        self.client = OdooClient(Settings('https://odoo.example', '', 'key', 50, 3, (1, 1)))
+        self.call = Mock()
+        self.client.call = self.call
+        self.client.fields = Mock()
         self.store = FundingStore(self.client)
         self.item = Opportunity('id', 'Agency', 'Example', 'grant', 'https://example.org',
                                 last_attempt_at='2026-11-25T00:00:00+00:00', verification='partial')
@@ -264,44 +285,43 @@ class FundingOdooTest(unittest.TestCase):
         self.assertEqual(call.call_args_list[1].kwargs['context']['lang'], 'pt_BR')
 
     def test_committed_write_after_connection_failure_is_confirmed(self):
-        from dataclasses import asdict
+        from intelligence.funding_odoo import funding_values
 
-        row = {'id': 10, 'identity': 'id', 'revision': 1, 'state': asdict(self.item)}
-        self.client.call.side_effect = [RuntimeError('Connection failed'), row, [row], {'status': 'confirmed'}, row]
-        self.store.append(self.item)
-        self.assertEqual(self.store.load(), [self.item])
-        self.store.append(self.item)
-        first, confirm, _, repeat, _ = self.client.call.call_args_list
-        self.assertEqual(first.kwargs['expected_revision'], 0)
-        self.assertEqual(confirm.args[1], 'funding_head')
-        self.assertEqual(repeat.kwargs['expected_revision'], 1)
-        self.assertTrue(all(not key.startswith('x_company') for key in first.kwargs['state']))
+        head, revision = funding_values(self.item)
+        confirmed = head | {'id': 10, 'x_revision_number': 1, 'x_current_digest': revision['x_digest']}
+        stored = revision | {'id': 11, 'x_opportunity_id': [10, 'Example'], 'x_number': 1}
+        self.call.side_effect = [[], RuntimeError('Connection failed'), [confirmed], [stored], [confirmed]]
+        self.assertTrue(self.store.append(self.item))
+        self.assertFalse(self.store.append(self.item))
+        create = next(call for call in self.call.call_args_list if call.args[1] == 'create')
+        self.assertEqual(create.kwargs['vals_list'][0]['x_revisions'], [[0, 0, revision | {'x_name': '1', 'x_number': 1}]])
+        self.assertTrue(all(not key.startswith('x_company') for key in create.kwargs['vals_list'][0]))
 
-    def test_unconfirmed_or_concurrent_write_cannot_replace_head(self):
-        from dataclasses import asdict, replace
-
-        other = replace(self.item, title='Different official version')
-        row = {'id': 10, 'identity': 'id', 'revision': 1, 'state': asdict(other)}
-        self.client.call.side_effect = [{'status': 'stale'}, row]
+    def test_failed_write_does_not_retry_create(self):
+        self.call.side_effect = [[], RuntimeError('Connection failed'), []]
         with self.assertRaisesRegex(RuntimeError, 'could not be confirmed'):
             self.store.append(self.item)
-        self.assertEqual(self.store.revisions, {})
+        self.assertEqual([call.args[1] for call in self.call.call_args_list],
+                         ['search_read', 'create', 'search_read'])
 
-    def test_bad_schema_and_permissions_fail_before_any_write(self):
+    def test_missing_source_changes_attempt_without_rewriting_official_history(self):
+        from dataclasses import replace
+        from intelligence.funding_odoo import funding_values
+
+        old = replace(self.item, verification='verified')
+        current = replace(old, verification='not_reverified', last_attempt_at='2026-11-25T06:00:00+00:00')
+        head, revision = funding_values(old)
+        before = head | {'id': 10, 'x_revision_number': 1, 'x_current_digest': revision['x_digest']}
+        after = before | funding_values(current)[0]
+        self.store.heads[old.identity] = (10, 1, revision['x_digest'], before['x_last_attempt_at'])
+        self.call.side_effect = [[before], True, [after]]
+        self.assertTrue(self.store.append(current))
+        write = self.call.call_args_list[1]
+        self.assertEqual(write.args[1], 'write')
+        self.assertEqual(set(write.kwargs['vals']), {'x_last_attempt_at', 'x_verification'})
+
+    def test_bad_schema_fails_before_any_write(self):
         self.client.fields.return_value = {}
-        with self.assertRaisesRegex(ValueError, 'Unexpected funding field'):
+        with self.assertRaisesRegex(ValueError, 'Incompatible Odoo field'):
             self.store.check(write=True)
-        self.client.call.assert_not_called()
-        self.client.fields.side_effect = [
-            {key: {'type': kind, 'relation': relation} for key, kind, relation in (
-                ('x_name', 'char', None), ('x_identity', 'char', None), ('x_current_id', 'many2one', 'x_revisao_fomento'),
-                ('x_generation', 'integer', None), ('x_checked_at', 'datetime', None),
-                ('x_last_attempt_at', 'datetime', None), ('x_verification', 'char', None),
-            )},
-            {'x_opportunity_id': {'type': 'many2one', 'relation': 'x_oportunidade_fomento'},
-             'x_revision': {'type': 'integer'}, 'x_state': {'type': 'json'}},
-        ]
-        self.client.call.side_effect = RuntimeError('Funding collector access denied')
-        with self.assertRaisesRegex(RuntimeError, 'access denied'):
-            self.store.check(write=True)
-        self.assertEqual(self.client.call.call_args.args[1], 'funding_contract')
+        self.call.assert_not_called()

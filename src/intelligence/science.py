@@ -211,11 +211,13 @@ def pubmed_record(node: ET.Element) -> Row | None:
     }
 
 
-def pubmed(search: Search, start: date, end: date, audit: Counter[str]) -> Iterator[Row]:
+def pubmed(search: Search, start: date, end: date, audit: Counter[str], *, splits: int = 2,
+           seen: set[str] | None = None) -> Iterator[Row]:
     dates = f'{start:%Y/%m/%d}:{end:%Y/%m/%d}'
     term = f'({search.pubmed}) AND (' + ' OR '.join(f'{dates}[{tag}]' for tag in ('crdt', 'mdat', 'mhda')) + ')'
     offset = 0
-    seen = set()
+    seen = set() if seen is None else seen
+    window_ids = set()
     for _ in range(3):
         body = read(PUBMED + 'esearch.fcgi', {
             'db': 'pubmed', 'retmode': 'json', 'retmax': 50, 'retstart': offset, 'term': term,
@@ -237,16 +239,30 @@ def pubmed(search: Search, start: date, end: date, audit: Counter[str]) -> Itera
         ):
             audit['query_warnings'] += 1
         total = int(count)
+        if not offset and total > 150 and start < end and splits:
+            middle = start + (end - start) // 2
+            audit['window_splits'] += 1
+            yield from pubmed(search, start, middle, audit, splits=splits - 1, seen=seen)
+            yield from pubmed(search, middle + timedelta(days=1), end, audit, splits=splits - 1, seen=seen)
+            return
         if offset > total or (offset < total and not ids):
             raise ValueError('Incomplete PubMed search page')
         if not ids:
             return
         requested = {value for value in ids if isinstance(value, str) and PMID.fullmatch(value)}
-        if len(requested) != len(ids) or requested & seen:
+        if len(requested) != len(ids) or requested & window_ids:
             raise ValueError('Invalid or repeated PubMed search identifiers')
-        seen.update(requested)
+        window_ids.update(requested)
+        offset += len(ids)
         audit['entries'] += len(ids)
-        response = read(PUBMED + 'efetch.fcgi', {'db': 'pubmed', 'id': ','.join(ids), 'retmode': 'xml'}, audit)
+        remaining = [value for value in ids if value not in seen]
+        audit['duplicate_entries'] += len(ids) - len(remaining)
+        if not remaining:
+            if offset >= total:
+                return
+            continue
+        requested = set(remaining)
+        response = read(PUBMED + 'efetch.fcgi', {'db': 'pubmed', 'id': ','.join(remaining), 'retmode': 'xml'}, audit)
         returned = set()
         for node in xml_records(response):
             row = pubmed_record(node)
@@ -254,9 +270,9 @@ def pubmed(search: Search, start: date, end: date, audit: Counter[str]) -> Itera
                 audit['invalid'] += 1
                 continue
             returned.add(row['pmid'])
+            seen.add(row['pmid'])
             yield row
         audit['missing_records'] += len(requested - returned)
-        offset += len(ids)
         if offset >= total:
             return
     audit['page_caps'] += 1
@@ -375,13 +391,15 @@ def _crossref_record(work: Row, identifier: str, title: str) -> Row:
     }
 
 
-def crossref(phrase: str, start: date, end: date, audit: Counter[str], *, scielo: bool = False) -> Iterator[Row]:
+def crossref(phrase: str, start: date, end: date, audit: Counter[str], *, scielo: bool = False,
+             splits: int = 1, seen: set[str] | None = None) -> Iterator[Row]:
     filters = f'from-index-date:{start},until-index-date:{end}'
     if scielo:
         filters += ',prefix:10.1590'
     cursor = '*'
-    seen = set()
-    for _ in range(2):
+    seen = set() if seen is None else seen
+    window_ids = set()
+    for page in range(2):
         response = json.loads(read(CROSSREF, {
             'query.title': phrase, 'filter': filters, 'rows': 20, 'cursor': cursor,
         }, audit))
@@ -392,7 +410,16 @@ def crossref(phrase: str, start: date, end: date, audit: Counter[str], *, scielo
         if not isinstance(items, list) or len(items) > 20:
             raise ValueError('Invalid Crossref response')
         audit['search_pages'] += 1
+        total = message.get('total-results')
+        if not page and len(items) == 20 and type(total) is int and total > 40 and start < end and splits:
+            middle = start + (end - start) // 2
+            audit['window_splits'] += 1
+            yield from crossref(phrase, start, middle, audit, scielo=scielo, splits=splits - 1, seen=seen)
+            yield from crossref(phrase, middle + timedelta(days=1), end, audit, scielo=scielo,
+                                splits=splits - 1, seen=seen)
+            return
         audit['entries'] += len(items)
+        prior_window_ids = window_ids.copy()
         for work in items:
             identifier = doi(work.get('DOI')) if isinstance(work, dict) else None
             title = _first(work.get('title')) if isinstance(work, dict) else None
@@ -402,6 +429,7 @@ def crossref(phrase: str, start: date, end: date, audit: Counter[str], *, scielo
             if scielo and not identifier.startswith('10.1590/'):
                 audit['outside_collection'] += 1
                 continue
+            window_ids.add(identifier)
             if identifier in seen:
                 audit['duplicate_entries'] += 1
                 continue
@@ -415,7 +443,10 @@ def crossref(phrase: str, start: date, end: date, audit: Counter[str], *, scielo
                 audit['invalid'] += 1
                 continue
             yield row
-        if len(items) < 20:
+        if page and items and window_ids == prior_window_ids:
+            audit['page_caps'] += 1
+            return
+        if len(items) < 20 or type(total) is int and total <= (page + 1) * 20:
             return
         # Crossref can return the same opaque cursor even when it advanced.
         cursor = message.get('next-cursor')
