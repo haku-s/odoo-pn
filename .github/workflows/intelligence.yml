@@ -25,6 +25,9 @@ on:
       preview_source:
         description: 'Optional source code to test in preview, including a disabled source'
         type: string
+      funding_baseline_run:
+        description: 'Optional previous funding preview run ID'
+        type: string
       from_date:
         description: 'First news replay date in Brasília (YYYY-MM-DD)'
         type: string
@@ -42,6 +45,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ${{ github.event_name == 'workflow_dispatch' && (inputs.mode == 'diagnose-news' || inputs.mode == 'funding-preview') && 'data-sync-diagnostics' || 'data-sync-main' }}
@@ -106,4 +110,22 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'funding-preview'
         env:
           PYTHONPATH: src
-        run: timeout --kill-after=10s 15m uv run --locked python -u -m intelligence funding-preview
+          BASELINE_RUN: ${{ inputs.funding_baseline_run }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          args=()
+          if [[ -n "$BASELINE_RUN" ]]; then
+            [[ "$BASELINE_RUN" =~ ^[0-9]+$ ]]
+            gh run download "$BASELINE_RUN" --name funding-preview --dir "$RUNNER_TEMP/funding-baseline"
+            args+=(--funding-baseline "$RUNNER_TEMP/funding-baseline/funding-preview.json")
+          fi
+          timeout --kill-after=10s 15m uv run --locked python -u -m intelligence funding-preview "${args[@]}" > "$RUNNER_TEMP/funding-preview.json"
+
+      - name: Retain funding preview evidence
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.mode == 'funding-preview'
+        uses: actions/upload-artifact@v7
+        with:
+          name: funding-preview
+          path: ${{ runner.temp }}/funding-preview.json
+          if-no-files-found: ignore
+          retention-days: 14

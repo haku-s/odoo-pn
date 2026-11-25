@@ -1,0 +1,5 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+access_opportunity_collector,Funding opportunity collector,model_x_oportunidade_fomento,funding_monitor.group_collector,1,0,0,0
+access_revision_collector,Funding revision collector,model_x_revisao_fomento,funding_monitor.group_collector,1,0,0,0
+access_opportunity_editor,Funding opportunity editor,model_x_oportunidade_fomento,funding_monitor.group_editor,1,1,0,0
+access_revision_editor,Funding revision editor,model_x_revisao_fomento,funding_monitor.group_editor,1,0,0,0

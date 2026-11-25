@@ -17,6 +17,8 @@ FONTES = 'x_fontes'
 ASSUNTOS = 'x_assuntos'
 PUBLICACOES = 'x_publicacoes'
 MODEL_FIELD = 'ir.model.fields'
+FUNDING = 'x_oportunidade_fomento'
+FUNDING_REVISION = 'x_revisao_fomento'
 
 CONTEXT = {'lang': 'pt_BR', 'active_test': False}
 TEXT = {'char', 'text'}
@@ -75,6 +77,8 @@ OPERATIONS = {
     ASSUNTOS: {'fields_get', 'search_read', 'search_count', 'has_access'},
     PUBLICACOES: {'fields_get', 'get_view', 'search_read', 'search_count', 'create', 'write', 'has_access'},
     MODEL_FIELD: {'search_read'},
+    FUNDING: {'fields_get', 'funding_contract', 'funding_page', 'funding_head', 'funding_append'},
+    FUNDING_REVISION: {'fields_get'},
 }
 
 TECHNICAL = re.compile(r'^[a-z][a-z0-9_]*$')

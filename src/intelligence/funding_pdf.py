@@ -20,7 +20,14 @@ def main() -> None:
     reader = PdfReader(BytesIO(body))
     if reader.is_encrypted:
         raise ValueError('Encrypted funding PDF')
-    pages = [(i + 1, (page.extract_text() or '')[:20000]) for i, page in enumerate(reader.pages[:8])]
+    if len(sys.argv) > 2 or (len(sys.argv) == 2 and not sys.argv[1].isdigit()):
+        raise ValueError('Invalid funding PDF page')
+    indices = list(range(min(8, len(reader.pages))))
+    if len(sys.argv) == 2:
+        index = int(sys.argv[1]) - 1
+        if 0 <= index < len(reader.pages) and index not in indices:
+            indices.append(index)
+    pages = [(index + 1, (reader.pages[index].extract_text() or '')[:20000]) for index in indices]
     print(json.dumps(pages, ensure_ascii=True))
 
 
