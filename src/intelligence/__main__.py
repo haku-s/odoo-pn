@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import sys
+from collections import Counter
 from datetime import date
 from pathlib import Path
 
@@ -48,7 +49,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description='Odoo data sync')
     parser.add_argument(
         'command', choices=['inspect', 'preview', 'apply', 'images-preview', 'images-apply', 'diagnose-news',
-                            'funding-preview', 'funding-check', 'funding-sync', 'science-preview'],
+                            'funding-preview', 'funding-check', 'funding-sync', 'science-preview', 'science-sync'],
         nargs='?', default='preview',
     )
     parser.add_argument('--limit', type=int, default=100, help='Maximum records per image backfill')
@@ -77,18 +78,24 @@ def main(argv=None) -> int:
     period = None
     if args.from_date or args.through_date:
         if not args.from_date or not args.through_date or args.command not in (
-            'preview', 'apply', 'diagnose-news', 'science-preview',
+            'preview', 'apply', 'diagnose-news', 'science-preview', 'science-sync',
         ):
             parser.error('Both replay dates are required in a compatible mode')
         period = (args.from_date, args.through_date)
     stage = 'settings'
     try:
-        if args.command == 'science-preview':
+        if args.command in ('science-preview', 'science-sync'):
             from datetime import datetime, timezone
 
             from .odoo import PUBLICACOES, PUBLICACOES_FIELDS
             from .science import default_start, load_snapshot, preview
+            from .science_odoo import ScienceStore
 
+            science_store = None
+            if args.command == 'science-sync':
+                stage = 'science preflight'
+                science_store = ScienceStore(OdooClient(Settings.from_env()))
+                science_store.check(write=True)
             stage = 'science collection'
             today = datetime.now(timezone.utc).date()
             start, end = period or (default_start(today), today)
@@ -100,28 +107,42 @@ def main(argv=None) -> int:
                 try:
                     odoo = OdooClient(Settings.from_env())
                     subjects = odoo.assuntos()
-                    metadata = odoo.fields(PUBLICACOES)
-                    publication_fields = {name: meta.get('type') for name, meta in metadata.items()
+                    schema = odoo.fields(PUBLICACOES)
+                    publication_fields = {name: meta.get('type') for name, meta in schema.items()
                                           if isinstance(meta, dict) and name.startswith('x_')
                                           and name not in PUBLICACOES_FIELDS}
                     inspection = {
                         'status': 'read', 'active_subject_count': len(subjects),
                         'publication_types': list(odoo.selection(PUBLICACOES, 'x_studio_tipo_de_publicacao')),
                         'additional_publication_fields': len(publication_fields),
+                        'required_existing_fields': [key for key in PUBLICACOES_FIELDS
+                                                     if schema.get(key, {}).get('required') is True],
                     }
                 except (ValueError, RuntimeError, requests.RequestException):
                     inspection = {'status': 'unavailable'}
                 result['odoo'] = inspection
+            if science_store is not None:
+                stage = 'science persistence'
+                counts: Counter[str] = Counter()
+                for record in result['records']:
+                    try:
+                        counts[science_store.put(record)] += 1
+                    except (ValueError, RuntimeError) as exc:
+                        counts['errors'] += 1
+                        print(f'Scientific publication could not be confirmed: {type(exc).__name__}', file=sys.stderr)
+                result.update(mode=args.command, persistence=dict(counts))
+                if counts['errors'] and result['status'] != 'failed':
+                    result['status'] = 'partial'
             if args.science_output:
                 stage = 'science snapshot'
                 with open(args.science_output, 'x', encoding='utf-8',
                           opener=lambda path, flags: os.open(path, flags, 0o600)) as report:
                     payload = result | {'odoo': inspection | {'publication_fields': publication_fields}} if inspection else result
                     json.dump(payload, report, ensure_ascii=False, indent=2)
-            if args.summary_only:
+            if args.summary_only or science_store is not None:
                 result.pop('records')
             print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
-            return int(result['status'] == 'failed')
+            return int(result['status'] == 'failed' or bool(result.get('persistence', {}).get('errors')))
         if args.command.startswith('funding-'):
             from .funding import load_baseline, opportunity_from_dict
             from .funding_odoo import FundingStore
@@ -132,7 +153,7 @@ def main(argv=None) -> int:
             previous = []
             if args.command != 'funding-preview' or args.funding_odoo:
                 store = FundingStore(OdooClient(Settings.from_env()))
-                store.check(write=args.command != 'funding-preview')
+                store.check(write=args.command in ('funding-check', 'funding-sync'))
                 previous = store.load()
             elif args.funding_baseline:
                 previous = load_baseline(args.funding_baseline)
@@ -149,11 +170,12 @@ def main(argv=None) -> int:
                 failures = 0
                 for row in result['opportunities']:
                     try:
-                        store.append(opportunity_from_dict(row))
-                        stored += 1
+                        stored += int(store.append(opportunity_from_dict(row)))
                     except (RuntimeError, ValueError) as exc:
                         failures += 1
-                        print(f'Funding revision could not be confirmed: {exc}', file=sys.stderr)
+                        print(f'Funding revision could not be confirmed: {type(exc).__name__}', file=sys.stderr)
+                if failures and result['status'] != 'failed':
+                    result['status'] = 'partial'
                 result.update(mode=args.command, stored=stored, persistence_errors=failures)
             if args.summary_only:
                 result.update(opportunity_count=len(result.pop('opportunities')), change_count=len(result.pop('changes')))
@@ -238,6 +260,7 @@ def main(argv=None) -> int:
         }
         if diagnose:
             output['source_registration'] = synchronizer.source_registration
+            output['source_duplicate_endpoints'] = synchronizer.source_duplicate_endpoints
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
         if args.preview_source and targeted != 1:
             print('Requested source did not complete the preview', file=sys.stderr)
