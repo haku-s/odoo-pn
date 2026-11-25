@@ -13,6 +13,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
+from functools import partial
 from html.parser import HTMLParser
 from time import sleep
 from urllib.parse import urlencode, unquote, urljoin, urlsplit
@@ -22,6 +23,10 @@ import requests
 from .camara_media import HOST as CAMARA_MEDIA_HOST, credited_photo
 from .classify import fold
 from .network import FetchError, read_public, read_public_response, status_error, validate_url
+from .news_html import (
+    ARCHIVES, EBC_ARCHIVE, FIOCRUZ_ARCHIVE, HEALTH_LISTING, HTML_CHANNELS, Listing,
+    in_article_scope, listing_date, next_listing_page, parse_listing,
+)
 
 DOMINIO_OFICIAL = {
     'agencia_brasil': {'agenciabrasil.ebc.com.br'},
@@ -31,25 +36,82 @@ DOMINIO_OFICIAL = {
 }
 
 MAX_XML_BYTES = 20 * 1024 * 1024
+MAX_ARCHIVE_PAGES = 20
+MAX_HTML_BYTES = 5 * 1024 * 1024
 MAX_CAMARA_INVALID_LOGS = 5
 
 EBC_HOST = 'agenciabrasil.ebc.com.br'
 EBC_IMAGE_HOST = 'imagens.ebc.com.br'
 IBGE_ARTICLE_HOST = 'agenciadenoticias.ibge.gov.br'
-EBC_FEEDS = {
+EBC_GENERAL_FEEDS = {
     f'https://{EBC_HOST}/rss/ultimasnoticias/feed.xml',
     f'https://{EBC_HOST}/feed/ultimasnoticias/feed.xml',
 }
+EBC_CHANNELS = {
+    f'agencia_brasil_{topic.replace("-", "_")}': f'https://{EBC_HOST}/rss/{topic}/feed.xml'
+    for topic in ('saude', 'educacao', 'direitos-humanos', 'economia')
+}
+EBC_FEEDS = EBC_GENERAL_FEEDS | set(EBC_CHANNELS.values())
+FEED_CHANNELS = {
+    **EBC_CHANNELS,
+    **{f'camara_{code}': f'https://www.camara.leg.br/noticias/rss/dinamico/{topic}'
+       for code, topic in (
+           ('ciencia_tecnologia', 'CIENCIA-E-TECNOLOGIA'), ('direitos_humanos', 'DIREITOS-HUMANOS'),
+           ('administracao_publica', 'ADMINISTRACAO-PUBLICA'), ('assistencia_social', 'ASSISTENCIA-SOCIAL'),
+           ('industria_comercio', 'INDUSTRIA-E-COMERCIO'),
+       )},
+    'jornal_usp': 'https://jornal.usp.br/feed/',
+    'embrapii': 'https://embrapii.org.br/feed/',
+    'sebrae': 'https://agenciasebrae.com.br/feed/',
+    'poder360': 'https://www.poder360.com.br/feed/',
+    'agencia_publica': 'https://apublica.org/feed/',
+    'nexo': 'https://www.nexojornal.com.br/rss.xml',
+    'valor': 'https://valor.globo.com/rss/valor',
+    'exame': 'https://exame.com/feed/',
+    'bbc_brasil': 'https://feeds.bbci.co.uk/portuguese/rss.xml',
+    'g1': 'https://pox.globo.com/rss/g1/',
+    'folha': 'https://feeds.folha.uol.com.br/emcimadahora/rss091.xml',
+    'uol_noticias': 'https://rss.uol.com.br/feed/noticias.xml',
+    'senado_noticias': 'https://www12.senado.leg.br/noticias/rss.xml',
+}
 RSS_PUBLISHERS = {
-    **dict.fromkeys(EBC_FEEDS, EBC_HOST),
+    **{url: urlsplit(url).netloc for url in FEED_CHANNELS.values()},
+    **dict.fromkeys(EBC_GENERAL_FEEDS, EBC_HOST),
+    FEED_CHANNELS['bbc_brasil']: 'www.bbc.com',
+    FEED_CHANNELS['g1']: 'g1.globo.com',
+    FEED_CHANNELS['folha']: 'www1.folha.uol.com.br',
+    FEED_CHANNELS['uol_noticias']: 'noticias.uol.com.br',
     'https://www.camara.leg.br/noticias/rss/dinamico/EDUCACAO': 'www.camara.leg.br',
     'https://www.camara.leg.br/noticias/rss/dinamico/SAUDE': 'www.camara.leg.br',
     'https://www.camara.leg.br/noticias/rss/dinamico/TRABALHO': 'www.camara.leg.br',
     'https://agencia.fiocruz.br/rss.xml': 'agencia.fiocruz.br',
     'https://revistapesquisa.fapesp.br/feed/': 'revistapesquisa.fapesp.br',
     'https://www.gov.br/saude/pt-br/assuntos/noticias/noticias/atom.xml': 'www.gov.br',
+    'https://www.gov.br/saude/pt-br/assuntos/noticias/noticias/rss.xml': 'www.gov.br',
     'https://portal.tcu.gov.br/rss.xml': 'portal.tcu.gov.br',
 }
+FUNDACENTRO_API = ('https://www.gov.br/fundacentro/++api++/pt-br/@search'
+                   '?portal_type=News%20Item&sort_on=effective&sort_order=descending&b_size=20')
+SENAI_API = 'https://noticias.portaldaindustria.com.br/api/noticias/?casas=4&limit=20&page=1'
+NEWS_APIS = {'fundacentro': FUNDACENTRO_API, 'senai': SENAI_API}
+ESTADAO_HOME = 'https://www.estadao.com.br/'
+HEALTH_FEED = 'https://www.gov.br/saude/pt-br/assuntos/noticias/noticias/atom.xml'
+HEALTH_RSS = 'https://www.gov.br/saude/pt-br/assuntos/noticias/noticias/rss.xml'
+FIOCRUZ_FEED = 'https://agencia.fiocruz.br/rss.xml'
+GUID_PERMALINK_FEEDS = {HEALTH_RSS, FEED_CHANNELS['senado_noticias']}
+DIAGNOSTIC_CHANNELS = {
+    **FEED_CHANNELS, **{code: listing.url for code, listing in HTML_CHANNELS.items()}, **NEWS_APIS,
+    'agencia_brasil': f'https://{EBC_HOST}/rss/ultimasnoticias/feed.xml',
+    'fiocruz': FIOCRUZ_FEED,
+    'ministerio_saude': HEALTH_FEED,
+    'camara_educacao': 'https://www.camara.leg.br/noticias/rss/dinamico/EDUCACAO',
+    'camara_saude': 'https://www.camara.leg.br/noticias/rss/dinamico/SAUDE',
+    'camara_trabalho': 'https://www.camara.leg.br/noticias/rss/dinamico/TRABALHO',
+    'pesquisa_fapesp': 'https://revistapesquisa.fapesp.br/feed/',
+    'tcu': 'https://portal.tcu.gov.br/rss.xml',
+    'estadao': ESTADAO_HOME,
+}
+ALTERNATE_IDENTITY_URLS = frozenset((FIOCRUZ_FEED, FIOCRUZ_ARCHIVE.url, HEALTH_FEED, HEALTH_LISTING.url))
 ATOM = '{http://www.w3.org/2005/Atom}'
 MEDIA = '{http://search.yahoo.com/mrss/}'
 CONTENT = '{http://purl.org/rss/1.0/modules/content/}encoded'
@@ -251,6 +313,17 @@ def rss_publisher(url: object) -> str | None:
     return RSS_PUBLISHERS.get(url) if isinstance(url, str) else None
 
 
+def news_publisher(url: object) -> str | None:
+    if not isinstance(url, str) or (
+        url not in RSS_PUBLISHERS and url not in ARCHIVES and url not in NEWS_APIS.values() and url != ESTADAO_HOME
+    ):
+        return None
+    parts = urlsplit(url)
+    if parts.netloc == 'www.gov.br':
+        return f'{parts.netloc}/{parts.path.split("/")[1]}'
+    return rss_publisher(url) or parts.netloc
+
+
 def _linked_url(base: str, value: str | None, host: str) -> str | None:
     if not value or len(value) > 2000:
         return None
@@ -344,7 +417,7 @@ def collect_feed(
     if host is None:
         raise ValueError('Feed URL is not approved')
     try:
-        endpoints = EBC_FEEDS if host == EBC_HOST else {url}
+        endpoints = EBC_GENERAL_FEEDS if url in EBC_GENERAL_FEEDS else {url}
         body, final_url = _retry_read(
             lambda: read_public(url, allowed_urls=endpoints, max_bytes=MAX_XML_BYTES, timeout=timeout), counts,
         )
@@ -354,7 +427,15 @@ def collect_feed(
         raise RespostaInvalida(str(exc)) from exc
     # Decode before checking for DTDs so alternate encodings cannot hide declarations.
     try:
-        decoded = body.decode('utf-8-sig')
+        if url == FEED_CHANNELS['folha']:
+            decoded = body.decode('iso-8859-1')
+        elif url == FEED_CHANNELS['uol_noticias']:
+            try:
+                decoded = body.decode('utf-8-sig')
+            except UnicodeDecodeError:
+                decoded = body.decode('iso-8859-1')
+        else:
+            decoded = body.decode('utf-8-sig')
     except UnicodeDecodeError as exc:
         raise RespostaInvalida('Feed encoding is not UTF-8') from exc
     if '<!DOCTYPE' in decoded.upper():
@@ -365,7 +446,10 @@ def collect_feed(
         raise RespostaInvalida('Invalid feed XML') from exc
 
     atom = root.tag == ATOM + 'feed'
-    channel = root.find('channel') if root.tag == 'rss' and root.get('version') == '2.0' else None
+    versions: set[str | None] = {'2.0', '0.91'} if url == FEED_CHANNELS['folha'] else {'2.0'}
+    if url == FEED_CHANNELS['uol_noticias']:
+        versions.add(None)
+    channel = root.find('channel') if root.tag == 'rss' and root.get('version') in versions else None
     if atom:
         entries = root.findall(ATOM + 'entry')
     elif channel is not None:
@@ -400,10 +484,31 @@ def collect_feed(
             address = entry.findtext('link')
             title = _texto(_field(entry, 'title'))
             identity = _texto(entry.findtext('guid'), 2000)
+            if url in GUID_PERMALINK_FEEDS and not address:
+                address = identity
+            if url == FEED_CHANNELS['folha'] and address:
+                redirect_prefix = 'https://redir.folha.com.br/redir/online/emcimadahora/rss091/*'
+                address = address.removeprefix(redirect_prefix)
             date = entry.findtext('pubDate') or entry.findtext(DC_DATE)
             summary = _field(entry, 'description')
             content = _field(entry, CONTENT)
         link = _linked_url(final_url, address, host)
+        if not link and url == FEED_CHANNELS['folha']:
+            for section in ('c-level', 'f5', 'guia'):
+                if link := _linked_url(final_url, address, f'{section}.folha.uol.com.br'):
+                    break
+        if link and url in (HEALTH_RSS, HEALTH_FEED) and not urlsplit(link).path.startswith('/saude/pt-br/'):
+            link = None
+        if link and url == FEED_CHANNELS['senado_noticias']:
+            path = urlsplit(link).path
+            if path.startswith('/noticias/audios/'):
+                counts['non_news_entries'] += 1
+                continue
+            if not path.startswith('/noticias/materias/'):
+                link = None
+        if not link and address and url == FEED_CHANNELS['uol_noticias']:
+            counts['syndicated_entries'] += 1
+            continue
         if not title or not link:
             counts['invalid_items'] += 1
             continue
@@ -448,10 +553,299 @@ def collect_feed(
     return items
 
 
+def _collect_listing(
+    listing: Listing, since: datetime, limit: int, timeout: tuple[int, int],
+    until: datetime | None, counts: Counter[str], items: list[Item],
+) -> None:
+    start = _utc_timestamp(since)
+    end = _utc_timestamp(until) if until is not None else None
+    host = urlsplit(listing.url).netloc
+    seen = {item.url for item in items}
+    url = listing.url
+    signatures: set[tuple[str, ...]] = set()
+    for page in range(MAX_ARCHIVE_PAGES):
+        try:
+            body, _ = _retry_read(
+                partial(read_public, url, allowed_urls={url}, max_bytes=MAX_HTML_BYTES, timeout=timeout), counts,
+            )
+            document = parse_listing(body)
+            rows = list(document.select(listing.rows))
+            if not rows:
+                raise RespostaInvalida('News listing has no recognized article rows')
+        except (ValueError, RuntimeError) as exc:
+            if not items and page == 0:
+                raise RespostaInvalida(f'News listing failed: {exc}') from exc
+            counts['pagination_incomplete'] += 1
+            counts['archive_errors'] += 1
+            break
+
+        counts['pages'] += 1
+        counts['raw_entries'] += len(rows)
+        page_dates = []
+        page_links = []
+        for row in rows:
+            title_el = row.first(listing.title)
+            link_el = row if row.tag == 'a' else title_el if title_el and title_el.tag == 'a' else row.first(listing.link)
+            if title_el and listing.link == 'a' and title_el.tag != 'a':
+                link_el = title_el.first('a') or link_el
+            title = _texto(title_el.text()) if title_el else None
+            link = _linked_url(url, link_el.attrs.get('href'), host) if link_el else None
+            if listing == HTML_CHANNELS['agencia_bndes'] and link and urlsplit(link).path.startswith('/pautas-bndes/'):
+                counts['non_news_entries'] += 1
+                continue
+            if not title or not link or not in_article_scope(listing, link):
+                counts['invalid_items'] += 1
+                continue
+            page_links.append(link)
+            date = listing_date(row.first(listing.date))
+            try:
+                published = _data_hora(date)
+            except RespostaInvalida:
+                published = None
+            if not published:
+                counts['invalid_dates'] += 1
+                continue
+            page_dates.append(published)
+            counts['valid_items'] += 1
+            # Date-only listings report a local calendar day. Include its overlap with the window.
+            if date and len(date) == 10:
+                next_day = datetime.strptime(published, '%Y-%m-%d %H:%M:%S') + timedelta(days=1)  # noqa: DTZ007
+                in_window = next_day.strftime('%Y-%m-%d %H:%M:%S') > start and (end is None or published < end)
+            else:
+                in_window = _date_in_window(published, start, end)
+            if not in_window:
+                counts['outside_window'] += 1
+                continue
+            if link in seen:
+                counts['source_duplicates'] += 1
+                continue
+            seen.add(link)
+            if len(items) >= limit:
+                counts['item_limit_dropped'] += 1
+                continue
+            summary = row.first(listing.summary)
+            text = summary.text() if summary else ''
+            if text.startswith((date or '') + ' - '):
+                text = text[len(date or '') + 3:]
+            image, credit = None, None
+            if listing in (EBC_ARCHIVE, FIOCRUZ_ARCHIVE) and (photo := row.first('img')):
+                candidate = photo.attrs.get('data-echo') or photo.attrs.get('src')
+                image = candidate if candidate and is_ebc_image_proxy(candidate) else _linked_url(link, candidate, host)
+                credit = _texto(photo.attrs.get('title'), 300)
+            items.append(Item(link, title, link, published, _texto(text), 'Notícia', image, credit))
+        signature = tuple(page_links)
+        if not signature or signature in signatures:
+            counts['pagination_incomplete'] += 1
+            break
+        signatures.add(signature)
+        if page_dates and min(page_dates) <= start:
+            counts['archive_window_covered'] += 1
+            return
+        next_url = next_listing_page(listing, document, url, (page + listing.first_next) * listing.step)
+        if not next_url or counts['item_limit_dropped']:
+            break
+        url = next_url
+    else:
+        counts['pagination_incomplete'] += 1
+    counts['archive_window_unverified'] += 1
+
+
+def _collect_news_api(url: str, since: datetime, limit: int, timeout: tuple[int, int],
+                      until: datetime | None, counts: Counter[str]) -> list[Item]:
+    fundacentro = url == FUNDACENTRO_API
+    start = _utc_timestamp(since)
+    end = _utc_timestamp(until) if until is not None else None
+    host = urlsplit(url).netloc
+    items, seen, signatures = [], set(), set()
+    for page in range(MAX_ARCHIVE_PAGES):
+        address = (url if page == 0 else url + f'&b_start={page * 20}') if fundacentro else (
+            url.rsplit('=', 1)[0] + f'={page + 1}'
+        )
+        try:
+            body, _ = _retry_read(
+                partial(read_public, address, allowed_urls={address}, max_bytes=MAX_HTML_BYTES, timeout=timeout), counts,
+            )
+            data = json.loads(body)
+            rows = data.get('items' if fundacentro else 'results') if isinstance(data, dict) else None
+            if not isinstance(rows, list) or len(rows) > 20:
+                raise RespostaInvalida('Unexpected news API response')
+        except (ValueError, RuntimeError) as exc:
+            if page == 0:
+                raise RespostaInvalida(f'News API failed: {exc}') from exc
+            counts['pagination_incomplete'] += 1
+            break
+        counts['pages'] += 1
+        counts['raw_entries'] += len(rows)
+        dates, links = [], []
+        for row in rows:
+            if not isinstance(row, dict):
+                counts['invalid_items'] += 1
+                continue
+            title = _texto(row.get('title' if fundacentro else 'titulo'))
+            ref = _texto(row.get('@id' if fundacentro else 'url'), 2000)
+            link = _linked_url(url, ref, host)
+            path = urlsplit(link).path if link else ''
+            correct_scope = path.startswith('/fundacentro/pt-br/comunicacao/noticias/' if fundacentro else '/noticias/')
+            if not title or not link or not correct_scope:
+                counts['invalid_items'] += 1
+                continue
+            links.append(link)
+            try:
+                published = _data_hora(row.get('effective' if fundacentro else 'data_publicacao'))
+            except RespostaInvalida:
+                published = None
+            if not published:
+                counts['invalid_dates'] += 1
+                continue
+            dates.append(published)
+            counts['valid_items'] += 1
+            if not _date_in_window(published, start, end):
+                counts['outside_window'] += 1
+                continue
+            if link in seen:
+                counts['source_duplicates'] += 1
+                continue
+            seen.add(link)
+            if len(items) >= limit:
+                counts['item_limit_dropped'] += 1
+                continue
+            summary = _html_para_texto(row.get('description' if fundacentro else 'lead'))
+            items.append(Item(link, title, link, published, summary, 'Notícia'))
+        signature = tuple(links)
+        if signature in signatures or not links and rows:
+            counts['pagination_incomplete'] += 1
+            break
+        signatures.add(signature)
+        if dates and min(dates) <= start:
+            counts['archive_window_covered'] += 1
+            return items
+        total = data.get('items_total' if fundacentro else 'count')
+        if type(total) is not int or total < page * 20 + len(rows) or not rows and total > page * 20:
+            counts['pagination_incomplete'] += 1
+            break
+        if total <= (page + 1) * 20 or counts['item_limit_dropped']:
+            break
+        if len(rows) != 20:
+            counts['pagination_incomplete'] += 1
+            break
+    else:
+        counts['pagination_incomplete'] += 1
+    counts['archive_window_unverified'] += 1
+    return items
+
+
+def _collect_arc_snapshot(since: datetime, limit: int, timeout: tuple[int, int],
+                          until: datetime | None, counts: Counter[str]) -> list[Item]:
+    try:
+        body, _ = _retry_read(partial(read_public, ESTADAO_HOME, allowed_urls={ESTADAO_HOME},
+                                      max_bytes=MAX_HTML_BYTES, timeout=timeout), counts)
+        _, marker, public_data = body.decode('utf-8-sig').partition('Fusion.contentCache=')
+        if not marker:
+            raise ValueError('Missing public story metadata')
+        cache, _ = json.JSONDecoder().raw_decode(public_data.lstrip())
+    except (ValueError, RuntimeError) as exc:
+        if isinstance(exc, FetchError):
+            raise RespostaInvalida(str(exc)) from exc
+        raise RespostaInvalida('Invalid public story metadata') from exc
+    if not isinstance(cache, dict) or 'content-api' not in cache:
+        raise RespostaInvalida('Missing public story collection')
+    pending = [cache['content-api']]
+    items, urls = [], set()
+    start = _utc_timestamp(since)
+    end = _utc_timestamp(until) if until is not None else None
+    counts['pages'] += 1
+    counts['archive_window_unverified'] += 1  # Publisher homepage selection has no archive cursor.
+    while pending:
+        row = pending.pop()
+        if isinstance(row, list):
+            pending.extend(row)
+            continue
+        if not isinstance(row, dict):
+            continue
+        if row.get('type') != 'story':
+            pending.extend(row.values())
+            continue
+        counts['raw_entries'] += 1
+        titles = row.get('headlines')
+        title = _texto(titles.get('basic')) if isinstance(titles, dict) else None
+        link = _linked_url(ESTADAO_HOME, _texto(row.get('canonical_url'), 2000), 'www.estadao.com.br')
+        identity = _texto(row.get('_id'), 2000)
+        if not title or not link or not identity:
+            counts['invalid_items'] += 1
+            continue
+        try:
+            published = _data_hora(row.get('first_publish_date'))
+        except RespostaInvalida:
+            published = None
+        if not published:
+            counts['invalid_dates'] += 1
+            continue
+        counts['valid_items'] += 1
+        if not _date_in_window(published, start, end):
+            counts['outside_window'] += 1
+            continue
+        if link in urls:
+            counts['source_duplicates'] += 1
+            continue
+        urls.add(link)
+        summaries = row.get('subheadlines')
+        summary = _html_para_texto(summaries.get('basic')) if isinstance(summaries, dict) else None
+        items.append(Item(identity, title, link, published, summary, 'Notícia'))
+    if not counts['raw_entries']:
+        raise RespostaInvalida('Public story collection has no entries')
+    items.sort(key=lambda item: item.data_publicacao or '', reverse=True)
+    if len(items) > limit:
+        counts['item_limit_dropped'] += len(items) - limit
+    return items[:limit]
+
+
+def collect_news(url: str, since: datetime, limit: int, timeout: tuple[int, int], *,
+                 until: datetime | None = None, audit: Counter[str] | None = None) -> list[Item]:
+    counts = Counter() if audit is None else audit
+    if url in NEWS_APIS.values():
+        return _collect_news_api(url, since, limit, timeout, until, counts)
+    if url == ESTADAO_HOME:
+        return _collect_arc_snapshot(since, limit, timeout, until, counts)
+    if url == HEALTH_FEED or url in ARCHIVES:
+        items: list[Item] = []
+        try:
+            _collect_listing(HEALTH_LISTING if url == HEALTH_FEED else ARCHIVES[url],
+                             since, limit, timeout, until, counts, items)
+        except RespostaInvalida:
+            if url != HEALTH_FEED:
+                raise
+            counts['archive_errors'] += 1
+            try:
+                return collect_feed(HEALTH_RSS, since, limit, timeout, until=until, audit=counts)
+            except RespostaInvalida:
+                counts['feed_errors'] += 1
+                return collect_feed(url, since, limit, timeout, until=until, audit=counts)
+        return items
+    archive = EBC_ARCHIVE if url in EBC_GENERAL_FEEDS else FIOCRUZ_ARCHIVE if url == FIOCRUZ_FEED else None
+    try:
+        items = collect_feed(url, since, limit, timeout, until=until, audit=counts)
+    except RespostaInvalida:
+        if archive is None:
+            raise
+        counts['feed_errors'] += 1
+        items = []
+        _collect_listing(archive, since, limit, timeout, until, counts, items)
+        return items
+    if counts['feed_window_unverified']:
+        if archive:
+            try:
+                _collect_listing(archive, since, limit, timeout, until, counts, items)
+            except RespostaInvalida:
+                counts['archive_errors'] += 1
+                counts['pagination_incomplete'] += 1
+                counts['archive_window_unverified'] += 1
+    return items
+
+
 def coletar_agencia_brasil(session, url, desde, limite, *, until: datetime | None = None, audit=None):
     if rss_publisher(url) != EBC_HOST:
         raise ValueError('Feed URL is not approved for this source')
-    return collect_feed(url, desde, limite, (10, 40), until=until, audit=audit)
+    return collect_news(url, desde, limite, (10, 40), until=until, audit=audit)
 
 
 # ----------------------------------------------------------------------- Câmara
@@ -792,11 +1186,14 @@ def coletar(
     audit: Counter[str] | None = None, non_news_window: tuple[datetime, datetime] | None = None,
     news_only: bool = False,
 ) -> list[Item]:
-    if codigo == 'agencia_brasil' or (method == 'RSS' and codigo not in COLETORES):
-        publisher = rss_publisher(url)
-        if publisher is None or (codigo == 'agencia_brasil' and publisher != EBC_HOST):
+    is_news_api = method == 'API REST' and NEWS_APIS.get(codigo) == url
+    if codigo == 'agencia_brasil' or (method == 'RSS' and codigo not in COLETORES) or is_news_api:
+        publisher = news_publisher(url)
+        if publisher is None or (codigo == 'agencia_brasil' and publisher != EBC_HOST) or (
+            url in NEWS_APIS.values() and not is_news_api
+        ):
             raise FonteNaoImplementada('Feed URL is not approved')
-        return collect_feed(url, desde, limite, timeout, until=until, audit=audit)
+        return collect_news(url, desde, limite, timeout, until=until, audit=audit)
     if codigo == 'ibge':
         return coletar_ibge(session, url, desde, limite, until=until, audit=audit,
                             non_news_window=non_news_window, news_only=news_only)
