@@ -91,6 +91,8 @@ jobs:
           IMAGE_LIMIT: ${{ inputs.image_limit }}
           IMAGE_AFTER_ID: ${{ inputs.image_after_id }}
           INTEL_AVATAR_FIELD: ${{ secrets.INTEL_AVATAR_FIELD }}
+          CGU_API_TOKEN: ${{ secrets.CGU_API_TOKEN }}
+          CGU_SIAFI_CODES: ${{ vars.CGU_SIAFI_CODES }}
           ODOO_URL: ${{ secrets.ODOO_URL }}
           ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
           ODOO_DATABASE: ${{ vars.ODOO_DATABASE }}

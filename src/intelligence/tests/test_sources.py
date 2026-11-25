@@ -472,6 +472,49 @@ class RegistryTest(unittest.TestCase):
             sources.coletar('dou_inlabs', FakeSession([]), 'https://inlabs.in.gov.br/', datetime.now(UTC), 10)
 
 
+class CguTest(unittest.TestCase):
+    def test_filters_by_publication_date_for_both_datasets(self):
+        zone = ZoneInfo('America/Sao_Paulo')
+        start = datetime(2026, 11, 19, 10, tzinfo=zone)
+        end = datetime(2026, 11, 23, tzinfo=zone)
+        tender = {'id': 7, 'licitacao': {'objeto': 'Equipment'}, 'dataAbertura': '2026-12-01'}
+        contract = {'id': 7, 'objeto': 'Research services', 'dataInicioVigencia': '2026-12-01'}
+        pages = (
+            [tender | {'dataPublicacao': '2026-11-19'},
+             tender | {'id': 8, 'dataAbertura': '2026-11-20', 'dataPublicacao': '2026-11-18'},
+             tender | {'id': 9}],
+            [],
+            [contract | {'dataPublicacaoDOU': '2026-11-21'}],
+            [],
+        )
+        audit = Counter()
+        with (
+            patch.dict('os.environ', {'CGU_API_TOKEN': 'test-key', 'CGU_SIAFI_CODES': '12345'}),
+            patch.object(sources, 'read_public_response', side_effect=[
+                (json.dumps(rows).encode(), '', 200) for rows in pages
+            ]) as read,
+        ):
+            items = sources.coletar('portal_transparencia', None, sources.CGU_BASE_URL,
+                                    start, 10, method='API REST', until=end, audit=audit)
+
+        self.assertEqual([item.identificador for item in items], ['contratos:7', 'licitacoes:7'])
+        self.assertEqual(audit['outside_window'], 1)
+        self.assertEqual(audit['invalid_dates'], 1)
+        self.assertEqual(audit['feed_window_unverified'], 1)
+        self.assertTrue(all('dataInicial' not in call.args[0] and 'test-key' not in call.args[0]
+                            for call in read.call_args_list))
+
+    def test_missing_siafi_scope_does_not_contact_the_api(self):
+        with (
+            patch.dict('os.environ', {'CGU_API_TOKEN': 'test-key', 'CGU_SIAFI_CODES': ''}),
+            patch.object(sources, 'read_public_response') as read,
+            self.assertRaisesRegex(sources.RespostaInvalida, 'CGU_SIAFI_CODES'),
+        ):
+            sources.coletar('portal_transparencia', None, sources.CGU_BASE_URL, datetime.now(UTC), 10,
+                            method='API REST')
+        read.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()
 

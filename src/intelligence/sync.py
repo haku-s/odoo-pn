@@ -19,7 +19,7 @@ from .classify import classificar, split_terms
 from .odoo import OdooClient, OdooHTTPError, SELECTIONS, normalizar_valor
 from .network import FetchError
 from .sources import (
-    ALTERNATE_IDENTITY_URLS, COLETORES, DIAGNOSTIC_CHANNELS, EBC_HOST, NEWS_APIS, RespostaInvalida, coletar,
+    ALTERNATE_IDENTITY_URLS, CGU_SOURCE, COLETORES, DIAGNOSTIC_CHANNELS, EBC_HOST, NEWS_APIS, RespostaInvalida, coletar,
     ebc_article_summary, news_publisher,
 )
 
@@ -174,7 +174,7 @@ class Synchronizer:
             self.source_states[codigo] = 'not_implemented'
             print(f'Source {codigo}: no collector implemented', file=sys.stderr)
             return
-        if codigo not in ('ibge', 'agencia_brasil') and publisher is None:
+        if codigo not in ('ibge', 'agencia_brasil', CGU_SOURCE) and publisher is None:
             if replay:
                 self.source_states[codigo] = 'outside_replay_scope'
                 self.stats['fontes_fora_do_reprocessamento'] += 1
@@ -258,6 +258,12 @@ class Synchronizer:
                 self._registrar_falha(identificador_fonte, codigo, 'Partial collection: ' + ', '.join(incomplete))
             return
         state = 'completed'
+        if codigo == CGU_SOURCE and counts['feed_window_unverified']:
+            self.stats['fontes_parciais'] += 1
+            self.source_states[codigo] = 'limited_history' if itens else 'empty_unverified'
+            if auditoria_fonte is not None:
+                auditoria_fonte['estado'] = 'parcial'
+            return
         if diagnostic:
             limited = not counts['archive_window_covered'] and (
                 counts['archive_window_unverified'] or counts['feed_window_unverified']

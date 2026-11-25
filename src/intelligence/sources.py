@@ -7,6 +7,7 @@ from typing import Any
 
 import json
 import logging
+import os
 import re
 import xml.etree.ElementTree as ET
 from collections import Counter
@@ -22,7 +23,7 @@ import requests
 
 from .camara_media import HOST as CAMARA_MEDIA_HOST, credited_photo
 from .classify import fold
-from .network import FetchError, read_public, read_public_response, status_error, validate_url
+from .network import CGU_API_HOST, FetchError, read_public, read_public_response, status_error, validate_url
 from .news_html import (
     ARCHIVES, EBC_ARCHIVE, FIOCRUZ_ARCHIVE, HEALTH_LISTING, HTML_CHANNELS, Listing,
     in_article_scope, listing_date, next_listing_page, parse_listing,
@@ -1187,12 +1188,94 @@ def coletar_bcb(session, url, desde, limite, *, until: datetime | None = None, a
     )]
 
 
+CGU_SOURCE = 'portal_transparencia'
+CGU_BASE_URL = f'https://{CGU_API_HOST}'
+CGU_MAX_PAGES = 4
+
+
+def coletar_cgu(
+    session: requests.Session | None, url: object, desde: datetime, limite: int, *,
+    until: datetime | None = None, audit: Counter[str] | None = None,
+) -> list[Item]:
+    """Scan bounded CGU results and select records by official publication date."""
+    if url not in (CGU_BASE_URL, CGU_BASE_URL + '/'):
+        raise FonteNaoImplementada('CGU API origin is not approved')
+    token = os.getenv('CGU_API_TOKEN', '').strip()
+    if not token:
+        raise RespostaInvalida('Missing CGU_API_TOKEN')
+    codes = tuple(dict.fromkeys(code.strip() for code in os.getenv('CGU_SIAFI_CODES', '').split(',')))
+    if not 1 <= len(codes) <= 8 or any(not re.fullmatch(r'[0-9]{5}', code) for code in codes):
+        raise RespostaInvalida('CGU_SIAFI_CODES must contain one to eight comma-separated SIAFI codes')
+    audit = audit if audit is not None else Counter()
+    # The API's range parameters refer to opening or validity and may hide publications in this window.
+    audit['feed_window_unverified'] += 1
+    start = _utc_timestamp(desde.replace(hour=0, minute=0, second=0, microsecond=0))
+    end = _utc_timestamp(until) if until is not None else None
+    items: dict[str, Item] = {}
+    failure = None
+    for code in codes:
+        for path, date_key, label, kind in (
+            ('licitacoes', 'dataPublicacao', 'Licitação', 'Ato oficial'),
+            ('contratos', 'dataPublicacaoDOU', 'Contrato', 'Contrato público'),
+        ):
+            for page in range(1, CGU_MAX_PAGES + 1):
+                query = urlencode({'codigoOrgao': code, 'pagina': page})
+                address = f'{CGU_BASE_URL}/api-de-dados/{path}?{query}'
+                try:
+                    def read(address: str = address) -> tuple[bytes, str, int]:
+                        return read_public_response(address, allowed_urls={address}, max_bytes=2 * 1024 * 1024,
+                                                    timeout=(5, 10), cgu_token=token)
+
+                    body, _, _ = _retry_read(read, audit)
+                    rows: object = json.loads(body)
+                    if not isinstance(rows, list):
+                        raise RespostaInvalida('CGU response is not an array')
+                except (RuntimeError, ValueError) as exc:
+                    audit['feed_errors'] += 1
+                    if isinstance(exc, FetchError) and str(exc).endswith(('HTTP 401', 'HTTP 403')):
+                        raise
+                    failure = exc if isinstance(exc, FetchError) else RespostaInvalida('CGU response could not be read')
+                    break
+                audit['pages'] += 1
+                if not rows:
+                    break
+                audit['raw_entries'] += len(rows)
+                for row in rows:
+                    if not isinstance(row, dict) or type(row.get('id')) is not int or row['id'] <= 0:
+                        audit['invalid_items'] += 1
+                        continue
+                    purchase = row.get('licitacao') if path == 'licitacoes' else row
+                    description = _texto(purchase.get('objeto')) if isinstance(purchase, dict) else None
+                    if not description:
+                        audit['invalid_items'] += 1
+                        continue
+                    published = _data_hora(row.get(date_key))
+                    if published is None:
+                        audit['invalid_dates'] += 1
+                        continue
+                    audit['valid_items'] += 1
+                    if not _date_in_window(published, start, end):
+                        audit['outside_window'] += 1
+                        continue
+                    identifier = f'{path}:{row["id"]}'
+                    if identifier in items:
+                        audit['source_duplicates'] += 1
+                        continue
+                    link = f'https://portaldatransparencia.gov.br/{path}/{row["id"]}'
+                    items[identifier] = Item(identifier, f'{label} — {description}'[:240], link,
+                                             published, description, kind)
+    if failure is not None and not audit['pages']:
+        raise failure
+    return sorted(items.values(), key=lambda item: item.data_publicacao or '', reverse=True)[:limite]
+
+
 COLETORES = {
     'agencia_brasil': coletar_agencia_brasil,
     'camara': coletar_camara,
     'senado': coletar_senado,
     'ibge': coletar_ibge,
     'bcb_sgs': coletar_bcb,
+    CGU_SOURCE: coletar_cgu,
 }
 
 
