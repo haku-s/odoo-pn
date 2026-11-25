@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime, timedelta
 from collections import Counter
+import json
 from zoneinfo import ZoneInfo
 from unittest import TestCase
 from unittest.mock import patch
@@ -71,13 +72,47 @@ class SharedFeedTest(TestCase):
         self.assertEqual([call.args[0] for call in read.call_args_list], [url, url + '?page=1'])
         self.assertEqual((audit['pagination_incomplete'], audit['archive_window_unverified']), (1, 1))
 
-    def test_published_health_rss_uses_official_permalink_guid(self):
-        url = sources.HEALTH_RSS
-        article = 'https://www.gov.br/saude/pt-br/assuntos/noticias/2026/novembro/health'
-        payload = rss(link=article).replace(f'<link>{article}</link><guid>one</guid>'.encode(),
-                                            f'<guid>{article}</guid>'.encode())
-        item, = collect(payload, url)
-        self.assertEqual((item.url, item.identificador), (article, article))
+    def test_official_permalink_guid_supplies_the_link_for_health_and_senate(self):
+        for url, article in (
+            (sources.HEALTH_RSS, 'https://www.gov.br/saude/pt-br/assuntos/noticias/2026/novembro/health'),
+            (sources.FEED_CHANNELS['senado_noticias'], 'https://www12.senado.leg.br/noticias/materias/2026/11/19/new'),
+        ):
+            with self.subTest(url=url):
+                payload = rss(link=article).replace(f'<link>{article}</link><guid>one</guid>'.encode(),
+                                                    f'<guid>{article}</guid>'.encode())
+                item, = collect(payload, url)
+                self.assertEqual((item.url, item.identificador), (article, article))
+
+    def test_estadao_snapshot_uses_public_story_metadata_without_reading_article_pages(self):
+        url = 'https://www.estadao.com.br/'
+        body = b'''<script>Fusion.contentCache={"content-api":{"stories":[
+          {"_id":"first","type":"story","canonical_url":"/economia/article-novo/",
+           "headlines":{"basic":"Headline"},"subheadlines":{"basic":"Public summary"},
+           "first_publish_date":"2026-11-19T10:00:00Z"}]}};
+        </script>'''
+        audit = Counter()
+        with patch.object(sources, 'read_public', return_value=(body, url)) as read:
+            item, = sources.collect_news(url, SINCE, 20, (2, 3), audit=audit)
+        self.assertEqual((item.identificador, item.resumo), ('first', 'Public summary'))
+        self.assertEqual(audit['archive_window_unverified'], 1)
+        read.assert_called_once()
+
+    def test_news_api_reconstructs_pagination_from_the_approved_route(self):
+        url = sources.SENAI_API
+        rows = [
+            {'url': f'https://noticias.portaldaindustria.com.br/noticias/educacao/article-{number}/',
+             'titulo': 'Headline', 'data_publicacao': '2026-11-19T10:00:00Z'}
+            for number in range(20)
+        ]
+        first = json.dumps({'results': rows, 'count': 21, 'next': 'https://127.0.0.1/private'}).encode()
+        second = json.dumps({'results': [{**rows[0], 'data_publicacao': '2026-11-01T00:00:00Z'}],
+                             'count': 21, 'next': None}).encode()
+        next_page = url.removesuffix('1') + '2'
+        audit = Counter()
+        with patch.object(sources, 'read_public', side_effect=[(first, url), (second, next_page)]) as read:
+            items = sources.coletar('senai', None, url, SINCE, 25, method='API REST', audit=audit)
+        self.assertEqual((len(items), audit['pages'], audit['source_duplicates']), (20, 2, 1))
+        self.assertEqual(read.call_args.kwargs['allowed_urls'], {next_page})
 
     def test_invalid_entry_does_not_hide_a_valid_entry_and_audits_capacity(self):
         body = rss().replace(b'<item>', b'<item><title>Broken</title></item><item>', 1)

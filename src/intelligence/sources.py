@@ -94,9 +94,11 @@ FUNDACENTRO_API = ('https://www.gov.br/fundacentro/++api++/pt-br/@search'
                    '?portal_type=News%20Item&sort_on=effective&sort_order=descending&b_size=20')
 SENAI_API = 'https://noticias.portaldaindustria.com.br/api/noticias/?casas=4&limit=20&page=1'
 NEWS_APIS = {'fundacentro': FUNDACENTRO_API, 'senai': SENAI_API}
+ESTADAO_HOME = 'https://www.estadao.com.br/'
 HEALTH_FEED = 'https://www.gov.br/saude/pt-br/assuntos/noticias/noticias/atom.xml'
 HEALTH_RSS = 'https://www.gov.br/saude/pt-br/assuntos/noticias/noticias/rss.xml'
 FIOCRUZ_FEED = 'https://agencia.fiocruz.br/rss.xml'
+GUID_PERMALINK_FEEDS = {HEALTH_RSS, FEED_CHANNELS['senado_noticias']}
 DIAGNOSTIC_CHANNELS = {
     **FEED_CHANNELS, **{code: listing.url for code, listing in HTML_CHANNELS.items()}, **NEWS_APIS,
     'agencia_brasil': f'https://{EBC_HOST}/rss/ultimasnoticias/feed.xml',
@@ -106,6 +108,7 @@ DIAGNOSTIC_CHANNELS = {
     'camara_trabalho': 'https://www.camara.leg.br/noticias/rss/dinamico/TRABALHO',
     'pesquisa_fapesp': 'https://revistapesquisa.fapesp.br/feed/',
     'tcu': 'https://portal.tcu.gov.br/rss.xml',
+    'estadao': ESTADAO_HOME,
 }
 ALTERNATE_IDENTITY_URLS = frozenset((FIOCRUZ_FEED, FIOCRUZ_ARCHIVE.url, HEALTH_FEED, HEALTH_LISTING.url))
 ATOM = '{http://www.w3.org/2005/Atom}'
@@ -310,7 +313,9 @@ def rss_publisher(url: object) -> str | None:
 
 
 def news_publisher(url: object) -> str | None:
-    if not isinstance(url, str) or url not in RSS_PUBLISHERS and url not in ARCHIVES and url not in NEWS_APIS.values():
+    if not isinstance(url, str) or (
+        url not in RSS_PUBLISHERS and url not in ARCHIVES and url not in NEWS_APIS.values() and url != ESTADAO_HOME
+    ):
         return None
     parts = urlsplit(url)
     if parts.netloc == 'www.gov.br':
@@ -478,7 +483,7 @@ def collect_feed(
             address = entry.findtext('link')
             title = _texto(_field(entry, 'title'))
             identity = _texto(entry.findtext('guid'), 2000)
-            if url == HEALTH_RSS and not address:
+            if url in GUID_PERMALINK_FEEDS and not address:
                 address = identity
             if url == FEED_CHANNELS['folha'] and address:
                 redirect_prefix = 'https://redir.folha.com.br/redir/online/emcimadahora/rss091/*'
@@ -492,6 +497,8 @@ def collect_feed(
                 if link := _linked_url(final_url, address, f'{section}.folha.uol.com.br'):
                     break
         if link and url in (HEALTH_RSS, HEALTH_FEED) and not urlsplit(link).path.startswith('/saude/pt-br/'):
+            link = None
+        if link and url == FEED_CHANNELS['senado_noticias'] and not urlsplit(link).path.startswith('/noticias/materias/'):
             link = None
         if not link and address and url == FEED_CHANNELS['uol_noticias']:
             counts['syndicated_entries'] += 1
@@ -721,11 +728,78 @@ def _collect_news_api(url: str, since: datetime, limit: int, timeout: tuple[int,
     return items
 
 
+def _collect_arc_snapshot(since: datetime, limit: int, timeout: tuple[int, int],
+                          until: datetime | None, counts: Counter[str]) -> list[Item]:
+    try:
+        body, _ = _retry_read(partial(read_public, ESTADAO_HOME, allowed_urls={ESTADAO_HOME},
+                                      max_bytes=MAX_HTML_BYTES, timeout=timeout), counts)
+        _, marker, public_data = body.decode('utf-8-sig').partition('Fusion.contentCache=')
+        if not marker:
+            raise ValueError('Missing public story metadata')
+        cache, _ = json.JSONDecoder().raw_decode(public_data.lstrip())
+    except (ValueError, RuntimeError) as exc:
+        if isinstance(exc, FetchError):
+            raise RespostaInvalida(str(exc)) from exc
+        raise RespostaInvalida('Invalid public story metadata') from exc
+    if not isinstance(cache, dict) or 'content-api' not in cache:
+        raise RespostaInvalida('Missing public story collection')
+    pending = [cache['content-api']]
+    items, urls = [], set()
+    start = _utc_timestamp(since)
+    end = _utc_timestamp(until) if until is not None else None
+    counts['pages'] += 1
+    counts['archive_window_unverified'] += 1  # Publisher homepage selection has no archive cursor.
+    while pending:
+        row = pending.pop()
+        if isinstance(row, list):
+            pending.extend(row)
+            continue
+        if not isinstance(row, dict):
+            continue
+        if row.get('type') != 'story':
+            pending.extend(row.values())
+            continue
+        counts['raw_entries'] += 1
+        titles = row.get('headlines')
+        title = _texto(titles.get('basic')) if isinstance(titles, dict) else None
+        link = _linked_url(ESTADAO_HOME, _texto(row.get('canonical_url'), 2000), 'www.estadao.com.br')
+        identity = _texto(row.get('_id'), 2000)
+        if not title or not link or not identity:
+            counts['invalid_items'] += 1
+            continue
+        try:
+            published = _data_hora(row.get('first_publish_date'))
+        except RespostaInvalida:
+            published = None
+        if not published:
+            counts['invalid_dates'] += 1
+            continue
+        counts['valid_items'] += 1
+        if not _date_in_window(published, start, end):
+            counts['outside_window'] += 1
+            continue
+        if link in urls:
+            counts['source_duplicates'] += 1
+            continue
+        urls.add(link)
+        summaries = row.get('subheadlines')
+        summary = _html_para_texto(summaries.get('basic')) if isinstance(summaries, dict) else None
+        items.append(Item(identity, title, link, published, summary, 'Notícia'))
+    if not counts['raw_entries']:
+        raise RespostaInvalida('Public story collection has no entries')
+    items.sort(key=lambda item: item.data_publicacao or '', reverse=True)
+    if len(items) > limit:
+        counts['item_limit_dropped'] += len(items) - limit
+    return items[:limit]
+
+
 def collect_news(url: str, since: datetime, limit: int, timeout: tuple[int, int], *,
                  until: datetime | None = None, audit: Counter[str] | None = None) -> list[Item]:
     counts = Counter() if audit is None else audit
     if url in NEWS_APIS.values():
         return _collect_news_api(url, since, limit, timeout, until, counts)
+    if url == ESTADAO_HOME:
+        return _collect_arc_snapshot(since, limit, timeout, until, counts)
     if url == HEALTH_FEED or url in ARCHIVES:
         items: list[Item] = []
         try:
