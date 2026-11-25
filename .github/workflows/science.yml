@@ -24,7 +24,6 @@ jobs:
     if: github.ref_name == github.event.repository.default_branch && vars.SCIENCE_SYNC_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    environment: science-production
     steps:
       - uses: actions/checkout@v7
         with:
@@ -37,8 +36,8 @@ jobs:
         env:
           PYTHONPATH: src
           ODOO_URL: ${{ secrets.ODOO_URL }}
-          ODOO_API_KEY: ${{ secrets.SCIENCE_ODOO_API_KEY }}
-          ODOO_DATABASE: ${{ secrets.ODOO_DATABASE }}
+          ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
+          ODOO_DATABASE: ${{ vars.ODOO_DATABASE }}
           FROM_DATE: ${{ inputs.from_date }}
           THROUGH_DATE: ${{ inputs.through_date }}
         run: |
