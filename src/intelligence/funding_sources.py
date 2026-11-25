@@ -41,6 +41,7 @@ TECNOVA_SP = 'https://fapesp.br/pipe/tecnova-3-2025'
 FIOCRUZ_FOMENTO = 'https://fomentoapesquisa.fiocruz.br/editais'
 CATALISA = 'https://sebrae.com.br/subsites/catalisa-ict'
 HORIZON_API = 'https://api.tech.ec.europa.eu/search-api/prod/rest/search?apiKey=SEDIA&text=*'
+HORIZON_CODE = re.compile(r'HORIZON-[A-Za-z0-9-]{3,90}')
 HORIZON_TOPICS = 'https://ec.europa.eu/info/funding-tenders/opportunities/portal/screen/opportunities/topic-details/'
 PPSUS_SUPPORT = 'https://webatendimento.saude.gov.br/faq/siscet'
 CNPQ = 'https://www.gov.br/cnpq/pt-br/chamadas'
@@ -1063,7 +1064,7 @@ def _catalisa(today: date, tracked: set[str]) -> tuple[list[Opportunity], dict[s
     return [item], {'pages': 1, 'scope': 'cycle 02 regulation; stage 3 is not public entry'}
 
 
-def _horizon(today: date, tracked: set[str]) -> tuple[list[Opportunity], dict[str, Any]]:
+def _horizon(today: date, tracked: set[str], *, identifiers: dict[str, str] | None = None) -> tuple[list[Opportunity], dict[str, Any]]:
     filters: list[dict[str, Any]] = [
         {'terms': {'type': ['1']}},
         {'terms': {'frameworkProgramme': ['43108390']}}, {'term': {'language': 'en'}},
@@ -1119,11 +1120,19 @@ def _horizon(today: date, tracked: set[str]) -> tuple[list[Opportunity], dict[st
                 seen.add(item.identity)
                 if item.status != 'deadline_elapsed' or item.identity in tracked:
                     items.append(item)
-    missing = sorted(identity.removeprefix('eu:horizon:').upper() for identity in tracked - seen
-                     if re.fullmatch(r'eu:horizon:horizon-[a-z0-9-]{3,90}', identity))
+    official_ids = identifiers or {}
+    missing = []
+    for identity in sorted(tracked - seen):
+        normalized = identity.removeprefix('eu:horizon:')
+        if identity == normalized:
+            continue
+        code = official_ids.get(identity, normalized.upper())
+        if HORIZON_CODE.fullmatch(code) and code.lower() == normalized:
+            missing.append(code)
     detail_errors = 0
     for start in range(0, min(len(missing), 72), page_size):
         codes = missing[start:start + page_size]
+        expected = {code.lower() for code in codes}
         try:
             count, rows = fetch(1, search_form({'terms': {'identifier': codes}}))
         except (ValueError, RuntimeError, OSError):
@@ -1134,7 +1143,7 @@ def _horizon(today: date, tracked: set[str]) -> tuple[list[Opportunity], dict[st
         for raw in rows:
             metadata = raw.get('metadata') if isinstance(raw, dict) else None
             item = _horizon_topic(metadata, today, HORIZON_API) if isinstance(metadata, dict) else None
-            if item and item.identity.removeprefix('eu:horizon:').upper() in codes:
+            if item and item.identity.removeprefix('eu:horizon:') in expected:
                 items.append(item)
     return items, {'pages': max(1, min(last, 48)) - len(bad_pages), 'catalogue_rows': total,
                    'invalid_topics': invalid, 'duplicate_hits': repeated, 'failed_pages': bad_pages,
@@ -1153,11 +1162,12 @@ def _horizon_topic(data: dict[str, Any], today: date, endpoint: str) -> Opportun
         return next(iter(values(key)), '')
 
     code, title = first('identifier'), _short(first('title'))
-    if (not re.fullmatch(r'HORIZON-[A-Z0-9-]{3,90}', code) or not title or 'en' not in values('language')
+    if (not HORIZON_CODE.fullmatch(code) or not title or 'en' not in values('language')
             or '43108390' not in values('frameworkProgramme') or '1' not in values('type')):
         return None
     url = HORIZON_TOPICS + code
-    item = Opportunity(f'eu:horizon:{code.lower()}', 'European Commission', title, 'research_grant', url)
+    modality = 'prize' if '-PRIZE-' in code.upper() else 'research_grant'
+    item = Opportunity(f'eu:horizon:{code.lower()}', 'European Commission', title, modality, url)
     for name, key in (('program', 'callIdentifier'), ('official_identifier', 'identifier'),
                       ('catalogue_status_code', 'status'), ('submission_model', 'deadlineModel')):
         item.record(name, first(key), endpoint, key, authority=CATALOGUE)
@@ -1227,11 +1237,15 @@ FUNDING_ADAPTERS: dict[str, tuple[str, Callable[..., tuple[list[Opportunity], di
 }
 
 
-def collect_opportunities(today: date, tracked: set[str]) -> tuple[list[Opportunity], dict[str, Any]]:
+def collect_opportunities(today: date, tracked: set[str], *,
+                          horizon_ids: dict[str, str] | None = None) -> tuple[list[Opportunity], dict[str, Any]]:
     def collect(entry) -> tuple[str, list[Opportunity], dict[str, Any]]:
         code, (url, adapter) = entry
         try:
-            items, metadata = adapter(today, tracked)
+            if code == 'horizon_europe' and horizon_ids:
+                items, metadata = adapter(today, tracked, identifiers=horizon_ids)
+            else:
+                items, metadata = adapter(today, tracked)
             partial_result = bool(metadata.get('coverage_limited') or any(item.issues for item in items))
             state = 'partial' if partial_result else 'verified' if items else 'verified_empty'
             return code, items, {'endpoint': url, 'state': state, 'count': len(items), **metadata}
@@ -1319,7 +1333,9 @@ def _reverify_details(
 
 def preview(previous: list[Opportunity]) -> dict[str, Any]:
     now = datetime.now(BRASILIA)
-    items, sources = collect_opportunities(now.date(), {item.identity for item in previous})
+    horizon_ids = {item.identity: item.facts['official_identifier'].value for item in previous
+                   if item.identity.startswith('eu:horizon:') and 'official_identifier' in item.facts}
+    items, sources = collect_opportunities(now.date(), {item.identity for item in previous}, horizon_ids=horizon_ids)
     _reverify_details(previous, items, sources, now.date())
     timestamp = now.astimezone(timezone.utc).isoformat(timespec='seconds')
     retained, changes = reconcile(previous, items, timestamp)

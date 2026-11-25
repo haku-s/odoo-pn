@@ -220,13 +220,29 @@ class FundingReliabilityTest(unittest.TestCase):
 
     def test_eu_two_stage_uses_earliest_date_for_new_applicants(self):
         item = sources._horizon_topic({
-            'identifier': ['HORIZON-EXAMPLE-2026'], 'title': ['Example research'],
+            'identifier': ['HORIZON-CL5-2027-04-Two-Stage-D2-07'], 'title': ['Example research'],
             'language': ['en'], 'frameworkProgramme': ['43108390'], 'type': ['1'],
             'deadlineModel': ['two-stage'],
             'deadlineDate': ['2026-11-30T17:00:00.000+0000', '2027-03-30T17:00:00.000+0000'],
         }, date(2026, 12, 1), sources.HORIZON_API)
         self.assertEqual(item.status, 'deadline_elapsed')
+        self.assertEqual(item.identity, 'eu:horizon:horizon-cl5-2027-04-two-stage-d2-07')
+        self.assertTrue(item.url.endswith('HORIZON-CL5-2027-04-Two-Stage-D2-07'))
         self.assertEqual(item.facts['full_proposal_deadline'].value, '2027-03-30')
+
+    def test_horizon_reverifies_with_the_original_official_case(self):
+        wire = 'HORIZON-CL5-2027-04-Two-Stage-D2-07'
+        identity = 'eu:horizon:' + wire.lower()
+        metadata = {'identifier': [wire], 'title': ['Example'], 'language': ['en'],
+                    'frameworkProgramme': ['43108390'], 'type': ['1'], 'status': ['31094503']}
+        def response(rows):
+            return json.dumps({'results': rows, 'totalResults': len(rows), 'pageSize': 24, 'pageNumber': 1}).encode(), '', 200
+        with patch.object(sources, 'read_public_response', side_effect=[
+            response([]), response([{'metadata': metadata}]),
+        ]) as fetch:
+            items, _ = sources._horizon(date(2026, 11, 25), {identity}, identifiers={identity: wire})
+        self.assertIn(wire.encode(), fetch.call_args.kwargs['search_form'][0])
+        self.assertEqual([(item.identity, item.status) for item in items], [(identity, 'closed')])
 
     def test_ppsus_support_is_a_partial_alternative_to_primary_site(self):
         with (
