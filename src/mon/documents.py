@@ -302,7 +302,9 @@ def attach(odoo, session, identifier: str, task_id: int, document: Document,
     except RuntimeError as exc:
         rows = odoo.attachments(task_id)
         if not confirmed(rows):
-            raise RuntimeError('Unconfirmed attachment creation; checkpoint withheld') from exc
+            raise RuntimeError(
+                f'Unconfirmed attachment creation ({exc}); checkpoint withheld'
+            ) from exc
     else:
         rows = odoo.attachments(task_id)
         if not confirmed(rows, attachment_id):
