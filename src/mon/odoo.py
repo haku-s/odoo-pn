@@ -228,10 +228,11 @@ class OdooClient:
     def call(self, model: str, method: str, **params):
         if method not in OPERATIONS.get(model, ()):
             raise ValueError('Operation not permitted')
+        timeout = (10, 120) if model == ATTACHMENT and method == 'create' else (10, 40)
         try:
             response = self.session.post(
                 f'{self.base}/json/2/{model}/{method}', headers=self.headers,
-                json=params, timeout=(10, 40), allow_redirects=False,
+                json=params, timeout=timeout, allow_redirects=False,
             )
         except requests.RequestException as exc:
             raise RuntimeError(f'Odoo {model}/{method}: connection failed') from exc
